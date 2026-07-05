@@ -1607,7 +1607,8 @@ app.get("/company-settings/current", authenticateToken, async (req, res) => {
       company_name: settings.company_name || company.name || "Triangle WMS Pro",
       logo_url: settings.logo_url || "",
       plan_name: company.plan_name || "",
-      subscription_status: company.subscription_status || ""
+      subscription_status: company.subscription_status || "",
+      business_type: company.business_type || ""
     });
   } catch (error) {
     console.error("ERREUR COMPANY SETTINGS CURRENT :", error);
