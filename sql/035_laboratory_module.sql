@@ -186,6 +186,11 @@ WHERE NOT EXISTS (
   WHERE a.company_id IS NULL AND a.name=data.name
 );
 
+-- La table ai_module_knowledge (026) n'a pas les colonnes capabilities /
+-- is_active sur les bases construites depuis zéro : alignement sans perte.
+ALTER TABLE ai_module_knowledge ADD COLUMN IF NOT EXISTS capabilities JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE ai_module_knowledge ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;
+
 INSERT INTO ai_module_knowledge (
   module_key, module_name, description, capabilities, data_sources, examples, is_active, active
 )
