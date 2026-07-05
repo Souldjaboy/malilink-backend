@@ -15550,93 +15550,10 @@ app.post("/assistant/query", authenticateToken, async (req, res) => {
   }
 });
 
-/* ASSISTANT IA OPENROUTER */
-app.post("/ai/chat", authenticateToken, async (req, res) => {
-  try {
-    const { message, user } = req.body;
-
-    if (!message || String(message).trim() === "") {
-      return res.status(400).json({
-        error: "Message obligatoire"
-      });
-    }
-
-    if (!process.env.OPENROUTER_API_KEY) {
-      return res.json({
-        answer:
-          "Assistant IA non configuré. Ajoutez OPENROUTER_API_KEY dans le fichier .env. En attendant, je peux vous conseiller de vérifier les produits, stocks, mouvements, alertes, documents et rapports depuis le menu Triangle WMS Pro."
-      });
-    }
-
-    const companyId = user?.company_id || null;
-    const isSuperAdmin = user?.is_super_admin === true;
-    const contextValues = isSuperAdmin || !companyId ? [] : [companyId];
-    const companyClause = isSuperAdmin || !companyId ? "" : "WHERE company_id=$1";
-    const movementClause = isSuperAdmin || !companyId ? "" : "WHERE company_id=$1";
-    const productStats = await pool.query(
-      `SELECT COUNT(*)::int AS total,
-              COALESCE(SUM(stock),0)::int AS stock_total,
-              COUNT(*) FILTER (WHERE stock <= minimum_stock)::int AS alertes
-       FROM products ${companyClause}`,
-      contextValues
-    );
-    const movementStats = await pool.query(
-      `SELECT COUNT(*)::int AS total,
-              COUNT(*) FILTER (WHERE status='En attente')::int AS en_attente
-       FROM stock_movements ${movementClause}`,
-      contextValues
-    );
-
-    const aiResponse = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "http://localhost:3000",
-          "X-Title": "Triangle WMS Pro"
-        },
-        body: JSON.stringify({
-          model: "openrouter/auto",
-          messages: [
-            {
-              role: "system",
-              content:
-                "Tu es l'assistant IA officiel de Triangle WMS Pro. Tu aides les utilisateurs en français simple et professionnel. Tu es spécialisé en logistique, gestion de stock, entreposage, transport, inventaire, documents logistiques, pointage, RH, tableaux de bord et organisation opérationnelle. Tu dois répondre clairement, étape par étape, sans inventer de données internes si elles ne sont pas fournies."
-            },
-            {
-              role: "user",
-              content: `Utilisateur connecté : ${user?.fullname || "Utilisateur"} | Rôle : ${user?.role || "non défini"}\nContexte WMS réel résumé : produits=${productStats.rows[0]?.total || 0}, stock_total=${productStats.rows[0]?.stock_total || 0}, alertes_stock=${productStats.rows[0]?.alertes || 0}, mouvements=${movementStats.rows[0]?.total || 0}, mouvements_en_attente=${movementStats.rows[0]?.en_attente || 0}.\n\nQuestion : ${message}`
-            }
-          ]
-        })
-      }
-    );
-
-    const data = await aiResponse.json();
-
-    if (!aiResponse.ok) {
-      return res.status(500).json({
-        error: "Erreur OpenRouter",
-        details: data
-      });
-    }
-
-    const answer =
-      data?.choices?.[0]?.message?.content ||
-      "Je n'ai pas pu générer une réponse.";
-
-    res.json({
-      answer
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur assistant IA"
-    });
-  }
-});
+/* ASSISTANT IA OPENROUTER :
+   déplacé dans routes/ai.js (POST /ai/chat) — identité lue depuis le JWT
+   uniquement, contexte scopé par rôle/espace. L'ancienne version lisait
+   `user` depuis req.body (usurpation de company_id possible). */
 
 /* PAIEMENT MANUEL SAAS */
 app.post("/payments/manual", authenticateToken, async (req, res) => {
@@ -18361,6 +18278,9 @@ app.use(
   "/education",
   createEducationRouter({ pool, authenticateToken, authorizeRoles })
 );
+
+const createAiRouter = require("./routes/ai");
+app.use("/ai", createAiRouter({ pool, authenticateToken }));
 
 app.listen(process.env.PORT || 5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
