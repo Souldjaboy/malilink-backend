@@ -15747,7 +15747,7 @@ app.post("/chat/upload-audio", authenticateToken, upload.single("audio"), async 
 app.use("/super-admin", authenticateToken, authorizeRoles("super_admin"));
 
 /* SUPER ADMIN SAAS */
-app.get("/super-admin/overview", async (req, res) => {
+app.get("/super-admin/overview", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const totalCompanies = await pool.query("SELECT COUNT(*) FROM companies");
     const activeCompanies = await pool.query(
@@ -15784,7 +15784,7 @@ app.get("/super-admin/overview", async (req, res) => {
   }
 });
 
-app.get("/super-admin/companies", async (req, res) => {
+app.get("/super-admin/companies", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT 
@@ -15806,7 +15806,7 @@ app.get("/super-admin/companies", async (req, res) => {
   }
 });
 
-app.put("/super-admin/companies/:id/status", async (req, res) => {
+app.put("/super-admin/companies/:id/status", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const { status } = req.body;
 
@@ -15826,7 +15826,7 @@ app.put("/super-admin/companies/:id/status", async (req, res) => {
   }
 });
 
-app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
+app.put("/super-admin/subscriptions/:companyId/renew", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const { months, payment_mode } = req.body;
 
@@ -15849,7 +15849,7 @@ app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
   }
 });
 
-app.put("/super-admin/subscriptions/:companyId/free", async (req, res) => {
+app.put("/super-admin/subscriptions/:companyId/free", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE subscriptions
@@ -16717,7 +16717,7 @@ app.get("/attendance/today", authenticateToken, async (req, res) => {
 });
 
 /* DELETE COMPANY */
-app.delete("/super-admin/companies/:id", async (req, res) => {
+app.delete("/super-admin/companies/:id", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const companyId = req.params.id;
 
@@ -16977,7 +16977,7 @@ app.put("/super-admin/plans/:id", authenticateToken, authorizeRoles("super_admin
 });
 
 /* SUPER ADMIN - UPDATE COMPANY STATUS */
-app.put("/super-admin/companies/:id/status", async (req, res) => {
+app.put("/super-admin/companies/:id/status", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const companyId = req.params.id;
 
@@ -17004,7 +17004,7 @@ app.put("/super-admin/companies/:id/status", async (req, res) => {
 });
 
 /* SUPER ADMIN - FREE ACCESS */
-app.put("/super-admin/subscriptions/:companyId/free", async (req, res) => {
+app.put("/super-admin/subscriptions/:companyId/free", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const companyId = req.params.companyId;
 
@@ -17033,7 +17033,7 @@ app.put("/super-admin/subscriptions/:companyId/free", async (req, res) => {
 });
 
 /* SUPER ADMIN - RENEW SUBSCRIPTION */
-app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
+app.put("/super-admin/subscriptions/:companyId/renew", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const companyId = req.params.companyId;
 
@@ -18347,6 +18347,19 @@ app.post("/disbursement-requests/:id/close", authenticateToken, async (req, res)
     client.release();
   }
 });
+
+// ---------- MODULES SÉPARÉS (architecture modulaire progressive) ----------
+const createDeliveryRouter = require("./routes/delivery");
+app.use(
+  "/delivery",
+  createDeliveryRouter({ pool, authenticateToken, authorizeRoles })
+);
+
+const createEducationRouter = require("./routes/education");
+app.use(
+  "/education",
+  createEducationRouter({ pool, authenticateToken, authorizeRoles })
+);
 
 app.listen(process.env.PORT || 5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
