@@ -1626,9 +1626,32 @@ app.put(
       return res.status(403).json({ error: "Vous avez un accès lecture seule." });
     }
 
-    const { company_name, address, phone, email, website, logo_url, slogan } =
-      req.body;
+    const {
+      company_name,
+      address,
+      phone,
+      email,
+      website,
+      logo_url,
+      slogan,
+      city,
+      country,
+      description,
+      business_sector,
+      currency,
+      language,
+      opening_hours,
+      facebook_url,
+      whatsapp_number,
+      instagram_url,
+      is_public,
+      business_type
+    } = req.body;
     const companyId = getEffectiveCompanyId(req);
+
+    // Colonnes étendues (migration 046) : on ne les écrit que si elles
+    // existent, pour ne pas casser une base non migrée.
+    const hasExtendedColumns = await columnExists("company_settings", "city");
 
     const existing = await pool.query(
       `SELECT id FROM company_settings
@@ -1637,34 +1660,77 @@ app.put(
       [companyId]
     );
 
+    let saved;
     if (existing.rows.length === 0) {
-      const created = await pool.query(
+      saved = await pool.query(
         `INSERT INTO company_settings
         (company_id, company_name, address, phone, email, website, logo_url, slogan)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         RETURNING *`,
         [companyId, company_name, address, phone, email, website, logo_url, slogan]
       );
-
-      return res.json(created.rows[0]);
+    } else {
+      saved = await pool.query(
+        `UPDATE company_settings
+         SET company_name=$1,
+             address=$2,
+             phone=$3,
+             email=$4,
+             website=$5,
+             logo_url=$6,
+             slogan=$7,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$8
+         RETURNING *`,
+        [company_name, address, phone, email, website, logo_url, slogan, existing.rows[0].id]
+      );
     }
 
-    const id = existing.rows[0].id;
+    const settingsId = saved.rows[0].id;
 
-    const updated = await pool.query(
-      `UPDATE company_settings
-       SET company_name=$1,
-           address=$2,
-           phone=$3,
-           email=$4,
-           website=$5,
-           logo_url=$6,
-           slogan=$7,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$8
-       RETURNING *`,
-      [company_name, address, phone, email, website, logo_url, slogan, id]
-    );
+    if (hasExtendedColumns) {
+      saved = await pool.query(
+        `UPDATE company_settings
+         SET city=COALESCE($1, city),
+             country=COALESCE($2, country),
+             description=COALESCE($3, description),
+             business_sector=COALESCE($4, business_sector),
+             currency=COALESCE($5, currency),
+             language=COALESCE($6, language),
+             opening_hours=COALESCE($7, opening_hours),
+             facebook_url=COALESCE($8, facebook_url),
+             whatsapp_number=COALESCE($9, whatsapp_number),
+             instagram_url=COALESCE($10, instagram_url),
+             is_public=COALESCE($11, is_public),
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$12
+         RETURNING *`,
+        [
+          city ?? null,
+          country ?? null,
+          description ?? null,
+          business_sector ?? null,
+          currency ?? null,
+          language ?? null,
+          opening_hours ?? null,
+          facebook_url ?? null,
+          whatsapp_number ?? null,
+          instagram_url ?? null,
+          typeof is_public === "boolean" ? is_public : null,
+          settingsId
+        ]
+      );
+    }
+
+    // Le type d'activité vit sur companies : il pilote le dashboard adaptatif.
+    if (business_type !== undefined && companyId) {
+      await pool.query(
+        `UPDATE companies SET business_type=$1 WHERE id=$2`,
+        [String(business_type || ""), companyId]
+      );
+    }
+
+    const updated = saved;
 
     await logActivity(
       "Administrateur",
@@ -9801,7 +9867,8 @@ app.get("/marketplace/customers/profile", authenticateToken, async (req, res) =>
       return res.status(403).json({ error: "Accès réservé aux clients Marketplace." });
     }
     const profile = await pool.query(
-      `SELECT mp.*, u.fullname, u.email AS user_email, u.phone AS user_phone
+      `SELECT mp.*, u.fullname, u.email AS user_email, u.phone AS user_phone,
+              u.profile_image_url AS photo_url
        FROM marketplace_profiles mp
        LEFT JOIN users u ON u.id=mp.user_id
        WHERE mp.user_id=$1 AND mp.profile_type='customer'
@@ -9828,7 +9895,7 @@ app.put("/marketplace/customers/profile", authenticateToken, async (req, res) =>
     if (normalizeRole(req.user?.role) !== "customer") {
       return res.status(403).json({ error: "Accès réservé aux clients Marketplace." });
     }
-    const { full_name = "", phone = "", email = "", country = "", city = "", address = "" } = req.body || {};
+    const { full_name = "", phone = "", email = "", country = "", city = "", address = "", photo_url = "" } = req.body || {};
     let result = await pool.query(
       `UPDATE marketplace_profiles
        SET full_name=$2,
@@ -9854,11 +9921,12 @@ app.put("/marketplace/customers/profile", authenticateToken, async (req, res) =>
     await pool.query(
       `UPDATE users
        SET fullname=COALESCE(NULLIF($1,''), fullname),
-           phone=COALESCE(NULLIF($2,''), phone)
-       WHERE id=$3`,
-      [full_name, phone, req.user.id]
+           phone=COALESCE(NULLIF($2,''), phone),
+           profile_image_url=COALESCE(NULLIF($3,''), profile_image_url)
+       WHERE id=$4`,
+      [full_name, phone, String(photo_url || ""), req.user.id]
     );
-    res.json(result.rows[0]);
+    res.json({ ...result.rows[0], photo_url: photo_url || undefined });
   } catch (error) {
     console.error("ERREUR UPDATE CUSTOMER PROFILE :", error);
     res.status(500).json({ error: error.detail || error.message || "Erreur modification profil client marketplace" });
