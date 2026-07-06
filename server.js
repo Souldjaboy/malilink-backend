@@ -1814,6 +1814,10 @@ app.post("/register-saas", async (req, res) => {
        (aucun provider SMS branché) — compte actif immédiatement.
        Avec email : le flux de vérification existant est conservé. */
     const phoneOnlyRegistration = !cleanEmail;
+    /* Tenant de l'inscription : sans lui, la colonne prend le défaut
+       'triangle' et l'entreprise ne peut jamais se connecter depuis
+       malilinkglobal.com ("compte n'appartient pas à cette version"). */
+    const registrationTenant = getTenantFromRequest(req);
 
     const companyResult = await pool.query(
       `
@@ -1834,9 +1838,10 @@ app.post("/register-saas", async (req, res) => {
         trial_start_date,
         trial_end_date,
         subscription_plan,
-        subscription_expires_at
+        subscription_expires_at,
+        tenant_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + ($9 || ' days')::interval,$10,$11,$12,NOW(),NOW() + ($9 || ' days')::interval,$13,NOW() + ($9 || ' days')::interval)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + ($9 || ' days')::interval,$10,$11,$12,NOW(),NOW() + ($9 || ' days')::interval,$13,NOW() + ($9 || ' days')::interval,$14)
       RETURNING *
       `,
       [
@@ -1852,7 +1857,8 @@ app.post("/register-saas", async (req, res) => {
         false,
         phoneOnlyRegistration,
         phoneOnlyRegistration ? "active" : "pending_verification",
-        plan.name || plan_name || ""
+        plan.name || plan_name || "",
+        registrationTenant
       ]
     );
 
@@ -1875,9 +1881,10 @@ app.post("/register-saas", async (req, res) => {
         phone_verified,
         account_status,
         invitation_status,
-        verification_required
+        verification_required,
+        tenant_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING *
       `,
       [
@@ -1893,7 +1900,8 @@ app.post("/register-saas", async (req, res) => {
         phoneOnlyRegistration,
         phoneOnlyRegistration ? "active" : "pending_verification",
         phoneOnlyRegistration ? "active" : "pending_verification",
-        !phoneOnlyRegistration
+        !phoneOnlyRegistration,
+        registrationTenant
       ]
     );
 
@@ -10784,6 +10792,216 @@ app.post("/laboratory/public/results/verify", async (req, res) => {
   }
 });
 
+/* ============================================================
+   NAVIGATION PUBLIQUE CLIENT — MaliLink
+   Le client voit ce que les entreprises publient : véhicules
+   disponibles, biens immobiliers, restaurants et leurs menus.
+   Lecture seule, éléments disponibles uniquement, scopé tenant.
+============================================================ */
+
+app.get("/public/vehicles", async (req, res) => {
+  try {
+    const tenantId = getTenantFromRequest(req);
+    const { q = "", type = "" } = req.query;
+    const values = [tenantId];
+    let where = `WHERE c.tenant_id=$1 AND v.statut='disponible'`;
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND (v.marque ILIKE $${values.length} OR v.modele ILIKE $${values.length} OR c.name ILIKE $${values.length})`;
+    }
+    if (type === "location") where += " AND (v.prix_location_jour > 0 OR v.prix_location_mois > 0)";
+    if (type === "vente") where += " AND v.prix_vente > 0";
+    const result = await pool.query(
+      `SELECT v.id, v.company_id, v.marque, v.modele, v.annee, v.couleur,
+              v.carburant, v.prix_vente, v.prix_location_jour,
+              v.prix_location_mois, v.images, c.name AS company_name
+       FROM vehicles v
+       JOIN companies c ON c.id=v.company_id
+       ${where}
+       ORDER BY v.updated_at DESC
+       LIMIT 100`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR PUBLIC VEHICLES :", error.message);
+    res.status(500).json({ error: "Erreur véhicules publics" });
+  }
+});
+
+app.get("/public/properties", async (req, res) => {
+  try {
+    const tenantId = getTenantFromRequest(req);
+    const { q = "", type = "", city = "" } = req.query;
+    const values = [tenantId];
+    let where = `WHERE c.tenant_id=$1 AND p.status='disponible'`;
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND (p.title ILIKE $${values.length} OR p.description ILIKE $${values.length} OR c.name ILIKE $${values.length})`;
+    }
+    if (city) {
+      values.push(`%${city}%`);
+      where += ` AND p.city ILIKE $${values.length}`;
+    }
+    if (type) {
+      values.push(type);
+      where += ` AND p.type=$${values.length}`;
+    }
+    const result = await pool.query(
+      `SELECT p.id, p.company_id, p.type, p.title, p.description, p.address,
+              p.city, p.surface, p.rooms_count, p.price_sale, p.price_rent_day,
+              p.price_rent_month, p.images, c.name AS company_name
+       FROM properties p
+       JOIN companies c ON c.id=p.company_id
+       ${where}
+       ORDER BY p.updated_at DESC
+       LIMIT 100`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR PUBLIC PROPERTIES :", error.message);
+    res.status(500).json({ error: "Erreur biens immobiliers publics" });
+  }
+});
+
+app.get("/public/restaurants", async (req, res) => {
+  try {
+    const tenantId = getTenantFromRequest(req);
+    const { q = "" } = req.query;
+    const values = [tenantId];
+    let where = `WHERE c.tenant_id=$1`;
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND c.name ILIKE $${values.length}`;
+    }
+    const result = await pool.query(
+      `SELECT c.id AS company_id, c.name AS company_name, c.address, c.phone,
+              COUNT(m.id)::int AS menu_count,
+              MIN(m.price) AS min_price, MAX(m.price) AS max_price
+       FROM companies c
+       JOIN restaurant_menu_items m ON m.company_id=c.id AND m.is_available=true
+       ${where}
+       GROUP BY c.id, c.name, c.address, c.phone
+       ORDER BY c.name ASC
+       LIMIT 100`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR PUBLIC RESTAURANTS :", error.message);
+    res.status(500).json({ error: "Erreur restaurants publics" });
+  }
+});
+
+app.get("/public/restaurants/:companyId/menu", async (req, res) => {
+  try {
+    const tenantId = getTenantFromRequest(req);
+    const companyId = Number(req.params.companyId);
+    const company = await pool.query(
+      `SELECT id, name, address, phone FROM companies WHERE id=$1 AND tenant_id=$2`,
+      [companyId, tenantId]
+    );
+    if (!company.rows[0]) {
+      return res.status(404).json({ error: "Restaurant introuvable." });
+    }
+    const menu = await pool.query(
+      `SELECT id, name, description, category, price, image, preparation_time
+       FROM restaurant_menu_items
+       WHERE company_id=$1 AND is_available=true
+       ORDER BY category ASC, name ASC`,
+      [companyId]
+    );
+    res.json({ restaurant: company.rows[0], menu: menu.rows });
+  } catch (error) {
+    console.error("ERREUR PUBLIC RESTAURANT MENU :", error.message);
+    res.status(500).json({ error: "Erreur menu restaurant" });
+  }
+});
+
+/* Demande client → entreprise (location, achat, réservation, commande).
+   Crée une notification pour les admins de l'entreprise concernée :
+   le client agit, l'entreprise voit la demande dans /notifications. */
+app.post("/public/business-requests", authenticateToken, async (req, res) => {
+  try {
+    const {
+      company_id,
+      module = "",
+      item_id = null,
+      item_label = "",
+      request_type = "demande",
+      message = "",
+      phone = ""
+    } = req.body || {};
+
+    const allowedModules = ["automobile", "immobilier", "hotel", "restaurant"];
+    if (!allowedModules.includes(String(module))) {
+      return res.status(400).json({ error: "Module de demande invalide." });
+    }
+    const companyId = Number(company_id);
+    if (!companyId) {
+      return res.status(400).json({ error: "Entreprise obligatoire." });
+    }
+    const cleanMessage = String(message || "").slice(0, 1000);
+    const cleanLabel = String(item_label || "").slice(0, 200);
+
+    // Le JWT ne contient ni le nom complet ni le téléphone : on lit le
+    // profil réel du client pour que l'entreprise puisse le rappeler.
+    const requester = await pool.query(
+      `SELECT fullname, phone, email FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+    const requesterRow = requester.rows[0] || {};
+    const cleanPhone = String(phone || requesterRow.phone || "").slice(0, 40);
+
+    const tenantId = getTenantFromRequest(req);
+    const company = await pool.query(
+      `SELECT id, name FROM companies WHERE id=$1 AND tenant_id=$2`,
+      [companyId, tenantId]
+    );
+    if (!company.rows[0]) {
+      return res.status(404).json({ error: "Entreprise introuvable." });
+    }
+
+    const admins = await pool.query(
+      `SELECT id FROM users
+       WHERE company_id=$1 AND role IN ('admin','direction','directeur') AND is_active=true
+       LIMIT 5`,
+      [companyId]
+    );
+
+    const clientName =
+      requesterRow.fullname ||
+      (String(requesterRow.email || "").includes("@pending.") ? "" : requesterRow.email) ||
+      "Client MaliLink";
+    const title = `Nouvelle demande client — ${module}`;
+    const body =
+      `${clientName} (${cleanPhone || "téléphone non fourni"}) : ` +
+      `${request_type}${cleanLabel ? ` — ${cleanLabel}` : ""}` +
+      `${cleanMessage ? ` | Message : ${cleanMessage}` : ""}`;
+
+    for (const admin of admins.rows) {
+      await createNotification({
+        user_id: admin.id,
+        title,
+        message: body,
+        type: "demande_client",
+        company_id: companyId,
+        related_entity_type: module,
+        related_entity_id: item_id ? Number(item_id) : null
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Votre demande a été envoyée. L’entreprise vous contactera rapidement."
+    });
+  } catch (error) {
+    console.error("ERREUR BUSINESS REQUEST :", error.message);
+    res.status(500).json({ error: "Erreur envoi de la demande. Réessayez." });
+  }
+});
+
 app.get("/marketplace/cart", authenticateToken, async (req, res) => {
   try {
     res.json(await getMarketplaceCartPayload(req.user));
@@ -12289,7 +12507,7 @@ app.post("/restaurant/menu-items", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO restaurant_menu_items
        (company_id, product_id, name, description, category, price, image,
-        is_available ?? true, preparation_time, publish_on_marketplace, created_by)
+        is_available, preparation_time, publish_on_marketplace, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
       [
