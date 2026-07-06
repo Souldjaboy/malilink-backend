@@ -1701,7 +1701,7 @@ app.post("/register-saas", async (req, res) => {
     } = req.body;
 
     const cleanEmail = String(email || "").trim().toLowerCase();
-    const cleanPhone = String(phone || "").trim();
+    const cleanPhone = normalizeMaliPhone(phone);
 
     if (!company_name || !responsible_name || !password || (!cleanEmail && !cleanPhone)) {
       return res.status(400).json({
@@ -1782,25 +1782,38 @@ app.post("/register-saas", async (req, res) => {
       });
     }
 
+    if (cleanPhone) {
+      const phoneDigits = maliPhoneVariants(cleanPhone).map((variant) => variant.replace(/[^0-9]/g, ""));
+      const existingPhone = await pool.query(
+        `SELECT id FROM users
+         WHERE regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = ANY($1)
+         LIMIT 1`,
+        [phoneDigits]
+      );
+      if (existingPhone.rows.length > 0) {
+        return res.status(400).json({
+          error: "Numéro de téléphone déjà utilisé. Connectez-vous avec votre numéro de téléphone."
+        });
+      }
+    }
+
     const existingUser = await pool.query(
-      `
-      SELECT id
-      FROM users
-      WHERE LOWER(email) = LOWER($1)
-         OR ($2 <> '' AND regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g') = regexp_replace($2, '[^0-9+]', '', 'g'))
-      LIMIT 1
-      `,
-      [cleanEmail || `phone-${cleanPhone}@pending.trianglewmspro.local`, cleanPhone]
+      `SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [cleanEmail || `phone-${cleanPhone}@pending.trianglewmspro.local`]
     );
 
     if (existingUser.rows.length > 0) {
       return res.status(400).json({
-        error: "Cet email ou téléphone existe déjà."
+        error: "Cet email existe déjà."
       });
     }
 
     const trialDays = Number(plan.trial_days || 15);
     const generatedEmail = cleanEmail || `phone-${crypto.randomBytes(8).toString("hex")}@pending.trianglewmspro.local`;
+    /* Inscription par téléphone seul : pas de vérification SMS pour l'instant
+       (aucun provider SMS branché) — compte actif immédiatement.
+       Avec email : le flux de vérification existant est conservé. */
+    const phoneOnlyRegistration = !cleanEmail;
 
     const companyResult = await pool.query(
       `
@@ -1837,8 +1850,8 @@ app.post("/register-saas", async (req, res) => {
         "trial",
         trialDays,
         false,
-        false,
-        "pending_verification",
+        phoneOnlyRegistration,
+        phoneOnlyRegistration ? "active" : "pending_verification",
         plan.name || plan_name || ""
       ]
     );
@@ -1877,10 +1890,10 @@ app.post("/register-saas", async (req, res) => {
         `TRIANGLE-EMP-${company.id}-${Date.now()}`,
         cleanPhone,
         false,
-        false,
-        "pending_verification",
-        "pending_verification",
-        true
+        phoneOnlyRegistration,
+        phoneOnlyRegistration ? "active" : "pending_verification",
+        phoneOnlyRegistration ? "active" : "pending_verification",
+        !phoneOnlyRegistration
       ]
     );
 
@@ -1908,20 +1921,25 @@ app.post("/register-saas", async (req, res) => {
       ]
     );
 
+    let verification = null;
+    let delivery = null;
     const targetType = cleanEmail ? "email" : "phone";
     const targetValue = cleanEmail || cleanPhone;
-    const verification = await createVerificationCode({
-      companyId: company.id,
-      userId: user.id,
-      targetType,
-      targetValue
-    });
-    const delivery = await sendVerificationMessage({
-      targetType,
-      targetValue,
-      code: verification.code,
-      verifyUrl: verification.verify_url
-    });
+
+    if (!phoneOnlyRegistration) {
+      verification = await createVerificationCode({
+        companyId: company.id,
+        userId: user.id,
+        targetType,
+        targetValue
+      });
+      delivery = await sendVerificationMessage({
+        targetType,
+        targetValue,
+        code: verification.code,
+        verifyUrl: verification.verify_url
+      });
+    }
 
     for (const moduleKey of COMPANY_MODULE_KEYS) {
       const requestedKey =
@@ -1949,17 +1967,21 @@ app.post("/register-saas", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Entreprise créée. Vérification obligatoire avant accès complet.",
+      message: phoneOnlyRegistration
+        ? "Compte créé avec succès. Connectez-vous avec votre numéro de téléphone."
+        : "Entreprise créée. Vérification obligatoire avant accès complet.",
       company,
       user,
       plan,
-      verification: {
-        required: true,
-        target_type: targetType,
-        target_value: targetValue,
-        delivery,
-        verify_url: verification.verify_url
-      }
+      verification: phoneOnlyRegistration
+        ? { required: false }
+        : {
+            required: true,
+            target_type: targetType,
+            target_value: targetValue,
+            delivery,
+            verify_url: verification.verify_url
+          }
     });
   } catch (error) {
     console.error("ERREUR REGISTER SAAS :", error);
@@ -2173,6 +2195,31 @@ app.post("/password-reset/confirm", async (req, res) => {
   }
 });
 
+/* ---------- Téléphone : normalisation Mali (+223 par défaut) ----------
+   Le numéro de téléphone est un identifiant de connexion : on stocke la
+   forme canonique +223XXXXXXXX et on compare toutes les variantes
+   (74329225, 223 74 32 92 25, +22374329225, 0022374329225). */
+function normalizeMaliPhone(raw) {
+  const cleaned = String(raw || "").replace(/[^0-9+]/g, "");
+  if (!cleaned) return "";
+  let digits = cleaned.startsWith("+") ? cleaned.slice(1) : cleaned;
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.length === 8) return `+223${digits}`;
+  if (digits.startsWith("223") && digits.length === 11) return `+${digits}`;
+  return `+${digits}`;
+}
+
+function maliPhoneVariants(raw) {
+  const canonical = normalizeMaliPhone(raw);
+  if (!canonical) return [];
+  const digits = canonical.slice(1); // sans le +
+  const variants = new Set([canonical, digits, `00${digits}`]);
+  if (digits.startsWith("223")) {
+    variants.add(digits.slice(3)); // numéro local à 8 chiffres
+  }
+  return Array.from(variants);
+}
+
 /* LOGIN SAAS */
 app.post("/login", async (req, res) => {
   try {
@@ -2186,11 +2233,12 @@ app.post("/login", async (req, res) => {
 
     const usersHasPhone = await columnExists("users", "phone");
     const looksLikeEmail = loginIdentifier.includes("@");
-    const normalizedPhone = loginIdentifier.replace(/[^0-9+]/g, "");
-    const canSearchPhone = usersHasPhone && !looksLikeEmail && normalizedPhone.length >= 6;
+    const phoneVariants = maliPhoneVariants(loginIdentifier);
+    const canSearchPhone = usersHasPhone && !looksLikeEmail && phoneVariants.length > 0 &&
+      loginIdentifier.replace(/[^0-9]/g, "").length >= 6;
 
     const result = await pool.query(
-      `SELECT 
+      `SELECT
         u.*,
         c.name AS company_name,
         c.status AS company_status,
@@ -2207,10 +2255,12 @@ app.post("/login", async (req, res) => {
        LEFT JOIN subscriptions s ON c.id = s.company_id
        LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
        WHERE LOWER(u.email) = LOWER($1)
-          ${canSearchPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9+]', '', 'g') = $2" : ""}
+          ${canSearchPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9]', '', 'g') = ANY($2)" : ""}
        ORDER BY s.id DESC
        LIMIT 1`,
-      canSearchPhone ? [loginIdentifier, normalizedPhone] : [loginIdentifier]
+      canSearchPhone
+        ? [loginIdentifier, phoneVariants.map((variant) => variant.replace(/[^0-9]/g, ""))]
+        : [loginIdentifier]
     );
 
     const user = result.rows[0];
@@ -2253,14 +2303,18 @@ app.post("/login", async (req, res) => {
     const isCustomerAccount = normalizeRole(user.role) === "customer";
 
     if (!isSuperAdmin) {
+      // Comptes sans entreprise (client, livreur) : pas de vérification
+      // entreprise à exiger.
+      const hasNoCompany = !user.company_id;
       const userVerified = user.email_verified === true || user.phone_verified === true;
       const companyVerified =
         isCustomerAccount ||
+        hasNoCompany ||
         user.company_email_verified === true ||
         user.company_phone_verified === true;
       const accountPending =
         String(user.account_status || "").toLowerCase() === "pending_verification" ||
-        (!isCustomerAccount && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
+        (!isCustomerAccount && !hasNoCompany && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
         user.verification_required === true;
 
       if (!userVerified || !companyVerified || accountPending) {
@@ -9616,20 +9670,60 @@ app.post("/marketplace/customers/register", async (req, res) => {
   try {
     const { fullname, email, phone, password, country = "", city = "", address = "" } = req.body || {};
     const cleanEmail = String(email || "").trim().toLowerCase();
-    const cleanPhone = String(phone || "").trim();
+    const cleanPhone = normalizeMaliPhone(phone);
     if (!fullname || (!cleanEmail && !cleanPhone) || !password) {
       return res.status(400).json({ error: "Nom, contact et mot de passe obligatoires." });
     }
+
+    if (cleanPhone) {
+      const phoneDigits = maliPhoneVariants(cleanPhone).map((variant) => variant.replace(/[^0-9]/g, ""));
+      const existingPhone = await pool.query(
+        `SELECT id FROM users
+         WHERE regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = ANY($1)
+         LIMIT 1`,
+        [phoneDigits]
+      );
+      if (existingPhone.rows.length > 0) {
+        return res.status(400).json({
+          error: "Numéro de téléphone déjà utilisé. Connectez-vous avec votre numéro de téléphone."
+        });
+      }
+    }
+
+    if (cleanEmail) {
+      const existingEmail = await pool.query(
+        `SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+        [cleanEmail]
+      );
+      if (existingEmail.rows.length > 0) {
+        return res.status(400).json({ error: "Cet email existe déjà." });
+      }
+    }
+
     const storedEmail = cleanEmail || `customer-${Date.now()}-${Math.floor(Math.random() * 100000)}@pending.trianglewmspro.local`;
+
+    /* Inscription par téléphone seul : pas de vérification SMS pour
+       l'instant (aucun provider SMS branché) — le compte est actif
+       immédiatement, téléphone + mot de passe suffisent.
+       Avec email : le flux de vérification existant est conservé. */
+    const phoneOnly = !cleanEmail;
 
     const passwordHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
     const userResult = await pool.query(
       `INSERT INTO users
        (fullname, email, phone, password, role, is_active, account_status,
-        verification_required, created_at)
-       VALUES ($1,$2,$3,$4,'customer',true,'pending_verification',true,NOW())
+        verification_required, phone_verified, created_at)
+       VALUES ($1,$2,$3,$4,'customer',true,$5,$6,$7,NOW())
        RETURNING id, fullname, email, phone, role`,
-      [fullname, storedEmail, cleanPhone, passwordHash]
+      [
+        fullname,
+        storedEmail,
+        cleanPhone,
+        passwordHash,
+        phoneOnly ? "active" : "pending_verification",
+        !phoneOnly,
+        phoneOnly
+      ]
     );
     const user = userResult.rows[0];
 
@@ -9640,8 +9734,30 @@ app.post("/marketplace/customers/register", async (req, res) => {
       [user.id, fullname, cleanEmail, cleanPhone, country, city, address]
     );
 
-    const targetType = cleanEmail ? "email" : "phone";
-    const targetValue = cleanEmail || cleanPhone;
+    if (phoneOnly) {
+      const token = jwt.sign(
+        {
+          id: user.id,
+          email: user.email,
+          role: "customer",
+          company_id: null,
+          is_super_admin: false
+        },
+        JWT_SECRET,
+        { expiresIn: "1d" }
+      );
+
+      return res.status(201).json({
+        success: true,
+        message: "Compte créé avec succès. Connectez-vous avec votre numéro de téléphone.",
+        token,
+        user,
+        verification: { required: false }
+      });
+    }
+
+    const targetType = "email";
+    const targetValue = cleanEmail;
     const verification = await createVerificationCode({
       companyId: null,
       userId: user.id,
@@ -18270,7 +18386,19 @@ app.post("/disbursement-requests/:id/close", authenticateToken, async (req, res)
 const createDeliveryRouter = require("./routes/delivery");
 app.use(
   "/delivery",
-  createDeliveryRouter({ pool, authenticateToken, authorizeRoles })
+  createDeliveryRouter({
+    pool,
+    authenticateToken,
+    authorizeRoles,
+    publicRegistration: {
+      bcrypt,
+      jwt,
+      jwtSecret: JWT_SECRET,
+      bcryptRounds: BCRYPT_ROUNDS,
+      normalizePhone: normalizeMaliPhone,
+      phoneVariants: maliPhoneVariants
+    }
+  })
 );
 
 const createEducationRouter = require("./routes/education");

@@ -15,6 +15,7 @@
  */
 
 const express = require("express");
+const { createRateLimiter } = require("../middleware/rateLimit");
 
 function haversineKm(lat1, lng1, lat2, lng2) {
   const toRad = (d) => (d * Math.PI) / 180;
@@ -27,8 +28,155 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-module.exports = function createDeliveryRouter({ pool, authenticateToken, authorizeRoles }) {
+module.exports = function createDeliveryRouter({
+  pool,
+  authenticateToken,
+  authorizeRoles,
+  publicRegistration
+}) {
   const router = express.Router();
+
+  /* ---------- Inscription livreur PUBLIQUE (une étape, sans compte) ----------
+     Crée le compte utilisateur (rôle livreur, identifiant = téléphone,
+     email optionnel) + le profil livreur, puis renvoie un token JWT :
+     le nouveau livreur arrive directement sur /livreur.
+     Déclarée AVANT router.use(authenticateToken). */
+  if (publicRegistration) {
+    const { bcrypt, jwt, jwtSecret, bcryptRounds, normalizePhone, phoneVariants } =
+      publicRegistration;
+    const publicRegisterLimiter = createRateLimiter({
+      windowMs: 10 * 60 * 1000,
+      max: 15,
+      message: "Trop de tentatives d’inscription. Réessayez dans quelques minutes."
+    });
+
+    router.post("/drivers/public-register", publicRegisterLimiter, async (req, res) => {
+      const client = await pool.connect();
+      try {
+        const {
+          fullname,
+          phone,
+          email,
+          password,
+          driver_type = "livreur",
+          vehicle_type = "moto",
+          vehicle_plate,
+          license_number,
+          city = ""
+        } = req.body || {};
+
+        const cleanFullname = String(fullname || "").trim();
+        const cleanPhone = normalizePhone(phone);
+        const cleanEmail = String(email || "").trim().toLowerCase();
+        const cleanPassword = String(password || "");
+
+        if (!cleanFullname || !cleanPhone || !cleanPassword) {
+          return res.status(400).json({
+            error: "Nom complet, numéro de téléphone et mot de passe obligatoires."
+          });
+        }
+        if (cleanPassword.length < 6) {
+          return res.status(400).json({
+            error: "Le mot de passe doit contenir au moins 6 caractères."
+          });
+        }
+        if (!["livreur", "coursier", "taxi", "transporteur"].includes(driver_type)) {
+          return res.status(400).json({ error: "Type de livreur invalide" });
+        }
+
+        const phoneDigits = phoneVariants(cleanPhone).map((variant) =>
+          variant.replace(/[^0-9]/g, "")
+        );
+        const existingPhone = await client.query(
+          `SELECT id FROM users
+           WHERE regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = ANY($1)
+           LIMIT 1`,
+          [phoneDigits]
+        );
+        if (existingPhone.rows.length > 0) {
+          return res.status(400).json({
+            error: "Numéro de téléphone déjà utilisé. Connectez-vous avec votre numéro de téléphone."
+          });
+        }
+
+        if (cleanEmail) {
+          const existingEmail = await client.query(
+            `SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+            [cleanEmail]
+          );
+          if (existingEmail.rows.length > 0) {
+            return res.status(400).json({ error: "Cet email existe déjà." });
+          }
+        }
+
+        const storedEmail =
+          cleanEmail ||
+          `driver-${Date.now()}-${Math.floor(Math.random() * 100000)}@pending.trianglewmspro.local`;
+        const passwordHash = await bcrypt.hash(cleanPassword, bcryptRounds);
+
+        await client.query("BEGIN");
+
+        // phone_verified=true : pas de vérification SMS pour l'instant,
+        // téléphone + mot de passe suffisent (le login exige un contact vérifié).
+        const userResult = await client.query(
+          `INSERT INTO users
+             (fullname, email, phone, password, role, is_active, account_status,
+              verification_required, phone_verified, created_at)
+           VALUES ($1,$2,$3,$4,'livreur',true,'active',false,true,NOW())
+           RETURNING id, fullname, email, phone, role`,
+          [cleanFullname, storedEmail, cleanPhone, passwordHash]
+        );
+        const user = userResult.rows[0];
+
+        const driverResult = await client.query(
+          `INSERT INTO delivery_drivers
+             (tenant_id, user_id, driver_type, vehicle_type, vehicle_plate,
+              license_number, phone)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           RETURNING *`,
+          [
+            req.tenant_id || "malilink",
+            user.id,
+            driver_type,
+            vehicle_type,
+            vehicle_plate || null,
+            license_number || null,
+            cleanPhone
+          ]
+        );
+
+        await client.query("COMMIT");
+
+        const token = jwt.sign(
+          {
+            id: user.id,
+            email: user.email,
+            role: "livreur",
+            company_id: null,
+            is_super_admin: false,
+            tenant_id: req.tenant_id || "malilink"
+          },
+          jwtSecret,
+          { expiresIn: "1d" }
+        );
+
+        res.status(201).json({
+          success: true,
+          message:
+            "Compte créé avec succès. Votre demande est en attente de validation par MaliLink.",
+          token,
+          user: { ...user, city },
+          driver: driverResult.rows[0]
+        });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        console.error("ERREUR INSCRIPTION LIVREUR PUBLIQUE :", error.message);
+        res.status(500).json({ error: "Erreur inscription livreur. Réessayez." });
+      } finally {
+        client.release();
+      }
+    });
+  }
 
   // Toutes les routes livraison exigent une authentification
   router.use(authenticateToken);
