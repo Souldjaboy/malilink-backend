@@ -479,34 +479,55 @@ module.exports = function createAiRouter({ pool, authenticateToken }) {
       ]);
 
       if (!process.env.OPENROUTER_API_KEY) {
-        return res.json({ answer: AI_UNAVAILABLE_MESSAGE, space, fallback: true });
+        console.error("AI CHAT — OPENROUTER_API_KEY absente de backend/.env");
+        const isAdmin = ["admin", "super_admin"].includes(String(req.user?.role || "").toLowerCase());
+        return res.json({
+          answer: isAdmin
+            ? "Assistant IA non configuré. Administrateur : ajoutez OPENROUTER_API_KEY dans backend/.env puis redémarrez le backend."
+            : AI_UNAVAILABLE_MESSAGE,
+          space,
+          fallback: true
+        });
       }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+      const requestBody = JSON.stringify({
+        model: process.env.OPENROUTER_MODEL || "openrouter/auto",
+        messages: [
+          { role: "system", content: buildSystemPrompt(space, req.user, context, knowledge) },
+          ...history,
+          { role: "user", content: message }
+        ]
+      });
 
-      let aiResponse;
-      try {
-        aiResponse = await fetch(OPENROUTER_URL, {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://malilinkglobal.com",
-            "X-Title": "MaliLink Global"
-          },
-          body: JSON.stringify({
-            model: "openrouter/auto",
-            messages: [
-              { role: "system", content: buildSystemPrompt(space, req.user, context, knowledge) },
-              ...history,
-              { role: "user", content: message }
-            ]
-          })
-        });
-      } finally {
-        clearTimeout(timeout);
+      // Retry limité : 2 tentatives (échec réseau, timeout ou 5xx fournisseur).
+      let aiResponse = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+        try {
+          aiResponse = await fetch(OPENROUTER_URL, {
+            method: "POST",
+            signal: controller.signal,
+            headers: {
+              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+              "Content-Type": "application/json",
+              "HTTP-Referer": "https://malilinkglobal.com",
+              "X-Title": "MaliLink Global"
+            },
+            body: requestBody
+          });
+          if (aiResponse.status < 500) break;
+          console.error(`AI CHAT — statut fournisseur ${aiResponse.status} (tentative ${attempt}/2)`);
+        } catch (fetchError) {
+          console.error(`AI CHAT — ${fetchError?.name === "AbortError" ? "timeout" : "erreur réseau"} (tentative ${attempt}/2)`);
+          aiResponse = null;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      if (!aiResponse) {
+        return res.json({ answer: AI_UNAVAILABLE_MESSAGE, space, fallback: true });
       }
 
       const payload = await aiResponse.json().catch(() => ({}));
