@@ -6,6 +6,8 @@
  * se font ici, côté backend — jamais seulement côté frontend.
  */
 
+/* Communauté professionnelle et sociale (type Facebook/LinkedIn).
+   Aucun objectif de rencontre/dating : retiré volontairement du produit. */
 const GOALS = [
   "amitie",
   "discussion",
@@ -14,8 +16,7 @@ const GOALS = [
   "activites_sorties",
   "collaborateurs",
   "suivre_createurs",
-  "decouvrir",
-  "rencontres" // réservé aux adultes (18+), opt-in explicite
+  "decouvrir"
 ];
 
 const AUDIENCES = ["public", "friends", "followers", "me"];

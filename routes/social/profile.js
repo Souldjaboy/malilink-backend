@@ -51,8 +51,7 @@ module.exports = function registerProfileRoutes(router, { pool, helpers }) {
         company_name = "",
         goals,
         interests,
-        is_public = true,
-        dating_opt_in = false
+        is_public = true
       } = req.body || {};
 
       const cleanDisplayName = String(display_name || "").trim().slice(0, 80);
@@ -74,17 +73,16 @@ module.exports = function registerProfileRoutes(router, { pool, helpers }) {
         return res.status(403).json({ error: "MaliLink Social est réservé aux 13 ans et plus." });
       }
 
-      // Rencontres : opt-in explicite ET 18 ans minimum, contrôlé ici.
-      const cleanGoals = sanitizeStringArray(goals).filter((goal) => GOALS.includes(goal));
-      const wantsDating = dating_opt_in === true || cleanGoals.includes("rencontres");
-      if (wantsDating && age < 18) {
-        return res.status(403).json({
-          error: "Le mode rencontres est réservé aux personnes majeures (18 ans et plus)."
+      // Photo de profil obligatoire : pas de réseau social sans visage.
+      const cleanPhoto = String(photo_url || "").slice(0, 500);
+      if (!cleanPhoto) {
+        return res.status(400).json({
+          error: "La photo de profil est obligatoire pour utiliser MaliLink Social."
         });
       }
-      const finalGoals = wantsDating && age >= 18
-        ? cleanGoals
-        : cleanGoals.filter((goal) => goal !== "rencontres");
+
+      // Communauté professionnelle et sociale : aucun objectif rencontre.
+      const finalGoals = sanitizeStringArray(goals).filter((goal) => GOALS.includes(goal));
 
       if (cleanUsername) {
         const taken = await pool.query(
@@ -103,7 +101,7 @@ module.exports = function registerProfileRoutes(router, { pool, helpers }) {
         cleanUsername,
         cleanDisplayName,
         String(bio || "").slice(0, 1000),
-        String(photo_url || "").slice(0, 500),
+        cleanPhoto,
         String(cover_url || "").slice(0, 500),
         birth_date,
         String(gender || "").slice(0, 30),
@@ -115,7 +113,7 @@ module.exports = function registerProfileRoutes(router, { pool, helpers }) {
         JSON.stringify(finalGoals),
         JSON.stringify(sanitizeStringArray(interests, { maxItems: 25 })),
         is_public !== false,
-        wantsDating && age >= 18
+        false // dating retiré du produit : jamais activé
       ];
 
       const { rows } = await pool.query(
@@ -148,13 +146,12 @@ module.exports = function registerProfileRoutes(router, { pool, helpers }) {
         values
       );
 
-      // Confidentialité et préférences par défaut (visibilité minimale
-      // pour la rencontre : dating_enabled suit l'opt-in explicite).
+      // Confidentialité et préférences par défaut (visibilité minimale).
       await pool.query(
         `INSERT INTO social_privacy_settings (user_id, dating_enabled)
          VALUES ($1,$2)
          ON CONFLICT (user_id) DO UPDATE SET dating_enabled=$2, updated_at=NOW()`,
-        [req.user.id, wantsDating && age >= 18]
+        [req.user.id, false]
       );
       await pool.query(
         `INSERT INTO social_preferences (user_id) VALUES ($1)
@@ -244,8 +241,8 @@ module.exports = function registerProfileRoutes(router, { pool, helpers }) {
 
       const current = (await getPrivacy(req.user.id)) || {};
       const age = ageFromBirthDate(profile.birth_date);
-      const datingRequested = boolOr(body.dating_enabled, current.dating_enabled === true);
-      const datingEnabled = datingRequested && age !== null && age >= 18 && profile.dating_opt_in === true;
+      // Dating retiré du produit : toujours désactivé, quelle que soit la demande.
+      const datingEnabled = false;
 
       const { rows } = await pool.query(
         `INSERT INTO social_privacy_settings

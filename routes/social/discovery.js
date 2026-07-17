@@ -6,8 +6,7 @@
  *
  * Règles appliquées côté backend :
  * - jamais de profil bloqué (dans un sens ou l'autre) ;
- * - la section rencontres n'apparie que des adultes (18+) ayant
- *   explicitement opté pour la visibilité rencontre, des deux côtés ;
+ * - communauté professionnelle et sociale : aucun mode rencontre ;
  * - l'algorithme n'utilise que les préférences déclarées.
  */
 
@@ -41,21 +40,7 @@ module.exports = function registerDiscoveryRoutes(router, { pool, helpers, creat
       const myPrefs =
         (await pool.query("SELECT * FROM social_preferences WHERE user_id=$1", [req.user.id]))
           .rows[0] || {};
-      const myPrivacy = await getPrivacy(req.user.id);
-      const myAge = ageFromBirthDate(me.birth_date);
 
-      const datingSection = section === "rencontres";
-      if (datingSection) {
-        const flags = await helpers.getFeatureFlags();
-        if (flags.social_dating_enabled === false) {
-          return res.status(503).json({ error: "Le mode rencontres est désactivé pour le moment." });
-        }
-        if (myAge === null || myAge < 18 || me.dating_opt_in !== true || myPrivacy?.dating_enabled !== true) {
-          return res.status(403).json({
-            error: "Le mode rencontres est réservé aux adultes ayant activé cette option."
-          });
-        }
-      }
 
       const values = [req.user.id, req.tenant_id || "malilink"];
       let where = `
@@ -76,20 +61,12 @@ module.exports = function registerDiscoveryRoutes(router, { pool, helpers, creat
         AND COALESCE(pr.allow_suggestions, true) = true
       `;
 
-      if (datingSection) {
-        // Des deux côtés : adulte + opt-in + confidentialité rencontre active.
+      // Section "professionnels" : profils avec profession ou objectif pro.
+      if (section === "professionnels") {
         where += `
-          AND p.dating_opt_in=true
-          AND COALESCE(pr.dating_enabled,false)=true
-          AND p.birth_date IS NOT NULL
-          AND date_part('year', age(p.birth_date)) >= 18
+          AND (p.profession <> ''
+               OR p.goals ?| ARRAY['reseau_professionnel','collaborateurs','partenariat_commercial'])
         `;
-      }
-
-      const genders = Array.isArray(myPrefs.discover_genders) ? myPrefs.discover_genders : [];
-      if (genders.length > 0) {
-        values.push(genders);
-        where += ` AND p.gender = ANY($${values.length})`;
       }
       if (section === "meme_ville" || myPrefs.city) {
         const city = section === "meme_ville" ? me.city : myPrefs.city;
