@@ -20,8 +20,9 @@ const { createHelpers } = require("./helpers");
 const registerProfileRoutes = require("./profile");
 const registerDiscoveryRoutes = require("./discovery");
 const registerPostRoutes = require("./posts");
+const registerMessageRoutes = require("./messages");
 
-module.exports = function createSocialRouter({ pool, authenticateToken, createNotification }) {
+module.exports = function createSocialRouter({ pool, authenticateToken, createNotification, realtime }) {
   const router = express.Router();
   const helpers = createHelpers({ pool });
 
@@ -50,12 +51,19 @@ module.exports = function createSocialRouter({ pool, authenticateToken, createNo
     return writeLimiter(req, res, next);
   });
 
-  const context = { pool, helpers, createNotification };
+  const context = { pool, helpers, createNotification, realtime };
 
   registerProfileRoutes(router, context);
   registerDiscoveryRoutes(router, context);
 
-  // Publications derrière leur propre flag.
+  // Messagerie : flag scopé sur /messages uniquement (coupable
+  // instantanément sans impacter le reste du module).
+  router.use("/messages", helpers.requireFlag("social_messages_enabled"));
+  registerMessageRoutes(router, context);
+
+  // Publications derrière leur propre flag (routes /feed, /posts, /saved,
+  // /comments — montées en dernier : le middleware ne gêne aucune route
+  // déclarée avant).
   const postsRouter = express.Router();
   registerPostRoutes(postsRouter, context);
   router.use("/", helpers.requireFlag("social_posts_enabled"), postsRouter);

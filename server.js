@@ -18696,9 +18696,18 @@ app.use(
 const createAiRouter = require("./routes/ai");
 app.use("/ai", createAiRouter({ pool, authenticateToken }));
 
-const createSocialRouter = require("./routes/social");
-app.use("/social", createSocialRouter({ pool, authenticateToken, createNotification }));
+/* Temps réel : Express est enveloppé dans un serveur HTTP natif pour
+   accueillir Socket.io — aucun changement pour les routes existantes. */
+const http = require("http");
+const httpServer = http.createServer(app);
+const { createRealtime } = require("./socket");
+const realtime = createRealtime({ httpServer, jwt, jwtSecret: JWT_SECRET, pool });
+app.set("realtime", realtime);
 
-app.listen(process.env.PORT || 5050, () => {
-  console.log("Backend sécurisé démarré sur le port 5050");
+const createSocialRouter = require("./routes/social");
+app.use("/social", createSocialRouter({ pool, authenticateToken, createNotification, realtime }));
+
+const listenPort = process.env.PORT || 5050;
+httpServer.listen(listenPort, () => {
+  console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
 });

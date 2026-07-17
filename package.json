@@ -29,6 +29,7 @@
     "openai": "^6.38.0",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",
-    "react-qr-scanner": "^1.0.0-alpha.11"
+    "react-qr-scanner": "^1.0.0-alpha.11",
+    "socket.io": "^4.8.3"
   }
 }
