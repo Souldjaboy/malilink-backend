@@ -18696,6 +18696,9 @@ app.use(
 const createAiRouter = require("./routes/ai");
 app.use("/ai", createAiRouter({ pool, authenticateToken }));
 
+const createSocialRouter = require("./routes/social");
+app.use("/social", createSocialRouter({ pool, authenticateToken, createNotification }));
+
 app.listen(process.env.PORT || 5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
 });
