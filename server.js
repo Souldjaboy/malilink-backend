@@ -18707,6 +18707,9 @@ app.set("realtime", realtime);
 const createSocialRouter = require("./routes/social");
 app.use("/social", createSocialRouter({ pool, authenticateToken, createNotification, realtime }));
 
+const createBadgesRouter = require("./routes/badges");
+app.use("/badges", createBadgesRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser }));
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
