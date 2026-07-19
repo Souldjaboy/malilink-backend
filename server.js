@@ -18710,6 +18710,19 @@ app.use("/social", createSocialRouter({ pool, authenticateToken, createNotificat
 const createBadgesRouter = require("./routes/badges");
 app.use("/badges", createBadgesRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser }));
 
+const createWalletRouter = require("./routes/wallet");
+app.use(
+  "/wallet",
+  createWalletRouter({
+    pool,
+    authenticateToken,
+    createNotification,
+    isSuperAdminUser,
+    getEffectiveCompanyId,
+    phoneVariants: maliPhoneVariants
+  })
+);
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
