@@ -18723,6 +18723,12 @@ app.use(
   })
 );
 
+const createFinanceRouter = require("./routes/finance");
+app.use(
+  "/finance",
+  createFinanceRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser })
+);
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
