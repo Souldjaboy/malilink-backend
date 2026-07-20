@@ -18719,7 +18719,8 @@ app.use(
     createNotification,
     isSuperAdminUser,
     getEffectiveCompanyId,
-    phoneVariants: maliPhoneVariants
+    phoneVariants: maliPhoneVariants,
+    bcrypt
   })
 );
 

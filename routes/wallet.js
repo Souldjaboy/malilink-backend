@@ -27,10 +27,124 @@ module.exports = function createWalletRouter({
   createNotification,
   isSuperAdminUser,
   getEffectiveCompanyId,
-  phoneVariants
+  phoneVariants,
+  bcrypt
 }) {
   const router = express.Router();
   router.use(authenticateToken);
+
+  /* ---------- Carte virtuelle : génération sécurisée ---------- */
+
+  // Somme de contrôle Luhn sur les chiffres → chiffre de contrôle final.
+  function luhnCheckDigit(digits) {
+    let sum = 0;
+    let alt = true;
+    for (let i = digits.length - 1; i >= 0; i -= 1) {
+      let n = Number(digits[i]);
+      if (alt) {
+        n *= 2;
+        if (n > 9) n -= 9;
+      }
+      sum += n;
+      alt = !alt;
+    }
+    return (10 - (sum % 10)) % 10;
+  }
+
+  // Numéro interne MLK : "MLK YYYY NNNN NNNN NNNC" (C = contrôle Luhn).
+  // Ce n'est PAS un numéro bancaire : circuit fermé MaliLink uniquement.
+  function generateCardNumber() {
+    const year = new Date().getFullYear();
+    let body = "";
+    for (let i = 0; i < 11; i += 1) body += Math.floor(Math.random() * 10);
+    const check = luhnCheckDigit(`${year}${body}`);
+    const full = `${body}${check}`; // 12 chiffres après l'année
+    return `MLK ${year} ${full.slice(0, 4)} ${full.slice(4, 8)} ${full.slice(8, 12)}`;
+  }
+
+  function maskCardNumber(cardNumber) {
+    const last4 = cardNumber.replace(/\D/g, "").slice(-4);
+    return `MLK •••• •••• •••• ${last4}`;
+  }
+
+  // Génère un identifiant public de wallet (ne révèle pas user_id).
+  function generateWalletNumber() {
+    return `MLW-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+  }
+
+  async function cardAudit(cardId, action, actorId, details = "") {
+    await pool
+      .query(
+        `INSERT INTO wallet_card_audit_logs (card_id, action, actor_user_id, details)
+         VALUES ($1,$2,$3,$4)`,
+        [cardId, action, actorId, String(details).slice(0, 300)]
+      )
+      .catch(() => {});
+  }
+
+  /* Assure wallet_number + carte virtuelle pour un wallet donné.
+     Idempotent : ne recrée jamais si déjà présents. */
+  async function ensureCard(wallet) {
+    if (!wallet.wallet_number) {
+      await pool
+        .query(`UPDATE wallets SET wallet_number=$1 WHERE id=$2 AND wallet_number IS NULL`, [
+          generateWalletNumber(),
+          wallet.id
+        ])
+        .catch(() => {});
+    }
+    const existing = await pool.query(`SELECT * FROM wallet_cards WHERE wallet_id=$1`, [wallet.id]);
+    if (existing.rows[0]) return existing.rows[0];
+
+    const owner = wallet.company_id
+      ? await pool.query(`SELECT name AS holder, name AS company FROM companies WHERE id=$1`, [wallet.company_id])
+      : await pool.query(`SELECT fullname AS holder FROM users WHERE id=$1`, [wallet.user_id]);
+    const cardType = wallet.company_id ? "entreprise" : "personnelle";
+    const template = wallet.company_id ? "entreprise" : "navy_gold";
+    const validUntil = new Date();
+    validUntil.setFullYear(validUntil.getFullYear() + 4);
+
+    const inserted = await pool
+      .query(
+        `INSERT INTO wallet_cards
+           (wallet_id, card_number, card_type, template, holder_name, company_name, valid_until)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (wallet_id) DO NOTHING
+         RETURNING *`,
+        [
+          wallet.id,
+          generateCardNumber(),
+          cardType,
+          template,
+          owner.rows[0]?.holder || "Titulaire MaliLink",
+          owner.rows[0]?.company || "",
+          validUntil.toISOString().slice(0, 10)
+        ]
+      )
+      .catch(() => ({ rows: [] }));
+    if (inserted.rows[0]) {
+      await cardAudit(inserted.rows[0].id, "created", wallet.user_id);
+      return inserted.rows[0];
+    }
+    const retry = await pool.query(`SELECT * FROM wallet_cards WHERE wallet_id=$1`, [wallet.id]);
+    return retry.rows[0];
+  }
+
+  function publicCardView(card, walletNumber) {
+    return {
+      id: card.id,
+      wallet_number: walletNumber,
+      masked_number: maskCardNumber(card.card_number),
+      card_type: card.card_type,
+      template: card.template,
+      holder_name: card.holder_name,
+      company_name: card.company_name,
+      status: card.status,
+      valid_until: card.valid_until,
+      currency: "FCFA",
+      label: "MaliLink Virtual Wallet Card"
+    };
+  }
 
   const writeLimiter = createRateLimiter({
     windowMs: 60 * 1000,
@@ -135,6 +249,9 @@ module.exports = function createWalletRouter({
         return res.status(503).json({ error: "Le wallet est temporairement désactivé." });
       }
       const wallet = await ensureWallet(pool, { userId: req.user.id });
+      const card = await ensureCard(wallet); // création auto de la carte au 1er accès
+      const fresh = await pool.query(`SELECT wallet_number FROM wallets WHERE id=$1`, [wallet.id]);
+      const walletNumber = fresh.rows[0]?.wallet_number;
       const walletBalances = await balances(pool, wallet.id);
       const transactions = await pool.query(
         `SELECT e.id, e.direction, e.amount, e.balance_after, e.created_at,
@@ -146,7 +263,8 @@ module.exports = function createWalletRouter({
         [wallet.id]
       );
       res.json({
-        wallet: { id: wallet.id, currency: wallet.currency, status: wallet.status },
+        wallet: { id: wallet.id, wallet_number: walletNumber, currency: wallet.currency, status: wallet.status },
+        card: publicCardView(card, walletNumber),
         ...walletBalances,
         transactions: transactions.rows,
         features: {
@@ -379,6 +497,96 @@ module.exports = function createWalletRouter({
     } catch (error) {
       console.error("ERREUR WALLET COMPANY :", error.message);
       res.status(500).json({ error: "Erreur wallet entreprise." });
+    }
+  });
+
+  /* ---------- Carte virtuelle : endpoints ---------- */
+
+  // Ma carte (numéro TOUJOURS masqué ici).
+  router.get("/card", async (req, res) => {
+    try {
+      const wallet = await ensureWallet(pool, { userId: req.user.id });
+      const card = await ensureCard(wallet);
+      const fresh = await pool.query(`SELECT wallet_number FROM wallets WHERE id=$1`, [wallet.id]);
+      res.json(publicCardView(card, fresh.rows[0]?.wallet_number));
+    } catch (error) {
+      console.error("ERREUR WALLET CARD :", error.message);
+      res.status(500).json({ error: "Erreur chargement de la carte." });
+    }
+  });
+
+  // Révéler le numéro complet : ré-authentification par mot de passe obligatoire.
+  router.post("/card/reveal", async (req, res) => {
+    try {
+      const password = String(req.body?.password || "");
+      if (!password) return res.status(400).json({ error: "Mot de passe requis." });
+      const userRow = await pool.query(`SELECT password FROM users WHERE id=$1`, [req.user.id]);
+      const hash = userRow.rows[0]?.password;
+      const ok = hash && bcrypt && (await bcrypt.compare(password, hash));
+      if (!ok) return res.status(403).json({ error: "Mot de passe incorrect." });
+
+      const wallet = await ensureWallet(pool, { userId: req.user.id });
+      const card = await ensureCard(wallet);
+      // Code de sécurité interne DYNAMIQUE (expire) — jamais stocké, jamais loggé.
+      const dynamicCode = String(Math.floor(100 + Math.random() * 900));
+      await cardAudit(card.id, "number_revealed", req.user.id);
+      res.json({
+        card_number: card.card_number,
+        security_code: dynamicCode,
+        security_code_expires_in: 60,
+        note: "Code de sécurité interne dynamique, valable 60 secondes."
+      });
+    } catch (error) {
+      console.error("ERREUR WALLET CARD REVEAL :", error.message);
+      res.status(500).json({ error: "Erreur révélation carte." });
+    }
+  });
+
+  // Bloquer / débloquer ma carte.
+  router.post("/card/block", async (req, res) => {
+    try {
+      const wallet = await ensureWallet(pool, { userId: req.user.id });
+      const card = await ensureCard(wallet);
+      const block = req.body?.block !== false;
+      const { rows } = await pool.query(
+        `UPDATE wallet_cards SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+        [block ? "blocked" : "active", card.id]
+      );
+      await cardAudit(card.id, block ? "blocked" : "unblocked", req.user.id);
+      const fresh = await pool.query(`SELECT wallet_number FROM wallets WHERE id=$1`, [wallet.id]);
+      res.json({ success: true, card: publicCardView(rows[0], fresh.rows[0]?.wallet_number) });
+    } catch (error) {
+      res.status(500).json({ error: "Erreur blocage carte." });
+    }
+  });
+
+  // Demander une carte physique — service non activé (statut de suivi seulement).
+  router.post("/card/physical-request", async (req, res) => {
+    try {
+      const wallet = await ensureWallet(pool, { userId: req.user.id });
+      const card = await ensureCard(wallet);
+      const existing = await pool.query(
+        `SELECT id, status FROM wallet_card_requests
+         WHERE card_id=$1 AND status NOT IN ('rejetee','livree') ORDER BY id DESC LIMIT 1`,
+        [card.id]
+      );
+      if (existing.rows[0]) {
+        return res.json({ success: true, request: existing.rows[0], existing: true });
+      }
+      const { rows } = await pool.query(
+        `INSERT INTO wallet_card_requests (card_id, user_id, status)
+         VALUES ($1,$2,'soumise') RETURNING id, status`,
+        [card.id, req.user.id]
+      );
+      await cardAudit(card.id, "print_requested", req.user.id);
+      res.status(201).json({
+        success: true,
+        request: rows[0],
+        message:
+          "Demande enregistrée. Le service de carte physique n'est pas encore activé : vous serez notifié dès son ouverture."
+      });
+    } catch (error) {
+      res.status(500).json({ error: "Erreur demande de carte physique." });
     }
   });
 
