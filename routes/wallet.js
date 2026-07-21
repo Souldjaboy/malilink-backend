@@ -18,6 +18,7 @@
 const crypto = require("crypto");
 const express = require("express");
 const { createRateLimiter } = require("../middleware/rateLimit");
+const ledger = require("../services/wallet-ledger");
 
 const MAX_AMOUNT = 10000000; // 10 000 000 FCFA par opération interne
 
@@ -391,19 +392,22 @@ module.exports = function createWalletRouter({
         });
       }
 
-      const tx = await client.query(
-        `INSERT INTO wallet_transactions
-           (tenant_id, reference, idempotency_key, kind, status, description, initiated_by, completed_at)
-         VALUES ($1,$2,$3,'transfer','completed',$4,$5,NOW())
-         RETURNING id, reference`,
-        [req.tenant_id || "malilink", reference(), idempotencyKey, note || "Transfert MaliLink", req.user.id]
-      );
-      await writeEntry(client, senderWallet.id, "debit", amount, tx.rows[0].id);
-      await writeEntry(client, recipientWallet.id, "credit", amount, tx.rows[0].id);
+      // Service partagé : écritures grand livre + compta auto (source unique).
+      const result = await ledger.postLedgerTransaction(client, {
+        tenantId: req.tenant_id || "malilink",
+        kind: "transfer",
+        description: note || "Transfert MaliLink",
+        initiatedBy: req.user.id,
+        idempotencyKey,
+        legs: [
+          { walletId: senderWallet.id, direction: "debit", amount, companyId: senderWallet.company_id },
+          { walletId: recipientWallet.id, direction: "credit", amount, companyId: recipientWallet.company_id }
+        ]
+      });
       await client.query("COMMIT");
 
-      await audit(senderWallet.id, tx.rows[0].id, "transfer_out", req.user.id, `${amount} FCFA → user ${recipientId}`);
-      await audit(recipientWallet.id, tx.rows[0].id, "transfer_in", req.user.id, `${amount} FCFA`);
+      await audit(senderWallet.id, result.transactionId, "transfer_out", req.user.id, `${amount} FCFA → user ${recipientId}`);
+      await audit(recipientWallet.id, result.transactionId, "transfer_in", req.user.id, `${amount} FCFA`);
       if (createNotification) {
         await createNotification({
           user_id: recipientId,
@@ -413,7 +417,7 @@ module.exports = function createWalletRouter({
           company_id: null
         }).catch(() => {});
       }
-      res.status(201).json({ success: true, reference: tx.rows[0].reference, amount });
+      res.status(201).json({ success: true, reference: result.reference, amount });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       if (String(error.message || "").includes("idempotency_key")) {
@@ -444,17 +448,24 @@ module.exports = function createWalletRouter({
 
       await client.query("BEGIN");
       const wallet = await ensureWallet(client, { userId: targetId });
-      await client.query(`SELECT id FROM wallets WHERE id=$1 FOR UPDATE`, [wallet.id]);
-      const tx = await client.query(
-        `INSERT INTO wallet_transactions
-           (tenant_id, reference, kind, status, description, related_module, initiated_by, completed_at)
-         VALUES ($1,$2,$3,'completed',$4,'admin',$5,NOW())
-         RETURNING id, reference`,
-        [req.tenant_id || "malilink", reference(), kind, motif, req.user.id]
-      );
-      await writeEntry(client, wallet.id, "credit", amount, tx.rows[0].id);
+      const platformId = await ledger.getPlatformWalletId(client);
+      // Double-entrée : le bonus/cashback est débité du wallet plateforme
+      // MaliLink (fonds promotionnels) et crédité à l'utilisateur.
+      for (const id of [wallet.id, platformId].filter(Boolean).sort((a, b) => a - b)) {
+        await client.query(`SELECT id FROM wallets WHERE id=$1 FOR UPDATE`, [id]);
+      }
+      const legs = [{ walletId: wallet.id, direction: "credit", amount, companyId: wallet.company_id }];
+      if (platformId) legs.push({ walletId: platformId, direction: "debit", amount, companyId: null });
+      const result = await ledger.postLedgerTransaction(client, {
+        tenantId: req.tenant_id || "malilink",
+        kind,
+        description: motif,
+        relatedModule: "admin",
+        initiatedBy: req.user.id,
+        legs
+      });
       await client.query("COMMIT");
-      await audit(wallet.id, tx.rows[0].id, `admin_${kind}`, req.user.id, motif);
+      await audit(wallet.id, result.transactionId, `admin_${kind}`, req.user.id, motif);
       if (createNotification) {
         await createNotification({
           user_id: targetId,
@@ -464,7 +475,7 @@ module.exports = function createWalletRouter({
           company_id: null
         }).catch(() => {});
       }
-      res.status(201).json({ success: true, reference: tx.rows[0].reference });
+      res.status(201).json({ success: true, reference: result.reference });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("ERREUR WALLET ADMIN CREDIT :", error.message);
@@ -497,6 +508,278 @@ module.exports = function createWalletRouter({
     } catch (error) {
       console.error("ERREUR WALLET COMPANY :", error.message);
       res.status(500).json({ error: "Erreur wallet entreprise." });
+    }
+  });
+
+  /* ---------- Paiement QR : demander / vérifier / payer ---------- */
+
+  // Créer une demande de paiement (le bénéficiaire génère un QR).
+  router.post("/payment-requests", writeLimiter, async (req, res) => {
+    try {
+      const wallet = await ensureWallet(pool, { userId: req.user.id });
+      const amount = req.body?.amount != null ? cleanAmount(req.body.amount) : null;
+      if (req.body?.amount != null && !amount) {
+        return res.status(400).json({ error: "Montant invalide." });
+      }
+      const reference = `MLQR-${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
+      const { rows } = await pool.query(
+        `INSERT INTO wallet_payment_requests
+           (tenant_id, reference, payee_wallet_id, amount, note, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING reference, amount, note, status, expires_at`,
+        [
+          req.tenant_id || "malilink",
+          reference,
+          wallet.id,
+          amount,
+          String(req.body?.note || "").slice(0, 200),
+          expiresAt
+        ]
+      );
+      res.status(201).json({ success: true, ...rows[0], qr_payload: reference });
+    } catch (error) {
+      console.error("ERREUR WALLET PAYREQ :", error.message);
+      res.status(500).json({ error: "Erreur création de la demande de paiement." });
+    }
+  });
+
+  // Vérifier l'état d'une demande (payeur scanne, ou bénéficiaire vérifie).
+  router.get("/payment-requests/:reference", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT pr.reference, pr.amount, pr.note, pr.status, pr.expires_at, pr.paid_at,
+                w.wallet_number AS payee_wallet_number,
+                COALESCE(u.fullname, c.name, '') AS payee_name
+         FROM wallet_payment_requests pr
+         JOIN wallets w ON w.id=pr.payee_wallet_id
+         LEFT JOIN users u ON u.id=w.user_id
+         LEFT JOIN companies c ON c.id=w.company_id
+         WHERE pr.reference=$1 LIMIT 1`,
+        [String(req.params.reference).slice(0, 40)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Demande introuvable." });
+      const request = rows[0];
+      if (request.status === "pending" && request.expires_at && new Date(request.expires_at) < new Date()) {
+        request.status = "expired";
+      }
+      res.json(request);
+    } catch (error) {
+      res.status(500).json({ error: "Erreur vérification du paiement." });
+    }
+  });
+
+  // Payer une demande QR (le payeur confirme).
+  router.post("/pay", writeLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const flags = await getFlags();
+      if (flags.wallet_transfers_enabled === false) {
+        return res.status(503).json({ error: "Les paiements sont temporairement désactivés." });
+      }
+      const reference = String(req.body?.reference || "").slice(0, 40);
+      const idempotencyKey = String(req.body?.idempotency_key || "").slice(0, 80) || null;
+
+      if (idempotencyKey) {
+        const existing = await pool.query(
+          `SELECT reference, status FROM wallet_transactions WHERE idempotency_key=$1`,
+          [idempotencyKey]
+        );
+        if (existing.rows[0]) return res.json({ success: true, duplicate: true, ...existing.rows[0] });
+      }
+
+      const reqRow = await pool.query(
+        `SELECT * FROM wallet_payment_requests WHERE reference=$1`,
+        [reference]
+      );
+      const request = reqRow.rows[0];
+      if (!request) return res.status(404).json({ error: "Demande de paiement introuvable." });
+      if (request.status !== "pending") return res.status(400).json({ error: "Cette demande n'est plus payable." });
+      if (request.expires_at && new Date(request.expires_at) < new Date()) {
+        return res.status(400).json({ error: "Cette demande de paiement a expiré." });
+      }
+
+      // Montant : celui de la demande, ou saisi par le payeur si demande libre.
+      const amount = request.amount != null ? Number(request.amount) : cleanAmount(req.body?.amount);
+      if (!amount) return res.status(400).json({ error: "Montant invalide." });
+
+      await client.query("BEGIN");
+      const payerWallet = await ensureWallet(client, { userId: req.user.id });
+      const payeeWalletRow = await client.query(`SELECT * FROM wallets WHERE id=$1`, [request.payee_wallet_id]);
+      const payeeWallet = payeeWalletRow.rows[0];
+      if (payerWallet.id === payeeWallet.id) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Vous ne pouvez pas payer votre propre demande." });
+      }
+
+      const [firstId, secondId] =
+        payerWallet.id < payeeWallet.id ? [payerWallet.id, payeeWallet.id] : [payeeWallet.id, payerWallet.id];
+      await client.query(`SELECT id FROM wallets WHERE id=$1 FOR UPDATE`, [firstId]);
+      await client.query(`SELECT id FROM wallets WHERE id=$1 FOR UPDATE`, [secondId]);
+
+      if (payerWallet.status !== "active") {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "Votre wallet est bloqué." });
+      }
+      const { available } = await balances(client, payerWallet.id);
+      if (available < amount) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: `Solde insuffisant. Disponible : ${available.toLocaleString("fr-FR")} FCFA.` });
+      }
+
+      const result = await ledger.postLedgerTransaction(client, {
+        tenantId: req.tenant_id || "malilink",
+        kind: "payment",
+        description: request.note || "Paiement QR MaliLink",
+        relatedModule: request.related_module || "qr",
+        relatedId: request.related_id,
+        initiatedBy: req.user.id,
+        idempotencyKey,
+        legs: [
+          { walletId: payerWallet.id, direction: "debit", amount, companyId: payerWallet.company_id },
+          { walletId: payeeWallet.id, direction: "credit", amount, companyId: payeeWallet.company_id }
+        ]
+      });
+      await client.query(
+        `UPDATE wallet_payment_requests
+         SET status='paid', payer_wallet_id=$1, transaction_id=$2, paid_at=NOW()
+         WHERE id=$3`,
+        [payerWallet.id, result.transactionId, request.id]
+      );
+      await client.query("COMMIT");
+
+      await audit(payerWallet.id, result.transactionId, "qr_payment", req.user.id, `${amount} FCFA`);
+      if (createNotification && payeeWallet.user_id) {
+        await createNotification({
+          user_id: payeeWallet.user_id,
+          title: "Wallet : paiement reçu 💰",
+          message: `Paiement de ${amount.toLocaleString("fr-FR")} FCFA reçu par QR MaliLink.`,
+          type: "wallet_credit",
+          company_id: null
+        }).catch(() => {});
+      }
+      res.status(201).json({ success: true, reference: result.reference, amount });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (String(error.message || "").includes("idempotency_key")) {
+        return res.json({ success: true, duplicate: true });
+      }
+      console.error("ERREUR WALLET PAY :", error.message);
+      res.status(500).json({ error: "Erreur paiement. Aucun montant n'a été débité." });
+    } finally {
+      client.release();
+    }
+  });
+
+  /* ---------- Paiement d'une commande Marketplace via Wallet ----------
+     Débit acheteur → crédit vendeur (net) + crédit plateforme (commission).
+     Commission MaliLink prélevée automatiquement. Écritures comptables auto. */
+  const COMMISSION_RATE = Number(process.env.MALILINK_COMMISSION_RATE || 0.05); // 5% par défaut
+
+  router.post("/pay-order/:orderId", writeLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const flags = await getFlags();
+      if (flags.marketplace_wallet_payment === false) {
+        return res.status(503).json({ error: "Le paiement Wallet marketplace est désactivé." });
+      }
+      const orderId = Number(req.params.orderId);
+      const idempotencyKey = `order-pay-${orderId}`; // idempotent par commande
+
+      const existing = await pool.query(
+        `SELECT reference FROM wallet_transactions WHERE idempotency_key=$1`,
+        [idempotencyKey]
+      );
+      if (existing.rows[0]) {
+        return res.json({ success: true, duplicate: true, reference: existing.rows[0].reference });
+      }
+
+      const orderRow = await pool.query(
+        `SELECT id, customer_user_id, vendor_company_id, total_amount, payment_status
+         FROM marketplace_orders WHERE id=$1`,
+        [orderId]
+      );
+      const order = orderRow.rows[0];
+      if (!order) return res.status(404).json({ error: "Commande introuvable." });
+      // Seul l'acheteur paie sa propre commande.
+      if (Number(order.customer_user_id) !== Number(req.user.id)) {
+        return res.status(403).json({ error: "Cette commande n'est pas la vôtre." });
+      }
+      if (["paid", "payé", "completed"].includes(String(order.payment_status || "").toLowerCase())) {
+        return res.status(400).json({ error: "Commande déjà payée." });
+      }
+      const amount = cleanAmount(order.total_amount);
+      if (!amount) return res.status(400).json({ error: "Montant de commande invalide." });
+      if (!order.vendor_company_id) return res.status(400).json({ error: "Vendeur introuvable pour cette commande." });
+
+      const commission = Math.round(amount * COMMISSION_RATE * 100) / 100;
+      const vendorNet = Math.round((amount - commission) * 100) / 100;
+
+      await client.query("BEGIN");
+      const buyerWallet = await ensureWallet(client, { userId: req.user.id });
+      const vendorWallet = await ensureWallet(client, { companyId: order.vendor_company_id });
+      const platformId = await ledger.getPlatformWalletId(client);
+
+      // Verrous ordre stable (anti-deadlock) sur les 3 wallets.
+      for (const id of [buyerWallet.id, vendorWallet.id, platformId].filter(Boolean).sort((a, b) => a - b)) {
+        await client.query(`SELECT id FROM wallets WHERE id=$1 FOR UPDATE`, [id]);
+      }
+      if (buyerWallet.status !== "active") {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "Votre wallet est bloqué." });
+      }
+      const { available } = await balances(client, buyerWallet.id);
+      if (available < amount) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: `Solde insuffisant. Disponible : ${available.toLocaleString("fr-FR")} FCFA.` });
+      }
+
+      const legs = [
+        { walletId: buyerWallet.id, direction: "debit", amount, companyId: buyerWallet.company_id },
+        { walletId: vendorWallet.id, direction: "credit", amount: vendorNet, companyId: vendorWallet.company_id }
+      ];
+      if (commission > 0 && platformId) {
+        legs.push({ walletId: platformId, direction: "credit", amount: commission, companyId: null });
+      } else if (commission > 0) {
+        // Pas de wallet plateforme : le vendeur reçoit tout (commission = 0 appliquée).
+        legs[1].amount = amount;
+      }
+
+      const result = await ledger.postLedgerTransaction(client, {
+        tenantId: req.tenant_id || "malilink",
+        kind: "payment",
+        description: `Paiement commande #${orderId}`,
+        relatedModule: "marketplace",
+        relatedId: orderId,
+        initiatedBy: req.user.id,
+        idempotencyKey,
+        commission,
+        legs
+      });
+      await client.query(
+        `UPDATE marketplace_orders
+         SET payment_status='paid', payment_method='wallet', updated_at=CURRENT_TIMESTAMP
+         WHERE id=$1`,
+        [orderId]
+      );
+      await client.query("COMMIT");
+
+      await audit(buyerWallet.id, result.transactionId, "order_payment", req.user.id, `commande #${orderId}, ${amount} FCFA`);
+      await audit(vendorWallet.id, result.transactionId, "vendor_payout", req.user.id, `${vendorNet} FCFA (commission ${commission})`);
+      res.status(201).json({
+        success: true,
+        reference: result.reference,
+        financial_operation_id: result.financial_operation_id,
+        amount,
+        commission,
+        vendor_net: vendorNet
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("ERREUR WALLET PAY ORDER :", error.message);
+      res.status(500).json({ error: "Erreur paiement de la commande. Aucun montant débité." });
+    } finally {
+      client.release();
     }
   });
 
