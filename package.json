@@ -9,7 +9,7 @@
     "migrate": "node scripts/migrate.js",
     "migrate:status": "node scripts/migrate.js --status",
     "migrate:mark-all": "node scripts/migrate.js --mark-all",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test services/*.test.js"
   },
   "keywords": [],
   "author": "",

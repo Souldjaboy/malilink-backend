@@ -32,6 +32,57 @@ module.exports = function createWalletRouter({
   bcrypt
 }) {
   const router = express.Router();
+
+  // Signature interne d'un reçu (HMAC) — prouve l'authenticité MaliLink.
+  const RECEIPT_SECRET =
+    process.env.WALLET_RECEIPT_SECRET || process.env.JWT_SECRET || "malilink_wallet_receipts";
+  function signReceipt(fields) {
+    return crypto
+      .createHmac("sha256", RECEIPT_SECRET)
+      .update(fields.join("|"))
+      .digest("hex")
+      .slice(0, 24);
+  }
+
+  // Vérification PUBLIQUE d'un reçu (scan du QR) — AVANT l'authentification.
+  // Confirme la signature sans exposer identités ni soldes.
+  router.get("/public/verify-receipt/:reference", async (req, res) => {
+    try {
+      const reference = String(req.params.reference).slice(0, 40);
+      const sig = String(req.query.sig || "");
+      const { rows } = await pool.query(
+        `SELECT t.reference, t.financial_operation_id, t.kind, t.status, t.created_at,
+                e.amount, e.direction
+         FROM wallet_transactions t
+         JOIN wallet_entries e ON e.transaction_id=t.id
+         WHERE t.reference=$1
+         ORDER BY e.id ASC LIMIT 1`,
+        [reference]
+      );
+      if (!rows[0]) return res.status(404).json({ valid: false, error: "Reçu introuvable." });
+      const r = rows[0];
+      const expected = signReceipt([
+        r.reference,
+        r.financial_operation_id || "",
+        r.created_at?.toISOString?.() || String(r.created_at)
+      ]);
+      const valid =
+        sig.length === expected.length &&
+        crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+      res.json({
+        valid,
+        reference: r.reference,
+        financial_operation_id: r.financial_operation_id,
+        kind: r.kind,
+        status: r.status,
+        created_at: r.created_at,
+        issuer: "MaliLink Wallet"
+      });
+    } catch (error) {
+      res.status(500).json({ valid: false, error: "Erreur vérification du reçu." });
+    }
+  });
+
   router.use(authenticateToken);
 
   /* ---------- Carte virtuelle : génération sécurisée ---------- */
@@ -312,6 +363,7 @@ module.exports = function createWalletRouter({
       const wallet = await ensureWallet(pool, { userId: req.user.id });
       const { rows } = await pool.query(
         `SELECT t.reference, t.kind, t.status, t.description, t.created_at,
+                t.financial_operation_id, t.commission_amount,
                 e.direction, e.amount, e.balance_after
          FROM wallet_transactions t
          JOIN wallet_entries e ON e.transaction_id=t.id AND e.wallet_id=$2
@@ -320,8 +372,35 @@ module.exports = function createWalletRouter({
         [String(req.params.reference).slice(0, 40), wallet.id]
       );
       if (!rows[0]) return res.status(404).json({ error: "Reçu introuvable." });
-      res.json({ ...rows[0], holder: req.user.id, currency: "FCFA" });
+      const r = rows[0];
+      const walletNumberRow = await pool.query(`SELECT wallet_number FROM wallets WHERE id=$1`, [wallet.id]);
+      // Reçu officiel MaliLink : numéro tx, finop, montant, commission,
+      // devise, date, statut, signature interne + QR de vérification.
+      const signature = signReceipt([
+        r.reference,
+        r.financial_operation_id || "",
+        r.created_at?.toISOString?.() || String(r.created_at)
+      ]);
+      res.json({
+        official_receipt: "MaliLink Wallet",
+        reference: r.reference,
+        financial_operation_id: r.financial_operation_id,
+        wallet_number: walletNumberRow.rows[0]?.wallet_number,
+        holder: req.user.id,
+        kind: r.kind,
+        direction: r.direction,
+        amount: Number(r.amount),
+        commission: Number(r.commission_amount || 0),
+        currency: "FCFA",
+        status: r.status,
+        balance_after: Number(r.balance_after),
+        created_at: r.created_at,
+        description: r.description,
+        signature,
+        verify_url: `/wallet/public/verify-receipt/${r.reference}?sig=${signature}`
+      });
     } catch (error) {
+      console.error("ERREUR WALLET RECEIPT :", error.message);
       res.status(500).json({ error: "Erreur reçu." });
     }
   });
