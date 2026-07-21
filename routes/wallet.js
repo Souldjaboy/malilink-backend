@@ -19,6 +19,12 @@ const crypto = require("crypto");
 const express = require("express");
 const { createRateLimiter } = require("../middleware/rateLimit");
 const ledger = require("../services/wallet-ledger");
+const limitsService = require("../services/wallet-limits");
+const fraud = require("../services/wallet-fraud");
+const notifications = require("../services/wallet-notifications");
+const webhooks = require("../services/wallet-webhooks");
+const reconciliation = require("../services/wallet-reconciliation");
+const currency = require("../services/wallet-currency");
 
 const MAX_AMOUNT = 10000000; // 10 000 000 FCFA par opération interne
 
@@ -46,7 +52,7 @@ module.exports = function createWalletRouter({
 
   // Vérification PUBLIQUE d'un reçu (scan du QR) — AVANT l'authentification.
   // Confirme la signature sans exposer identités ni soldes.
-  router.get("/public/verify-receipt/:reference", async (req, res) => {
+  async function verifyReceiptHandler(req, res) {
     try {
       const reference = String(req.params.reference).slice(0, 40);
       const sig = String(req.query.sig || "");
@@ -80,6 +86,44 @@ module.exports = function createWalletRouter({
       });
     } catch (error) {
       res.status(500).json({ valid: false, error: "Erreur vérification du reçu." });
+    }
+  }
+  router.get("/public/verify-receipt/:reference", verifyReceiptHandler);
+  router.get("/v1/public/verify-receipt/:reference", verifyReceiptHandler);
+
+  /* ---------- #8 API publique REST versionnée + documentation ----------
+     Surface stable pour partenaires. Endpoints publics montés AVANT l'auth. */
+
+  // Documentation lisible par machine (style OpenAPI léger).
+  router.get("/v1/docs", (req, res) => {
+    res.json({
+      api: "MaliLink Wallet Public API",
+      version: "1.0.0",
+      base_path: "/wallet/v1",
+      authentication: "Bearer JWT (sauf endpoints publics explicitement marqués).",
+      currency: "XOF (FCFA) — multi-devises en préparation (XOF, EUR, USD).",
+      endpoints: [
+        { method: "GET", path: "/wallet/v1/currencies", auth: false, description: "Devises supportées et taux indicatifs." },
+        { method: "GET", path: "/wallet/v1/public/verify-receipt/:reference?sig=", auth: false, description: "Vérifie la signature d'un reçu officiel (scan QR)." },
+        { method: "GET", path: "/wallet/v1/me", auth: true, description: "Solde et informations du wallet de l'utilisateur." },
+        { method: "GET", path: "/wallet/v1/transactions", auth: true, description: "Historique des transactions." },
+        { method: "GET", path: "/wallet/v1/receipt/:reference", auth: true, description: "Reçu officiel signé d'une transaction." },
+        { method: "POST", path: "/wallet/v1/transfer", auth: true, description: "Transfert interne (idempotent via idempotency_key)." },
+        { method: "POST", path: "/wallet/v1/pay", auth: true, description: "Payer une demande QR." }
+      ],
+      webhooks: {
+        signature_header: "X-MaliLink-Signature (HMAC-SHA256 du corps JSON)",
+        events: ["transaction.completed", "payment.received"]
+      }
+    });
+  });
+
+  // Devises supportées (public).
+  router.get("/v1/currencies", async (req, res) => {
+    try {
+      res.json({ base: currency.DEFAULT_CURRENCY, currencies: await currency.listCurrencies(pool) });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des devises." });
     }
   });
 
@@ -446,6 +490,12 @@ module.exports = function createWalletRouter({
         return res.status(400).json({ error: "Impossible de se transférer à soi-même." });
       }
 
+      // #4 Limites Wallet : plafonds par opération / jour / mois (si activé).
+      if (flags.wallet_limits_enabled !== false) {
+        const verdict = await limitsService.checkOutgoing(pool, req.user.id, amount);
+        if (!verdict.ok) return res.status(403).json({ error: verdict.reason, limit: verdict.limit });
+      }
+
       await client.query("BEGIN");
       const senderWallet = await ensureWallet(client, { userId: req.user.id });
       const recipientWallet = await ensureWallet(client, { userId: recipientId });
@@ -487,15 +537,34 @@ module.exports = function createWalletRouter({
 
       await audit(senderWallet.id, result.transactionId, "transfer_out", req.user.id, `${amount} FCFA → user ${recipientId}`);
       await audit(recipientWallet.id, result.transactionId, "transfer_in", req.user.id, `${amount} FCFA`);
-      if (createNotification) {
-        await createNotification({
-          user_id: recipientId,
+
+      // #3 Notifications financières (in-app + email/SMS/push selon config).
+      await notifications.emit(
+        { db: pool, createNotification },
+        {
+          userId: recipientId,
+          event: "transfer_in",
           title: "Wallet : argent reçu 💰",
           message: `Vous avez reçu ${amount.toLocaleString("fr-FR")} FCFA sur votre wallet MaliLink.`,
-          type: "wallet_credit",
-          company_id: null
-        }).catch(() => {});
-      }
+          financialOperationId: result.financial_operation_id
+        }
+      );
+
+      // #6 Fraude : score + alerte SEULEMENT (ne bloque jamais, après coup).
+      await fraud.evaluateAndRecord(pool, {
+        userId: req.user.id,
+        walletId: senderWallet.id,
+        amount,
+        recipientWalletId: recipientWallet.id,
+        transactionId: result.transactionId,
+        financialOperationId: result.financial_operation_id
+      });
+
+      // #7 Webhooks sortants (désactivés par défaut ; enfilés + signés).
+      await webhooks.enqueueEvent(pool, "transaction.completed", {
+        kind: "transfer", amount, reference: result.reference
+      }, result.financial_operation_id);
+
       res.status(201).json({ success: true, reference: result.reference, amount });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
@@ -682,6 +751,12 @@ module.exports = function createWalletRouter({
       const amount = request.amount != null ? Number(request.amount) : cleanAmount(req.body?.amount);
       if (!amount) return res.status(400).json({ error: "Montant invalide." });
 
+      // #4 Limites Wallet (plafonds du payeur).
+      if (flags.wallet_limits_enabled !== false) {
+        const verdict = await limitsService.checkOutgoing(pool, req.user.id, amount);
+        if (!verdict.ok) return res.status(403).json({ error: verdict.reason, limit: verdict.limit });
+      }
+
       await client.query("BEGIN");
       const payerWallet = await ensureWallet(client, { userId: req.user.id });
       const payeeWalletRow = await client.query(`SELECT * FROM wallets WHERE id=$1`, [request.payee_wallet_id]);
@@ -728,15 +803,27 @@ module.exports = function createWalletRouter({
       await client.query("COMMIT");
 
       await audit(payerWallet.id, result.transactionId, "qr_payment", req.user.id, `${amount} FCFA`);
-      if (createNotification && payeeWallet.user_id) {
-        await createNotification({
-          user_id: payeeWallet.user_id,
-          title: "Wallet : paiement reçu 💰",
-          message: `Paiement de ${amount.toLocaleString("fr-FR")} FCFA reçu par QR MaliLink.`,
-          type: "wallet_credit",
-          company_id: null
-        }).catch(() => {});
+      if (payeeWallet.user_id) {
+        await notifications.emit(
+          { db: pool, createNotification },
+          {
+            userId: payeeWallet.user_id,
+            event: "payment",
+            title: "Wallet : paiement reçu 💰",
+            message: `Paiement de ${amount.toLocaleString("fr-FR")} FCFA reçu par QR MaliLink.`,
+            financialOperationId: result.financial_operation_id
+          }
+        );
       }
+      await fraud.evaluateAndRecord(pool, {
+        userId: req.user.id, walletId: payerWallet.id, amount,
+        recipientWalletId: payeeWallet.id, transactionId: result.transactionId,
+        financialOperationId: result.financial_operation_id
+      });
+      await webhooks.enqueueEvent(pool, "payment.received", {
+        kind: "qr_payment", amount, reference: result.reference
+      }, result.financial_operation_id);
+
       res.status(201).json({ success: true, reference: result.reference, amount });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
@@ -790,6 +877,12 @@ module.exports = function createWalletRouter({
       const amount = cleanAmount(order.total_amount);
       if (!amount) return res.status(400).json({ error: "Montant de commande invalide." });
       if (!order.vendor_company_id) return res.status(400).json({ error: "Vendeur introuvable pour cette commande." });
+
+      // #4 Limites Wallet (plafonds de l'acheteur).
+      if (flags.wallet_limits_enabled !== false) {
+        const verdict = await limitsService.checkOutgoing(pool, req.user.id, amount);
+        if (!verdict.ok) return res.status(403).json({ error: verdict.reason, limit: verdict.limit });
+      }
 
       const commission = Math.round(amount * COMMISSION_RATE * 100) / 100;
       const vendorNet = Math.round((amount - commission) * 100) / 100;
@@ -845,6 +938,17 @@ module.exports = function createWalletRouter({
 
       await audit(buyerWallet.id, result.transactionId, "order_payment", req.user.id, `commande #${orderId}, ${amount} FCFA`);
       await audit(vendorWallet.id, result.transactionId, "vendor_payout", req.user.id, `${vendorNet} FCFA (commission ${commission})`);
+
+      await fraud.evaluateAndRecord(pool, {
+        userId: req.user.id, walletId: buyerWallet.id, amount,
+        recipientWalletId: vendorWallet.id, transactionId: result.transactionId,
+        financialOperationId: result.financial_operation_id
+      });
+      await webhooks.enqueueEvent(pool, "payment.received", {
+        kind: "order_payment", order_id: orderId, amount, commission, vendor_net: vendorNet,
+        reference: result.reference
+      }, result.financial_operation_id);
+
       res.status(201).json({
         success: true,
         reference: result.reference,
@@ -964,6 +1068,185 @@ module.exports = function createWalletRouter({
       error:
         "Les retraits d'argent réel ne sont pas encore disponibles : ils seront activés avec un fournisseur de paiement agréé."
     });
+  });
+
+  /* ═══════════════ Renfort du moteur financier (#2..#8) ═══════════════ */
+
+  function requireSuperAdmin(req, res) {
+    if (!isSuperAdminUser(req.user)) {
+      res.status(403).json({ error: "Réservé au super administrateur MaliLink." });
+      return false;
+    }
+    return true;
+  }
+
+  /* ---------- #5 Devises supportées (préparation multi-devises) ---------- */
+  router.get("/currencies", async (req, res) => {
+    try {
+      res.json({ base: currency.DEFAULT_CURRENCY, currencies: await currency.listCurrencies(pool) });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des devises." });
+    }
+  });
+
+  /* ---------- #4 Limites Wallet : lecture + configuration admin ---------- */
+  // Mes limites effectives (utilisateur courant).
+  router.get("/limits", async (req, res) => {
+    try {
+      res.json(await limitsService.getEffectiveLimits(pool, req.user.id));
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des limites." });
+    }
+  });
+
+  // Config admin : défaut plateforme (userId omis) ou par utilisateur.
+  router.put("/admin/limits", writeLimiter, async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const userId = req.body?.user_id ? Number(req.body.user_id) : null;
+      const fields = {
+        max_per_transaction: req.body?.max_per_transaction,
+        daily_amount_cap: req.body?.daily_amount_cap,
+        monthly_amount_cap: req.body?.monthly_amount_cap,
+        daily_count_cap: req.body?.daily_count_cap
+      };
+      const num = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+      const { rows } = await pool.query(
+        `INSERT INTO wallet_limits
+           (user_id, max_per_transaction, daily_amount_cap, monthly_amount_cap, daily_count_cap, updated_by)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (COALESCE(user_id, 0)) DO UPDATE SET
+           max_per_transaction=EXCLUDED.max_per_transaction,
+           daily_amount_cap=EXCLUDED.daily_amount_cap,
+           monthly_amount_cap=EXCLUDED.monthly_amount_cap,
+           daily_count_cap=EXCLUDED.daily_count_cap,
+           updated_by=EXCLUDED.updated_by, updated_at=NOW()
+         RETURNING *`,
+        [userId, num(fields.max_per_transaction), num(fields.daily_amount_cap),
+         num(fields.monthly_amount_cap), num(fields.daily_count_cap), req.user.id]
+      );
+      res.json({ success: true, limits: rows[0] });
+    } catch (e) {
+      console.error("ERREUR WALLET LIMITS :", e.message);
+      res.status(500).json({ error: "Erreur configuration des limites." });
+    }
+  });
+
+  /* ---------- #6 Fraude : consultation + revue (jamais de blocage auto) ---------- */
+  router.get("/admin/fraud-alerts", async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const status = ["open", "reviewed", "dismissed"].includes(req.query.status) ? req.query.status : null;
+      const { rows } = await pool.query(
+        `SELECT id, user_id, wallet_id, transaction_id, financial_operation_id,
+                risk_score, risk_level, reasons, amount, status, created_at, reviewed_at
+           FROM wallet_fraud_alerts
+          WHERE ($1::text IS NULL OR status=$1)
+          ORDER BY created_at DESC LIMIT 200`,
+        [status]
+      );
+      res.json({ alerts: rows });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des alertes." });
+    }
+  });
+
+  router.patch("/admin/fraud-alerts/:id", async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const status = ["reviewed", "dismissed"].includes(req.body?.status) ? req.body.status : "reviewed";
+      const { rows } = await pool.query(
+        `UPDATE wallet_fraud_alerts SET status=$1, reviewed_by=$2, reviewed_at=NOW()
+          WHERE id=$3 RETURNING id, status`,
+        [status, req.user.id, Number(req.params.id)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Alerte introuvable." });
+      res.json({ success: true, alert: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur revue de l'alerte." });
+    }
+  });
+
+  /* ---------- #2 Réconciliation automatique ---------- */
+  router.post("/admin/reconcile", writeLimiter, async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const report = await reconciliation.reconcile(pool, { tenantId: req.tenant_id || "malilink" });
+      res.json({ success: true, report });
+    } catch (e) {
+      console.error("ERREUR WALLET RECONCILE :", e.message);
+      res.status(500).json({ error: "Erreur réconciliation." });
+    }
+  });
+
+  router.get("/admin/reconciliation-reports", async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT id, scope, checked_count, mismatch_count, ledger_debit_total,
+                ledger_credit_total, status, created_at
+           FROM wallet_reconciliation_reports ORDER BY created_at DESC LIMIT 50`
+      );
+      res.json({ reports: rows });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des rapports." });
+    }
+  });
+
+  /* ---------- #7 Webhooks Wallet : gestion admin ---------- */
+  router.get("/admin/webhooks", async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      // Le secret n'est JAMAIS renvoyé en clair.
+      const { rows } = await pool.query(
+        `SELECT id, name, target_url, events, enabled, created_at,
+                (secret IS NOT NULL) AS has_secret
+           FROM wallet_webhooks ORDER BY created_at DESC`
+      );
+      res.json({ webhooks: rows });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des webhooks." });
+    }
+  });
+
+  router.post("/admin/webhooks", writeLimiter, async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const name = String(req.body?.name || "").slice(0, 120);
+      const targetUrl = String(req.body?.target_url || "");
+      const events = Array.isArray(req.body?.events) ? req.body.events.map(String) : [];
+      if (!name || !/^https:\/\//.test(targetUrl)) {
+        return res.status(400).json({ error: "Nom et URL HTTPS obligatoires." });
+      }
+      // Secret généré côté serveur, renvoyé UNE SEULE FOIS à la création.
+      const secret = crypto.randomBytes(24).toString("hex");
+      const { rows } = await pool.query(
+        `INSERT INTO wallet_webhooks (name, target_url, events, secret, enabled, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING id, name, target_url, events, enabled, created_at`,
+        [name, targetUrl, events, secret, req.body?.enabled === true, req.user.id]
+      );
+      res.status(201).json({ success: true, webhook: rows[0], secret });
+    } catch (e) {
+      console.error("ERREUR WALLET WEBHOOK :", e.message);
+      res.status(500).json({ error: "Erreur création du webhook." });
+    }
+  });
+
+  router.patch("/admin/webhooks/:id", async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const enabled = req.body?.enabled === true;
+      const { rows } = await pool.query(
+        `UPDATE wallet_webhooks SET enabled=$1, updated_at=NOW()
+          WHERE id=$2 RETURNING id, name, enabled`,
+        [enabled, Number(req.params.id)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Webhook introuvable." });
+      res.json({ success: true, webhook: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur mise à jour du webhook." });
+    }
   });
 
   return router;
