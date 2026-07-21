@@ -87,12 +87,13 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
   router.use(authenticateToken);
 
   // Résout la compagnie de transport du partenaire courant.
-  // super_admin : peut cibler via ?travel_company_id / body.travel_company_id.
-  async function resolveCompany(req, { create } = {}) {
+  // super_admin : peut cibler explicitement via ?travel_company_id /
+  // body.travel_company_id ; à défaut, on retombe sur le périmètre entreprise
+  // puis sur la compagnie qu'il a lui-même créée (repli commun ci-dessous).
+  async function resolveCompany(req) {
     if (isSuperAdminUser(req.user)) {
       const id = Number(req.body?.travel_company_id || req.query.travel_company_id);
       if (id) return repo.getCompany(id);
-      if (!create) return null;
     }
     const companyId = getEffectiveCompanyId ? getEffectiveCompanyId(req) : null;
     if (companyId) {
