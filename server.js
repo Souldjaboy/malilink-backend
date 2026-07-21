@@ -18748,6 +18748,12 @@ app.use(
   createFinanceRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser })
 );
 
+const createTravelRouter = require("./routes/travel");
+app.use(
+  "/travel",
+  createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId })
+);
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
