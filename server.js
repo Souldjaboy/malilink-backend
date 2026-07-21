@@ -216,17 +216,31 @@ const uploadLaboratoryResult = multer({
   }
 });
 
+// Pool PostgreSQL — paramètres EXPLICITES (Phase 0, durcissement montée en charge).
+// Valeurs surchargeables par variables d'environnement :
+//   PG_POOL_MAX (défaut 20)                 — connexions simultanées max par instance.
+//     Choisi pour tenir ~100k utilisateurs sur une instance ; avec PgBouncer et
+//     plusieurs instances (500k+), garder max × nb_instances < max_connections PG.
+//   PG_IDLE_TIMEOUT_MS (défaut 30000)       — ferme une connexion inactive après 30 s.
+//   PG_CONNECTION_TIMEOUT_MS (défaut 5000)  — échec si aucune connexion en 5 s
+//     (évite les requêtes qui pendent quand la base est saturée).
+const poolTuning = {
+  max: Number(process.env.PG_POOL_MAX || 20),
+  idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30000),
+  connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT_MS || 5000)
+};
 const pool = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL
-    })
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ...poolTuning })
   : new Pool({
       user: "souleymanediallo",
       host: "localhost",
       database: "triangle_wms_db",
       password: "",
-      port: 5432
+      port: 5432,
+      ...poolTuning
     });
+// Une erreur sur un client inactif ne doit pas planter le process.
+pool.on("error", (err) => console.error("⚠️  [pg pool] erreur client inactif :", err.message));
 
 if (!process.env.JWT_SECRET && process.env.NODE_ENV === "production") {
   console.error(
@@ -239,6 +253,10 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === "production") {
 
 const JWT_SECRET = process.env.JWT_SECRET || "triangle_wms_secret_key";
 const BCRYPT_ROUNDS = 12;
+
+// Vérification des secrets sensibles au démarrage (Phase 0) : avertit en dev,
+// bloque le démarrage en production si un secret critique est absent/faible.
+require("./config/env-guard").enforceEnv();
 
 const SUPER_ADMIN_EMAILS = new Set([
   "diallogcif@gmail.com"

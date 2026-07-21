@@ -13,6 +13,7 @@
  */
 
 const crypto = require("crypto");
+const vault = require("./secret-vault");
 
 function sign(secret, payload) {
   return crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
@@ -38,14 +39,19 @@ async function enqueueEvent(db, event, payload = {}, financialOperationId = null
   try {
     if (!(await globalEnabled(db))) return { queued: 0, reason: "webhooks_disabled" };
     const { rows: hooks } = await db.query(
-      `SELECT id, secret FROM wallet_webhooks
+      `SELECT id, secret, secret_enc, secret_format FROM wallet_webhooks
         WHERE enabled=true AND $1 = ANY(events)`,
       [event]
     );
     let queued = 0;
     for (const h of hooks) {
+      // Récupère le secret : chiffré au repos → déchiffré à la volée pour signer.
+      const secret =
+        h.secret_format && h.secret_format !== "plain"
+          ? vault.decrypt(h.secret_enc, h.secret_format)
+          : h.secret;
       const body = { event, data: payload, financial_operation_id: financialOperationId, ts: Date.now() };
-      const signature = sign(h.secret, body);
+      const signature = sign(secret, body);
       await db.query(
         `INSERT INTO wallet_webhook_deliveries
            (webhook_id, event, payload, signature, status, financial_operation_id)

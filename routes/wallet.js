@@ -25,6 +25,7 @@ const notifications = require("../services/wallet-notifications");
 const webhooks = require("../services/wallet-webhooks");
 const reconciliation = require("../services/wallet-reconciliation");
 const currency = require("../services/wallet-currency");
+const vault = require("../services/secret-vault");
 
 const MAX_AMOUNT = 10000000; // 10 000 000 FCFA par opération interne
 
@@ -40,8 +41,13 @@ module.exports = function createWalletRouter({
   const router = express.Router();
 
   // Signature interne d'un reçu (HMAC) — prouve l'authenticité MaliLink.
+  // INDÉPENDANT de JWT_SECRET (Phase 0) : compromettre l'un ne compromet pas
+  // l'autre. En production, env-guard exige WALLET_RECEIPT_SECRET distinct.
   const RECEIPT_SECRET =
-    process.env.WALLET_RECEIPT_SECRET || process.env.JWT_SECRET || "malilink_wallet_receipts";
+    process.env.WALLET_RECEIPT_SECRET ||
+    (process.env.NODE_ENV === "production"
+      ? (() => { throw new Error("WALLET_RECEIPT_SECRET requis en production."); })()
+      : "malilink_wallet_receipts_dev_only");
   function signReceipt(fields) {
     return crypto
       .createHmac("sha256", RECEIPT_SECRET)
@@ -1179,6 +1185,18 @@ module.exports = function createWalletRouter({
     }
   });
 
+  // Réconciliation INCRÉMENTALE (curseur) — conçue pour un cron régulier.
+  router.post("/admin/reconcile-incremental", writeLimiter, async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+      const report = await reconciliation.reconcileIncremental(pool, { tenantId: req.tenant_id || "malilink" });
+      res.json({ success: true, report });
+    } catch (e) {
+      console.error("ERREUR WALLET RECONCILE INC :", e.message);
+      res.status(500).json({ error: "Erreur réconciliation incrémentale." });
+    }
+  });
+
   router.get("/admin/reconciliation-reports", async (req, res) => {
     if (!requireSuperAdmin(req, res)) return;
     try {
@@ -1219,12 +1237,21 @@ module.exports = function createWalletRouter({
         return res.status(400).json({ error: "Nom et URL HTTPS obligatoires." });
       }
       // Secret généré côté serveur, renvoyé UNE SEULE FOIS à la création.
+      // Chiffré au repos si WALLET_SECRET_ENC_KEY est configurée (#4).
       const secret = crypto.randomBytes(24).toString("hex");
+      const sealed = vault.encrypt(secret);
       const { rows } = await pool.query(
-        `INSERT INTO wallet_webhooks (name, target_url, events, secret, enabled, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6)
+        `INSERT INTO wallet_webhooks
+           (name, target_url, events, secret, secret_enc, secret_format, enabled, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          RETURNING id, name, target_url, events, enabled, created_at`,
-        [name, targetUrl, events, secret, req.body?.enabled === true, req.user.id]
+        [
+          name, targetUrl, events,
+          sealed.format === "plain" ? secret : null,  // clair seulement si pas de chiffrement
+          sealed.format === "plain" ? null : sealed.value,
+          sealed.format,
+          req.body?.enabled === true, req.user.id
+        ]
       );
       res.status(201).json({ success: true, webhook: rows[0], secret });
     } catch (e) {
