@@ -92,8 +92,8 @@ function createTravelService(repo) {
       const date = q.date ? new Date(q.date) : new Date();
       const dayOfWeek = Number.isNaN(date.getTime()) ? null : date.getUTCDay(); // 0=dim
       const raw = await repo.searchOffers({
-        originCityId: Number(q.originCityId),
-        destinationCityId: Number(q.destinationCityId),
+        originLocationId: Number(q.originLocationId),
+        destinationLocationId: Number(q.destinationLocationId),
         dayOfWeek,
         modeCode: q.modeCode || null
       });

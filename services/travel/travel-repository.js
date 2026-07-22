@@ -104,25 +104,26 @@ function createTravelRepository(pool) {
     async createRoute(companyId, data) {
       const { rows } = await pool.query(
         `INSERT INTO travel_routes
-           (travel_company_id, mode_code, origin_city_id, destination_city_id,
-            origin_point_id, destination_point_id, distance_km, duration_minutes,
-            baggage_policy, services)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-        [companyId, data.modeCode, data.originCityId, data.destinationCityId,
-         data.originPointId || null, data.destinationPointId || null,
-         data.distanceKm || null, data.durationMinutes || null,
-         data.baggagePolicy || "", JSON.stringify(data.services || [])]
+           (travel_company_id, mode_code, origin_location_id, destination_location_id,
+            distance_km, duration_minutes, baggage_policy, cancellation_policy,
+            description, currency, services, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+        [companyId, data.modeCode, data.originLocationId, data.destinationLocationId,
+         data.distanceKm ?? null, data.durationMinutes ?? null,
+         data.baggagePolicy || "", data.cancellationPolicy || "", data.description || "",
+         data.currency || "XOF", JSON.stringify(data.services || []), data.status || "active"]
       );
       return rows[0];
     },
     async listRoutes(companyId) {
-      // Jointure catalogue : `published` = l'offre existe et est publiée.
+      // Noms de lieux issus du référentiel mondial ; `published` = offre publiée.
       const { rows } = await pool.query(
-        `SELECT r.*, oc.name AS origin_city, dc.name AS destination_city,
+        `SELECT r.*, ol.name AS origin_city, dl.name AS destination_city,
+                ol.country_name AS origin_country, dl.country_name AS destination_country,
                 (co.status = 'published') AS published
            FROM travel_routes r
-           JOIN travel_cities oc ON oc.id=r.origin_city_id
-           JOIN travel_cities dc ON dc.id=r.destination_city_id
+           JOIN geo_locations ol ON ol.id=r.origin_location_id
+           JOIN geo_locations dl ON dl.id=r.destination_location_id
            LEFT JOIN catalog_offers co
              ON co.related_module='travel' AND co.related_subtype='route' AND co.related_id=r.id
           WHERE r.travel_company_id=$1 ORDER BY r.id DESC`,
@@ -131,20 +132,20 @@ function createTravelRepository(pool) {
       return rows;
     },
 
-    // Détail d'une ligne pour composer une offre de catalogue (prix « à partir de »,
-    // places de l'horaire, nom de la compagnie, villes).
+    // Détail d'une ligne pour composer une offre de catalogue.
     async routeForCatalog(routeId) {
       const { rows } = await pool.query(
-        `SELECT r.id, r.mode_code, r.duration_minutes, r.services,
+        `SELECT r.id, r.mode_code, r.duration_minutes, r.distance_km, r.services,
                 c.id AS company_id, c.name AS company_name, c.logo_url,
-                oc.name AS origin_city, dc.name AS destination_city,
+                ol.name AS origin_city, dl.name AS destination_city,
+                ol.country_name AS origin_country, dl.country_name AS destination_country,
                 (SELECT MIN(base_price) FROM travel_prices p WHERE p.route_id=r.id) AS from_price,
                 (SELECT currency FROM travel_prices p WHERE p.route_id=r.id ORDER BY id LIMIT 1) AS currency,
                 (SELECT MAX(seats_total) FROM travel_schedules s WHERE s.route_id=r.id AND s.status='active') AS seats
            FROM travel_routes r
            JOIN travel_companies c ON c.id=r.travel_company_id
-           JOIN travel_cities oc ON oc.id=r.origin_city_id
-           JOIN travel_cities dc ON dc.id=r.destination_city_id
+           JOIN geo_locations ol ON ol.id=r.origin_location_id
+           JOIN geo_locations dl ON dl.id=r.destination_location_id
           WHERE r.id=$1`,
         [routeId]
       );
@@ -180,27 +181,27 @@ function createTravelRepository(pool) {
     /* ---------- Recherche ---------- */
     // Retourne les offres (route + compagnie + horaire + prix) pour un trajet
     // et un jour de semaine donné. Filtrage métier délégué au service.
-    async searchOffers({ originCityId, destinationCityId, dayOfWeek, modeCode }) {
+    async searchOffers({ originLocationId, destinationLocationId, dayOfWeek, modeCode }) {
       const { rows } = await pool.query(
         `SELECT
             r.id AS route_id, r.mode_code, r.duration_minutes, r.distance_km, r.services,
             c.id AS company_id, c.name AS company_name, c.logo_url, c.rating, c.rating_count,
-            oc.name AS origin_city, dc.name AS destination_city,
+            ol.name AS origin_city, dl.name AS destination_city,
             s.id AS schedule_id, s.departure_time, s.arrival_time, s.seats_total, s.days_of_week,
             p.seat_class, p.base_price, p.child_price, p.currency, p.baggage_included_kg
            FROM travel_routes r
            JOIN travel_companies c ON c.id=r.travel_company_id AND c.status='active'
-           JOIN travel_cities oc ON oc.id=r.origin_city_id
-           JOIN travel_cities dc ON dc.id=r.destination_city_id
+           JOIN geo_locations ol ON ol.id=r.origin_location_id
+           JOIN geo_locations dl ON dl.id=r.destination_location_id
            JOIN travel_schedules s ON s.route_id=r.id AND s.status='active'
            LEFT JOIN travel_prices p ON p.route_id=r.id
              AND (p.schedule_id IS NULL OR p.schedule_id=s.id)
           WHERE r.status='active'
-            AND r.origin_city_id=$1 AND r.destination_city_id=$2
+            AND r.origin_location_id=$1 AND r.destination_location_id=$2
             AND ($3::int IS NULL OR $3 = ANY(s.days_of_week))
             AND ($4::text IS NULL OR r.mode_code=$4)
           ORDER BY p.base_price NULLS LAST, s.departure_time`,
-        [originCityId, destinationCityId, dayOfWeek, modeCode || null]
+        [originLocationId, destinationLocationId, dayOfWeek, modeCode || null]
       );
       return rows;
     },

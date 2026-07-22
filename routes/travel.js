@@ -13,6 +13,7 @@ const express = require("express");
 const { createTravelRepository } = require("../services/travel/travel-repository");
 const { createTravelService } = require("../services/travel/travel-service");
 const catalog = require("../services/catalog");
+const geo = require("../services/geo/geo-service");
 
 module.exports = function createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId }) {
   const router = express.Router();
@@ -44,6 +45,20 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
     res.json({ cities: await service.cities(String(req.query.q || "").slice(0, 40)) });
   });
 
+  // Autocomplétion MONDIALE (référentiel local + géocodage Nominatim en repli).
+  // Public : le client et le partenaire l'utilisent tous les deux.
+  router.get("/geo/search", async (req, res) => {
+    if (!(await ensureEnabled(res))) return;
+    try {
+      const q = String(req.query.q || "").slice(0, 80);
+      if (q.trim().length < 2) return res.json({ results: [] });
+      res.json({ results: await geo.searchPlaces(pool, q) });
+    } catch (e) {
+      console.error("ERREUR TRAVEL GEO SEARCH :", e.message);
+      res.status(500).json({ error: "Erreur recherche de lieux." });
+    }
+  });
+
   router.get("/cities/:cityId/points", async (req, res) => {
     if (!(await ensureEnabled(res))) return;
     res.json({ points: await repo.listPoints(Number(req.params.cityId)) });
@@ -60,18 +75,18 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
     if (!(await repo.getFlag("travel_search_enabled"))) {
       return res.status(503).json({ error: "La recherche est temporairement désactivée." });
     }
-    const originCityId = Number(req.query.origin);
-    const destinationCityId = Number(req.query.destination);
-    if (!originCityId || !destinationCityId) {
-      return res.status(400).json({ error: "Ville de départ et destination obligatoires." });
+    const originLocationId = Number(req.query.origin);
+    const destinationLocationId = Number(req.query.destination);
+    if (!originLocationId || !destinationLocationId) {
+      return res.status(400).json({ error: "Lieu de départ et destination obligatoires." });
     }
-    if (originCityId === destinationCityId) {
+    if (originLocationId === destinationLocationId) {
       return res.status(400).json({ error: "Le départ et la destination doivent différer." });
     }
     try {
       const result = await service.search({
-        originCityId,
-        destinationCityId,
+        originLocationId,
+        destinationLocationId,
         date: req.query.date,
         adults: Number(req.query.adults || 1),
         children: Number(req.query.children || 0),
@@ -183,19 +198,76 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
   router.post("/partner/vehicles", vehicles.create);
   router.get("/partner/vehicles", vehicles.list);
 
-  const routes = partnerResource(
-    (companyId, req) => repo.createRoute(companyId, {
-      modeCode: req.body?.mode_code,
-      originCityId: req.body?.origin_city_id, destinationCityId: req.body?.destination_city_id,
-      originPointId: req.body?.origin_point_id, destinationPointId: req.body?.destination_point_id,
-      distanceKm: req.body?.distance_km, durationMinutes: req.body?.duration_minutes,
-      baggagePolicy: req.body?.baggage_policy, services: req.body?.services
-    }),
-    (companyId) => repo.listRoutes(companyId),
-    "route"
-  );
-  router.post("/partner/routes", routes.create);
-  router.get("/partner/routes", routes.list);
+  // Persister un lieu choisi (référentiel mondial) avant de créer une ligne.
+  router.post("/geo/locations", async (req, res) => {
+    try {
+      const location = await geo.persistPlace(pool, {
+        name: req.body?.name,
+        country_code: req.body?.country_code,
+        country_name: req.body?.country_name,
+        region: req.body?.region,
+        city: req.body?.city,
+        latitude: req.body?.latitude,
+        longitude: req.body?.longitude,
+        location_type: req.body?.location_type,
+        external_provider: req.body?.external_provider,
+        external_place_id: req.body?.external_place_id,
+      }, req.user.id);
+      res.status(201).json({ success: true, location });
+    } catch (e) {
+      console.error("ERREUR TRAVEL GEO PERSIST :", e.message);
+      res.status(400).json({ error: e.message || "Erreur enregistrement du lieu." });
+    }
+  });
+
+  // Création d'une ligne — lieux issus du référentiel mondial geo_locations.
+  // Distance/durée calculées automatiquement (corrigeables par le partenaire).
+  router.post("/partner/routes", async (req, res) => {
+    if (!(await ensureEnabled(res))) return;
+    const c = await resolveCompany(req);
+    if (!c) return res.status(403).json({ error: "Devenez d'abord partenaire (créez votre compagnie)." });
+    const originLocationId = Number(req.body?.origin_location_id);
+    const destinationLocationId = Number(req.body?.destination_location_id);
+    if (!originLocationId || !destinationLocationId) {
+      return res.status(400).json({ error: "Sélectionnez un lieu de départ et une destination." });
+    }
+    if (originLocationId === destinationLocationId) {
+      return res.status(400).json({ error: "Le départ et la destination doivent être différents." });
+    }
+    try {
+      const [origin, destination] = await Promise.all([geo.getById(pool, originLocationId), geo.getById(pool, destinationLocationId)]);
+      if (!origin || !destination) return res.status(404).json({ error: "Lieu introuvable dans le référentiel." });
+
+      const modeCode = String(req.body?.mode_code || "bus");
+      const metrics = await geo.routeMetrics(pool, originLocationId, destinationLocationId, modeCode);
+      const created = await repo.createRoute(c.id, {
+        modeCode,
+        originLocationId, destinationLocationId,
+        // Distance/durée : valeurs fournies sinon calcul automatique.
+        distanceKm: req.body?.distance_km != null && req.body.distance_km !== "" ? Number(req.body.distance_km) : metrics.distance_km,
+        durationMinutes: req.body?.duration_minutes != null && req.body.duration_minutes !== "" ? Number(req.body.duration_minutes) : metrics.duration_min,
+        baggagePolicy: req.body?.baggage_policy,
+        cancellationPolicy: req.body?.cancellation_policy,
+        description: req.body?.description,
+        currency: req.body?.currency,
+        services: req.body?.services,
+      });
+      await repo.log("route", created.id, "created", req.user.id, `${origin.name} → ${destination.name}`);
+      res.status(201).json({
+        success: true,
+        route: { ...created, origin_city: origin.name, destination_city: destination.name },
+      });
+    } catch (e) {
+      console.error("ERREUR TRAVEL ROUTE :", e.message);
+      res.status(500).json({ error: "Erreur création de la ligne." });
+    }
+  });
+
+  router.get("/partner/routes", async (req, res) => {
+    const c = await resolveCompany(req);
+    if (!c) return res.json({ routes: [] });
+    res.json({ routes: await repo.listRoutes(c.id) });
+  });
 
   // Horaires & prix rattachés à une ligne dont le partenaire est propriétaire.
   async function ownsRoute(req, routeId) {
