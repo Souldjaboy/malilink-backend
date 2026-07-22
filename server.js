@@ -9702,6 +9702,53 @@ app.get("/marketplace/products/:id", async (req, res) => {
   }
 });
 
+/* ---------- Catalogue central MaliLink (Lot A) — offres transverses ----------
+   Agrège les offres PUBLIÉES de tous les modules (Voyage d'abord). Public,
+   additif : ne modifie pas les endpoints /marketplace/products existants. */
+const catalogService = require("./services/catalog");
+
+// Arbre des catégories (Voyages et réservations + sous-catégories, etc.)
+app.get("/marketplace/catalog/categories", async (req, res) => {
+  try {
+    res.json({ categories: await catalogService.categoryTree(pool) });
+  } catch (error) {
+    console.error("ERREUR CATALOG CATEGORIES :", error.message);
+    res.status(500).json({ error: "Erreur chargement des catégories." });
+  }
+});
+
+// Détail d'une offre publiée du catalogue.
+app.get("/marketplace/catalog/offer/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM catalog_offers WHERE id=$1 AND status='published' LIMIT 1`,
+      [Number(req.params.id)]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Offre introuvable." });
+    res.json({ offer: rows[0] });
+  } catch (error) {
+    console.error("ERREUR CATALOG OFFER :", error.message);
+    res.status(500).json({ error: "Erreur détail de l'offre." });
+  }
+});
+
+// Parcours des offres publiées (filtres category / subcategory / q).
+app.get("/marketplace/catalog", async (req, res) => {
+  try {
+    const category = req.query.category ? String(req.query.category) : null;
+    const subcategory = req.query.subcategory ? String(req.query.subcategory) : null;
+    const q = req.query.q ? String(req.query.q).slice(0, 60) : null;
+    const [offers, counts] = await Promise.all([
+      catalogService.listPublished(pool, { category, subcategory, q, limit: req.query.limit }),
+      catalogService.countsBySubcategory(pool, category),
+    ]);
+    res.json({ count: offers.length, counts, offers });
+  } catch (error) {
+    console.error("ERREUR CATALOG LIST :", error.message);
+    res.status(500).json({ error: "Erreur chargement du catalogue." });
+  }
+});
+
 app.get("/marketplace/vendors", async (req, res) => {
   try {
     const result = await pool.query(

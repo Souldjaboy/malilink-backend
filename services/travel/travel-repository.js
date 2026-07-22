@@ -116,15 +116,39 @@ function createTravelRepository(pool) {
       return rows[0];
     },
     async listRoutes(companyId) {
+      // Jointure catalogue : `published` = l'offre existe et est publiée.
       const { rows } = await pool.query(
-        `SELECT r.*, oc.name AS origin_city, dc.name AS destination_city
+        `SELECT r.*, oc.name AS origin_city, dc.name AS destination_city,
+                (co.status = 'published') AS published
            FROM travel_routes r
            JOIN travel_cities oc ON oc.id=r.origin_city_id
            JOIN travel_cities dc ON dc.id=r.destination_city_id
+           LEFT JOIN catalog_offers co
+             ON co.related_module='travel' AND co.related_subtype='route' AND co.related_id=r.id
           WHERE r.travel_company_id=$1 ORDER BY r.id DESC`,
         [companyId]
       );
       return rows;
+    },
+
+    // Détail d'une ligne pour composer une offre de catalogue (prix « à partir de »,
+    // places de l'horaire, nom de la compagnie, villes).
+    async routeForCatalog(routeId) {
+      const { rows } = await pool.query(
+        `SELECT r.id, r.mode_code, r.duration_minutes, r.services,
+                c.id AS company_id, c.name AS company_name, c.logo_url,
+                oc.name AS origin_city, dc.name AS destination_city,
+                (SELECT MIN(base_price) FROM travel_prices p WHERE p.route_id=r.id) AS from_price,
+                (SELECT currency FROM travel_prices p WHERE p.route_id=r.id ORDER BY id LIMIT 1) AS currency,
+                (SELECT MAX(seats_total) FROM travel_schedules s WHERE s.route_id=r.id AND s.status='active') AS seats
+           FROM travel_routes r
+           JOIN travel_companies c ON c.id=r.travel_company_id
+           JOIN travel_cities oc ON oc.id=r.origin_city_id
+           JOIN travel_cities dc ON dc.id=r.destination_city_id
+          WHERE r.id=$1`,
+        [routeId]
+      );
+      return rows[0] || null;
     },
 
     async createSchedule(routeId, data) {

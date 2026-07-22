@@ -12,6 +12,7 @@
 const express = require("express");
 const { createTravelRepository } = require("../services/travel/travel-repository");
 const { createTravelService } = require("../services/travel/travel-service");
+const catalog = require("../services/catalog");
 
 module.exports = function createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId }) {
   const router = express.Router();
@@ -239,6 +240,59 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
     } catch (e) {
       console.error("ERREUR TRAVEL PRICE :", e.message);
       res.status(500).json({ error: "Erreur création du prix." });
+    }
+  });
+
+  /* ---------- Publication dans le catalogue central (Lot A) ---------- */
+  // Publier une ligne → l'offre apparaît automatiquement dans Marketplace.
+  router.post("/partner/routes/:routeId/publish", async (req, res) => {
+    if (!(await ensureEnabled(res))) return;
+    const routeId = Number(req.params.routeId);
+    if (!(await ownsRoute(req, routeId))) return res.status(403).json({ error: "Ligne non autorisée." });
+    try {
+      const r = await repo.routeForCatalog(routeId);
+      if (!r) return res.status(404).json({ error: "Ligne introuvable." });
+      if (r.from_price == null) {
+        return res.status(400).json({ error: "Ajoutez au moins un tarif avant de publier cette ligne." });
+      }
+      const offer = await catalog.upsertOffer(pool, {
+        relatedModule: "travel",
+        relatedId: routeId,
+        relatedSubtype: "route",
+        companyModule: "travel_companies",
+        companyId: r.company_id,
+        companyName: r.company_name,
+        category: "voyage",
+        subcategory: r.mode_code,
+        title: `${r.origin_city} → ${r.destination_city}`,
+        description: (r.services || []).join(", "),
+        price: Number(r.from_price),
+        currency: r.currency || "XOF",
+        availability: r.seats != null ? Number(r.seats) : null,
+        location: r.origin_city,
+        photos: r.logo_url ? [r.logo_url] : [],
+        status: "published",
+      });
+      await repo.log("route", routeId, "published", req.user.id, "catalogue");
+      res.json({ success: true, offer });
+    } catch (e) {
+      console.error("ERREUR TRAVEL PUBLISH :", e.message);
+      res.status(500).json({ error: "Erreur publication de la ligne." });
+    }
+  });
+
+  // Dépublier (retire de Marketplace, conserve la donnée).
+  router.post("/partner/routes/:routeId/unpublish", async (req, res) => {
+    if (!(await ensureEnabled(res))) return;
+    const routeId = Number(req.params.routeId);
+    if (!(await ownsRoute(req, routeId))) return res.status(403).json({ error: "Ligne non autorisée." });
+    try {
+      const updated = await catalog.setStatus(pool, { relatedModule: "travel", relatedId: routeId, relatedSubtype: "route" }, "suspended");
+      await repo.log("route", routeId, "unpublished", req.user.id, "catalogue");
+      res.json({ success: true, offer: updated });
+    } catch (e) {
+      console.error("ERREUR TRAVEL UNPUBLISH :", e.message);
+      res.status(500).json({ error: "Erreur retrait de la ligne." });
     }
   });
 
