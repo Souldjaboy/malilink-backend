@@ -14,8 +14,10 @@ const { createTravelRepository } = require("../services/travel/travel-repository
 const { createTravelService } = require("../services/travel/travel-service");
 const catalog = require("../services/catalog");
 const geo = require("../services/geo/geo-service");
+const booking = require("./../services/travel/travel-booking");
 
-module.exports = function createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId }) {
+module.exports = function createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId, phoneVariants }) {
+  const phoneVar = phoneVariants || ((p) => [String(p || "")]);
   const router = express.Router();
   const repo = createTravelRepository(pool);
   const service = createTravelService(repo);
@@ -96,6 +98,16 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
     } catch (e) {
       console.error("ERREUR TRAVEL SEARCH :", e.message);
       res.status(500).json({ error: "Erreur lors de la recherche." });
+    }
+  });
+
+  // Vérification PUBLIQUE d'un billet (scan QR / saisie du code) — AVANT auth.
+  // Toujours interrogée côté serveur : ne jamais se fier à l'apparence du QR.
+  router.get("/public/verify-ticket/:code", async (req, res) => {
+    try {
+      res.json(await booking.verifyTicket(pool, req.params.code));
+    } catch (e) {
+      res.status(500).json({ valid: false, result: "error" });
     }
   });
 
@@ -365,6 +377,243 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
     } catch (e) {
       console.error("ERREUR TRAVEL UNPUBLISH :", e.message);
       res.status(500).json({ error: "Erreur retrait de la ligne." });
+    }
+  });
+
+  /* ═══════════════ Réservation / Paiement Wallet / Billet ═══════════════ */
+
+  async function bookingWithTicket(reference) {
+    const b = (await pool.query(
+      `SELECT b.*, c.name AS company_name, ol.name AS origin, dl.name AS destination
+         FROM travel_bookings b
+         LEFT JOIN travel_companies c ON c.id=b.travel_company_id
+         LEFT JOIN travel_routes r ON r.id=b.route_id
+         LEFT JOIN geo_locations ol ON ol.id=r.origin_location_id
+         LEFT JOIN geo_locations dl ON dl.id=r.destination_location_id
+        WHERE b.reference=$1`, [reference]
+    )).rows[0];
+    if (!b) return null;
+    const ticket = (await pool.query(`SELECT * FROM travel_tickets WHERE booking_id=$1 ORDER BY id LIMIT 1`, [b.id])).rows[0] || null;
+    const passengers = (await pool.query(`SELECT * FROM travel_booking_passengers WHERE booking_id=$1 ORDER BY id`, [b.id])).rows;
+    return { booking: b, ticket, passengers };
+  }
+
+  // Client : créer une réservation (statut en attente de paiement).
+  router.post("/bookings", async (req, res) => {
+    if (!(await repo.getFlag("travel_bookings_enabled"))) {
+      return res.status(503).json({ error: "La réservation est temporairement indisponible." });
+    }
+    try {
+      const routeId = Number(req.body?.route_id);
+      const r = await repo.routeForCatalog(routeId);
+      if (!r) return res.status(404).json({ error: "Trajet introuvable." });
+      const created = await booking.createBooking(pool, {
+        userId: req.user.id, travelCompanyId: r.company_id, routeId,
+        scheduleId: req.body?.schedule_id, travelDate: req.body?.travel_date,
+        seatClass: req.body?.seat_class, adults: req.body?.adults, children: req.body?.children,
+        passengers: Array.isArray(req.body?.passengers) ? req.body.passengers : [],
+        channel: "online",
+      });
+      res.status(201).json({ success: true, booking: created });
+    } catch (e) {
+      console.error("ERREUR TRAVEL BOOKING :", e.message);
+      res.status(400).json({ error: e.message || "Erreur création de la réservation." });
+    }
+  });
+
+  // Client : payer une réservation via le Wallet MaliLink → émet le billet.
+  router.post("/bookings/:reference/pay", async (req, res) => {
+    if (!(await repo.getFlag("travel_payments_enabled"))) {
+      return res.status(503).json({ error: "Le paiement est temporairement indisponible." });
+    }
+    try {
+      const b0 = (await pool.query(`SELECT user_id FROM travel_bookings WHERE reference=$1`, [req.params.reference])).rows[0];
+      if (!b0) return res.status(404).json({ error: "Réservation introuvable." });
+      if (b0.user_id && Number(b0.user_id) !== Number(req.user.id) && !isSuperAdminUser(req.user)) {
+        return res.status(403).json({ error: "Cette réservation n'est pas la vôtre." });
+      }
+      const r = await booking.payWithWallet(pool, { reference: req.params.reference, payerUserId: b0.user_id || req.user.id });
+      if (r.error === "insufficient") return res.status(400).json({ error: `Solde Wallet insuffisant (disponible : ${r.available?.toLocaleString("fr-FR")} FCFA).` });
+      if (r.error === "wallet_blocked") return res.status(403).json({ error: "Votre wallet est bloqué." });
+      if (r.error === "not_found") return res.status(404).json({ error: "Réservation introuvable." });
+      if (r.error) return res.status(400).json({ error: "Paiement impossible." });
+      res.json({ success: true, duplicate: !!r.duplicate, booking: r.booking, ticket: r.ticket });
+    } catch (e) {
+      console.error("ERREUR TRAVEL PAY :", e.message);
+      res.status(500).json({ error: "Erreur de paiement. Aucun montant débité." });
+    }
+  });
+
+  // Client : mes réservations + billets.
+  router.get("/bookings/mine", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT b.reference, b.travel_date, b.total, b.currency, b.status, b.payment_status, b.created_at,
+                c.name AS company_name, ol.name AS origin, dl.name AS destination,
+                t.ticket_number, t.verification_code, t.qr_payload, t.status AS ticket_status
+           FROM travel_bookings b
+           LEFT JOIN travel_companies c ON c.id=b.travel_company_id
+           LEFT JOIN travel_routes r ON r.id=b.route_id
+           LEFT JOIN geo_locations ol ON ol.id=r.origin_location_id
+           LEFT JOIN geo_locations dl ON dl.id=r.destination_location_id
+           LEFT JOIN travel_tickets t ON t.booking_id=b.id
+          WHERE b.user_id=$1 ORDER BY b.created_at DESC LIMIT 100`, [req.user.id]
+      );
+      res.json({ bookings: rows });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement de vos voyages." });
+    }
+  });
+
+  router.get("/bookings/:reference", async (req, res) => {
+    const bt = await bookingWithTicket(req.params.reference);
+    if (!bt) return res.status(404).json({ error: "Réservation introuvable." });
+    if (bt.booking.user_id && Number(bt.booking.user_id) !== Number(req.user.id) && !isSuperAdminUser(req.user)) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+    res.json(bt);
+  });
+
+  // Client : annuler une réservation non payée.
+  router.post("/bookings/:reference/cancel", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE travel_bookings SET status='cancelled', updated_at=NOW()
+          WHERE reference=$1 AND user_id=$2 AND payment_status<>'paid' RETURNING reference`,
+        [req.params.reference, req.user.id]
+      );
+      if (!rows[0]) return res.status(400).json({ error: "Réservation introuvable ou déjà payée." });
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur annulation." });
+    }
+  });
+
+  /* ---------- Partenaire : réservations, stats, paiements, scan, POS ---------- */
+
+  router.get("/partner/bookings", async (req, res) => {
+    const c = await resolveCompany(req);
+    if (!c) return res.json({ bookings: [] });
+    try {
+      const status = ["pending", "confirmed", "cancelled", "completed"].includes(req.query.status) ? req.query.status : null;
+      const q = req.query.q ? String(req.query.q).slice(0, 60) : null;
+      const { rows } = await pool.query(
+        `SELECT b.reference, b.travel_date, b.seats_count, b.total, b.commission, b.currency,
+                b.status, b.payment_status, b.channel, b.created_at,
+                ol.name AS origin, dl.name AS destination,
+                t.ticket_number, t.verification_code, t.status AS ticket_status,
+                (SELECT first_name||' '||last_name FROM travel_booking_passengers WHERE booking_id=b.id ORDER BY id LIMIT 1) AS passenger,
+                (SELECT phone FROM travel_booking_passengers WHERE booking_id=b.id ORDER BY id LIMIT 1) AS phone
+           FROM travel_bookings b
+           LEFT JOIN travel_routes r ON r.id=b.route_id
+           LEFT JOIN geo_locations ol ON ol.id=r.origin_location_id
+           LEFT JOIN geo_locations dl ON dl.id=r.destination_location_id
+           LEFT JOIN travel_tickets t ON t.booking_id=b.id
+          WHERE b.travel_company_id=$1
+            AND ($2::text IS NULL OR b.status=$2)
+            AND ($3::text IS NULL OR b.reference ILIKE '%'||$3||'%'
+                 OR EXISTS (SELECT 1 FROM travel_booking_passengers p WHERE p.booking_id=b.id
+                            AND (p.first_name||' '||p.last_name ILIKE '%'||$3||'%' OR p.phone ILIKE '%'||$3||'%')))
+          ORDER BY b.created_at DESC LIMIT 200`,
+        [c.id, status, q]
+      );
+      res.json({ bookings: rows });
+    } catch (e) {
+      console.error("ERREUR TRAVEL PARTNER BOOKINGS :", e.message);
+      res.status(500).json({ error: "Erreur chargement des réservations." });
+    }
+  });
+
+  router.get("/partner/stats", async (req, res) => {
+    const c = await resolveCompany(req);
+    if (!c) return res.json({ stats: null });
+    try {
+      res.json({ stats: await booking.partnerStats(pool, c.id) });
+    } catch (e) {
+      console.error("ERREUR TRAVEL STATS :", e.message);
+      res.status(500).json({ error: "Erreur statistiques." });
+    }
+  });
+
+  router.get("/partner/payments", async (req, res) => {
+    const c = await resolveCompany(req);
+    if (!c) return res.json({ payments: [] });
+    try {
+      const { rows } = await pool.query(
+        `SELECT b.reference, b.total, b.commission, b.currency, b.payment_method, b.payment_status,
+                b.paid_at, (b.total - b.commission) AS vendor_net, b.financial_operation_id,
+                ol.name AS origin, dl.name AS destination
+           FROM travel_bookings b
+           LEFT JOIN travel_routes r ON r.id=b.route_id
+           LEFT JOIN geo_locations ol ON ol.id=r.origin_location_id
+           LEFT JOIN geo_locations dl ON dl.id=r.destination_location_id
+          WHERE b.travel_company_id=$1 AND b.payment_status='paid'
+          ORDER BY b.paid_at DESC NULLS LAST LIMIT 200`, [c.id]
+      );
+      res.json({ payments: rows });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur chargement des paiements." });
+    }
+  });
+
+  router.get("/partner/connectors", async (req, res) => {
+    try {
+      const { rows } = await pool.query(`SELECT code, label, enabled, is_real_money FROM travel_payment_connectors ORDER BY sort_order`);
+      res.json({ connectors: rows });
+    } catch (e) {
+      res.status(500).json({ error: "Erreur connecteurs." });
+    }
+  });
+
+  // Contrôle à l'embarquement (scan QR ou saisie du code).
+  router.post("/partner/scan", async (req, res) => {
+    const c = await resolveCompany(req);
+    if (!c) return res.status(403).json({ error: "Compagnie requise." });
+    try {
+      const code = String(req.body?.code || "").trim();
+      if (!code) return res.status(400).json({ error: "Code du billet requis." });
+      // Un scan du QR renvoie "MLV|ticket|code|sig" → on extrait le code.
+      const parsed = code.startsWith("MLV|") ? code.split("|")[2] : code;
+      const result = await booking.scanTicket(pool, { codeOrNumber: parsed, scannedBy: req.user.id, device: "partner_app" });
+      res.json(result);
+    } catch (e) {
+      console.error("ERREUR TRAVEL SCAN :", e.message);
+      res.status(500).json({ error: "Erreur de contrôle du billet." });
+    }
+  });
+
+  // POS : vente au comptoir — MÊME structure réservation/billet que le web.
+  // L'agent enregistre un client (par téléphone) et encaisse via son Wallet.
+  router.post("/partner/pos/sell", async (req, res) => {
+    const c = await resolveCompany(req);
+    if (!c) return res.status(403).json({ error: "Compagnie requise." });
+    try {
+      // Client résolu par téléphone (compte MaliLink requis pour le paiement Wallet).
+      const digits = phoneVar(req.body?.customer_phone || "").map((v) => v.replace(/[^0-9]/g, ""));
+      const found = await pool.query(
+        `SELECT id, fullname FROM users WHERE regexp_replace(COALESCE(phone,''),'[^0-9]','','g') = ANY($1) LIMIT 1`, [digits]
+      );
+      const customer = found.rows[0];
+      if (!customer) return res.status(404).json({ error: "Client introuvable (compte MaliLink requis pour l'encaissement Wallet)." });
+
+      const routeId = Number(req.body?.route_id);
+      const r = await repo.routeForCatalog(routeId);
+      if (!r || r.company_id !== c.id) return res.status(403).json({ error: "Trajet non autorisé." });
+
+      const created = await booking.createBooking(pool, {
+        userId: customer.id, travelCompanyId: c.id, routeId,
+        scheduleId: req.body?.schedule_id, travelDate: req.body?.travel_date,
+        seatClass: req.body?.seat_class, adults: req.body?.adults || 1, children: req.body?.children || 0,
+        passengers: [{ first_name: req.body?.first_name || customer.fullname, last_name: req.body?.last_name || "", phone: req.body?.customer_phone }],
+        channel: "pos", soldBy: req.user.id,
+      });
+      const paid = await booking.payWithWallet(pool, { reference: created.reference, payerUserId: customer.id });
+      if (paid.error === "insufficient") return res.status(400).json({ error: `Solde client insuffisant (${paid.available?.toLocaleString("fr-FR")} FCFA).` });
+      if (paid.error) return res.status(400).json({ error: "Encaissement impossible." });
+      res.status(201).json({ success: true, booking: paid.booking, ticket: paid.ticket });
+    } catch (e) {
+      console.error("ERREUR TRAVEL POS :", e.message);
+      res.status(500).json({ error: e.message || "Erreur vente au comptoir." });
     }
   });
 

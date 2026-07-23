@@ -18798,7 +18798,7 @@ app.use(
 const createTravelRouter = require("./routes/travel");
 app.use(
   "/travel",
-  createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId })
+  createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId, phoneVariants: maliPhoneVariants })
 );
 
 const listenPort = process.env.PORT || 5050;
