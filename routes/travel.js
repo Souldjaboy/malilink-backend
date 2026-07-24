@@ -101,6 +101,51 @@ module.exports = function createTravelRouter({ pool, authenticateToken, isSuperA
     }
   });
 
+  // Détail PUBLIC d'une offre du catalogue (page de réservation Marketplace).
+  // Renvoie l'offre + la ligne + les départs (horaires/tarifs/places) +
+  // coordonnées géo pour la carte. Réutilise catalog_offers → travel_routes.
+  router.get("/offer/:catalogId", async (req, res) => {
+    if (!(await ensureEnabled(res))) return;
+    try {
+      const offerRow = await pool.query(
+        `SELECT * FROM catalog_offers WHERE id=$1 AND status='published' AND related_module='travel'`,
+        [Number(req.params.catalogId)]
+      );
+      const offer = offerRow.rows[0];
+      if (!offer) return res.status(404).json({ error: "Offre introuvable ou non publiée." });
+      const routeId = offer.related_id;
+
+      const routeRow = await pool.query(
+        `SELECT r.id, r.mode_code, r.duration_minutes, r.distance_km, r.services,
+                r.baggage_policy, r.cancellation_policy, r.description, r.currency,
+                c.name AS company_name, c.logo_url, c.phone AS company_phone, c.rating, c.rating_count,
+                ol.name AS origin, ol.latitude AS origin_lat, ol.longitude AS origin_lng, ol.country_name AS origin_country,
+                dl.name AS destination, dl.latitude AS dest_lat, dl.longitude AS dest_lng, dl.country_name AS dest_country
+           FROM travel_routes r
+           JOIN travel_companies c ON c.id=r.travel_company_id
+           JOIN geo_locations ol ON ol.id=r.origin_location_id
+           JOIN geo_locations dl ON dl.id=r.destination_location_id
+          WHERE r.id=$1`, [routeId]
+      );
+      const route = routeRow.rows[0];
+      if (!route) return res.status(404).json({ error: "Ligne introuvable." });
+
+      const departures = (await pool.query(
+        `SELECT s.id AS schedule_id, s.departure_time, s.arrival_time, s.days_of_week, s.seats_total, s.status,
+                (SELECT MIN(base_price) FROM travel_prices p WHERE p.route_id=r.id AND (p.schedule_id IS NULL OR p.schedule_id=s.id)) AS base_price,
+                (SELECT MIN(child_price) FROM travel_prices p WHERE p.route_id=r.id AND (p.schedule_id IS NULL OR p.schedule_id=s.id)) AS child_price,
+                (COALESCE(s.seats_total,0) - COALESCE((SELECT SUM(seats_count) FROM travel_bookings b WHERE b.schedule_id=s.id AND b.payment_status='paid'),0)) AS seats_available
+           FROM travel_schedules s JOIN travel_routes r ON r.id=s.route_id
+          WHERE s.route_id=$1 AND s.status='active' ORDER BY s.departure_time`, [routeId]
+      )).rows;
+
+      res.json({ offer, route, departures });
+    } catch (e) {
+      console.error("ERREUR TRAVEL OFFER DETAIL :", e.message);
+      res.status(500).json({ error: "Erreur chargement de l'offre." });
+    }
+  });
+
   // Vérification PUBLIQUE d'un billet (scan QR / saisie du code) — AVANT auth.
   // Toujours interrogée côté serveur : ne jamais se fier à l'apparence du QR.
   router.get("/public/verify-ticket/:code", async (req, res) => {
