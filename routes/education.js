@@ -372,6 +372,17 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         return res.json({ student, attendance: upd.rows[0] || null, action: "sortie" });
       }
 
+      // Anti-double scan (§5) : si une présence existe déjà aujourd'hui, on
+      // ne recrée rien et on le signale clairement (l'heure d'entrée initiale
+      // est conservée par la contrainte ON CONFLICT).
+      const existing = await pool.query(
+        `SELECT * FROM edu_attendance WHERE student_id=$1 AND attendance_date=CURRENT_DATE`,
+        [student.id]
+      );
+      if (existing.rows[0]) {
+        return res.json({ student, attendance: existing.rows[0], action: "entree", already_recorded: true });
+      }
+
       // retard si arrivée après 08h15 (paramétrable plus tard)
       const now = new Date();
       const lateLimit = new Date(now); lateLimit.setHours(8, 15, 0, 0);
@@ -384,7 +395,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
          RETURNING *`,
         [schoolId(req), student.id, student.class_id, status, req.user.id]
       );
-      res.json({ student, attendance: ins.rows[0], action: "entree" });
+      res.json({ student, attendance: ins.rows[0], action: "entree", already_recorded: false });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur scan" }); }
   });
 
