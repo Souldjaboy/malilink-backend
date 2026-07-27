@@ -14,6 +14,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+const edupdf = require("../services/education/pdf");
 
 const STAFF_ROLES = ["super_admin", "school_admin", "director", "secretary", "supervisor"];
 const GRADE_ROLES = [...STAFF_ROLES, "teacher"];
@@ -415,6 +416,149 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       if (!rows[0]) return res.status(404).json({ error: "Professeur introuvable" });
       res.json(rows[0]);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur modification professeur" }); }
+  });
+
+  // ---------- INSCRIPTIONS + FICHE PDF (§10-11) ----------
+
+  async function nextEnrollmentRef(companyId) {
+    const year = new Date().getFullYear();
+    const { rows } = await pool.query(
+      `INSERT INTO edu_enrollment_counters (company_id, year, last_seq) VALUES ($1,$2,1)
+       ON CONFLICT (company_id, year) DO UPDATE SET last_seq = edu_enrollment_counters.last_seq + 1
+       RETURNING last_seq`,
+      [companyId, year]
+    );
+    return `MLK-INS-${year}-${String(rows[0].last_seq).padStart(5, "0")}`;
+  }
+
+  function enrollmentStatus(fee, paid) {
+    if (paid <= 0) return "pending";
+    if (paid >= fee) return "paid";
+    return "partially_paid";
+  }
+
+  router.get("/enrollments", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT e.*, s.first_name, s.last_name, s.matricule AS student_matricule, c.name AS class_name
+           FROM edu_enrollments e
+           JOIN edu_students s ON s.id=e.student_id
+           LEFT JOIN edu_classes c ON c.id=e.class_id
+          WHERE e.company_id=$1 ORDER BY e.created_at DESC LIMIT 300`,
+        [schoolId(req)]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur inscriptions" }); }
+  });
+
+  router.post("/enrollments", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      if (!b.student_id) return res.status(400).json({ error: "Élève requis" });
+      const own = await pool.query(`SELECT 1 FROM edu_students WHERE id=$1 AND company_id=$2`, [b.student_id, schoolId(req)]);
+      if (!own.rows[0]) return res.status(403).json({ error: "Élève hors de votre établissement." });
+      const fee = Number(b.enrollment_fee || 0);
+      const paid = Number(b.amount_paid || 0);
+      const reference = await nextEnrollmentRef(schoolId(req));
+      const signature = edupdf.signRef(["INSCRIPTION", reference]);
+      const { rows } = await pool.query(
+        `INSERT INTO edu_enrollments
+           (company_id, reference, student_id, school_year_id, class_id, enrollment_fee, amount_paid,
+            currency, payment_method, status, signature, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        [schoolId(req), reference, b.student_id, b.school_year_id || null, b.class_id || null, fee, paid,
+         b.currency || "FCFA", b.payment_method || "", enrollmentStatus(fee, paid), signature, b.notes || "", req.user.id]
+      );
+      // Trace le premier versement s'il y en a un.
+      if (paid > 0) {
+        await pool.query(
+          `INSERT INTO edu_enrollment_payments (company_id, enrollment_id, amount, method, recorded_by)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [schoolId(req), rows[0].id, paid, b.payment_method || "", req.user.id]
+        ).catch(() => {});
+      }
+      res.status(201).json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur création inscription" }); }
+  });
+
+  async function enrollmentDetail(companyId, id) {
+    const { rows } = await pool.query(
+      `SELECT e.*, s.first_name, s.last_name, s.matricule AS student_matricule, s.gender, s.birth_date,
+              c.name AS class_name, y.label AS year_label
+         FROM edu_enrollments e
+         JOIN edu_students s ON s.id=e.student_id
+         LEFT JOIN edu_classes c ON c.id=e.class_id
+         LEFT JOIN edu_school_years y ON y.id=e.school_year_id
+        WHERE e.company_id=$1 AND e.id=$2`,
+      [companyId, id]
+    );
+    return rows[0] || null;
+  }
+
+  router.get("/enrollments/:id", async (req, res) => {
+    const d = await enrollmentDetail(schoolId(req), req.params.id);
+    if (!d) return res.status(404).json({ error: "Inscription introuvable" });
+    res.json(d);
+  });
+
+  // Fiche d'inscription PDF (§11) — QR de vérification signé.
+  router.get("/enrollments/:id/pdf", async (req, res) => {
+    try {
+      const d = await enrollmentDetail(schoolId(req), req.params.id);
+      if (!d) return res.status(404).json({ error: "Inscription introuvable" });
+      const school = (await pool.query(
+        `SELECT co.name, es.address, es.phone, es.director_name, es.logo_url
+           FROM companies co LEFT JOIN edu_schools es ON es.company_id=co.id
+          WHERE co.id=$1 LIMIT 1`,
+        [schoolId(req)]
+      )).rows[0] || {};
+      const parent = (await pool.query(
+        `SELECT COALESCE(u.fullname, '') AS name, sp.relation, COALESCE(u.phone,'') AS phone
+           FROM edu_student_parents sp LEFT JOIN users u ON u.id=sp.parent_user_id
+          WHERE sp.student_id=$1 ORDER BY sp.id LIMIT 1`,
+        [d.student_id]
+      )).rows[0] || {};
+      const rest = Math.max(0, Number(d.enrollment_fee) - Number(d.amount_paid));
+      await edupdf.renderDocument(res, {
+        filename: `fiche-inscription-${d.reference}`,
+        title: "Fiche d'inscription",
+        reference: d.reference,
+        qrText: edupdf.docToken("INSCRIPTION", d.reference),
+        school,
+        sections: [
+          { title: "Élève", rows: [
+            { label: "Nom complet", value: `${d.first_name} ${d.last_name}` },
+            { label: "Matricule", value: d.student_matricule },
+            { label: "Sexe", value: d.gender === "F" ? "Féminin" : d.gender === "M" ? "Masculin" : "—" },
+            { label: "Date de naissance", value: d.birth_date || "—" },
+            { label: "Classe", value: d.class_name || "—" },
+            { label: "Année scolaire", value: d.year_label || "—" },
+          ] },
+          { title: "Parent / Tuteur", rows: [
+            { label: "Nom", value: parent.name || "—" },
+            { label: "Relation", value: parent.relation || "—" },
+            { label: "Téléphone", value: parent.phone || "—" },
+          ] },
+          { title: "Paiement", rows: [
+            { label: "Frais d'inscription", value: `${Number(d.enrollment_fee).toLocaleString("fr-FR")} ${d.currency}` },
+            { label: "Montant payé", value: `${Number(d.amount_paid).toLocaleString("fr-FR")} ${d.currency}` },
+            { label: "Reste à payer", value: `${rest.toLocaleString("fr-FR")} ${d.currency}` },
+            { label: "Moyen de paiement", value: d.payment_method || "—" },
+            { label: "Statut", value: d.status },
+          ] },
+        ],
+        footerNote: `Fiche générée par MaliLink Éducation le ${new Date().toLocaleDateString("fr-FR")}. Authenticité vérifiable par le QR code.`,
+      });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération de la fiche PDF" }); }
+  });
+
+  // Vérification publique d'un document (référence + signature). Info limitée.
+  router.get("/verify/:type/:reference", async (req, res) => {
+    try {
+      const sig = String(req.query.sig || "");
+      const valid = edupdf.verifyToken(String(req.params.type).toUpperCase(), req.params.reference, sig);
+      res.json({ valid, reference: req.params.reference, type: req.params.type, issuer: "MaliLink Éducation" });
+    } catch { res.status(500).json({ valid: false }); }
   });
 
   // ---------- EMPLOIS DU TEMPS (§7) + CONFLITS (§8) ----------
