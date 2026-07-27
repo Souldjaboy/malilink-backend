@@ -72,6 +72,31 @@ async function renderDocument(res, spec) {
   for (const section of spec.sections || []) {
     doc.fillColor(GOLD).fontSize(11).font("Helvetica-Bold").text(section.title, 40, y);
     y += 18;
+
+    if (section.table) {
+      // Tableau à colonnes : { columns:[{label,width,align}], rows:[[...cells]] }
+      const cols = section.table.columns;
+      let x = 50;
+      const xs = cols.map((c) => { const cur = x; x += c.width; return cur; });
+      // En-tête.
+      doc.fillColor(NAVY).fontSize(9).font("Helvetica-Bold");
+      cols.forEach((c, i) => doc.text(String(c.label), xs[i], y, { width: c.width - 6, align: c.align || "left" }));
+      y += 14;
+      doc.moveTo(50, y - 2).lineTo(555, y - 2).lineWidth(0.5).strokeColor("#ccc").stroke();
+      // Lignes.
+      doc.font("Helvetica").fontSize(9);
+      for (const cells of section.table.rows) {
+        cols.forEach((c, i) => {
+          doc.fillColor(c.strong ? "#111" : "#333").font(c.strong ? "Helvetica-Bold" : "Helvetica");
+          doc.text(String(cells[i] ?? ""), xs[i], y, { width: c.width - 6, align: c.align || "left" });
+        });
+        y += 15;
+        if (y > 760) { doc.addPage(); y = 50; }
+      }
+      y += 12;
+      continue;
+    }
+
     for (const row of section.rows) {
       doc.fillColor("#555").fontSize(10).font("Helvetica").text(String(row.label), 50, y, { width: 180, continued: false });
       doc.fillColor("#111").font("Helvetica-Bold").text(String(row.value ?? "—"), 235, y, { width: 320 });

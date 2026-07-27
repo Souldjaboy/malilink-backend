@@ -1532,6 +1532,132 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur bulletins" }); }
   });
 
+  // Mention selon la moyenne générale (système /20).
+  function mention(avg) {
+    if (avg == null) return "—";
+    const a = Number(avg);
+    if (a >= 18) return "Excellent";
+    if (a >= 16) return "Très bien";
+    if (a >= 14) return "Bien";
+    if (a >= 12) return "Assez bien";
+    if (a >= 10) return "Passable";
+    return "Insuffisant";
+  }
+
+  // Liste des bulletins générés pour une classe + période (avec noms d'élèves).
+  router.get("/classes/:id/report-cards", requireRoles(GRADE_ROLES), async (req, res) => {
+    try {
+      const termId = req.query.term_id ? Number(req.query.term_id) : null;
+      const { rows } = await pool.query(
+        `SELECT rc.id, rc.student_id, rc.term_id, rc.general_average, rc.rank_in_class, rc.class_size,
+                rc.absences_count, rc.late_count, rc.appreciation, rc.conduct, rc.council_decision,
+                s.first_name, s.last_name, s.matricule AS student_matricule, t.label AS term_label
+           FROM edu_report_cards rc
+           JOIN edu_students s ON s.id=rc.student_id
+           JOIN edu_terms t ON t.id=rc.term_id
+          WHERE rc.company_id=$1 AND s.class_id=$2 AND ($3::int IS NULL OR rc.term_id=$3)
+          ORDER BY rc.rank_in_class NULLS LAST, s.last_name`,
+        [schoolId(req), req.params.id, termId]
+      );
+      res.json(rows.map((r) => ({ ...r, mention: mention(r.general_average) })));
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur bulletins" }); }
+  });
+
+  // Appréciation / conduite / décision du conseil sur un bulletin.
+  router.patch("/report-cards/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const { rows } = await pool.query(
+        `UPDATE edu_report_cards SET
+           appreciation=COALESCE($3, appreciation),
+           conduct=COALESCE($4, conduct),
+           council_decision=COALESCE($5, council_decision)
+         WHERE id=$1 AND company_id=$2 RETURNING *`,
+        [req.params.id, schoolId(req), b.appreciation ?? null, b.conduct ?? null, b.council_decision ?? null]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Bulletin introuvable" });
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur bulletin" }); }
+  });
+
+  // Bulletin PDF (§16) — tableau des matières, moyenne, rang, mention, QR signé.
+  router.get("/report-cards/:id/pdf", async (req, res) => {
+    try {
+      const rc = (await pool.query(
+        `SELECT rc.*, s.first_name, s.last_name, s.matricule AS student_matricule, s.gender,
+                c.name AS class_name, t.label AS term_label, y.label AS year_label
+           FROM edu_report_cards rc
+           JOIN edu_students s ON s.id=rc.student_id
+           LEFT JOIN edu_classes c ON c.id=s.class_id
+           JOIN edu_terms t ON t.id=rc.term_id
+           LEFT JOIN edu_school_years y ON y.id=t.school_year_id
+          WHERE rc.id=$1 AND rc.company_id=$2`,
+        [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!rc) return res.status(404).json({ error: "Bulletin introuvable" });
+      const school = (await pool.query(
+        `SELECT co.name, es.address, es.phone, es.director_name, es.logo_url
+           FROM companies co LEFT JOIN edu_schools es ON es.company_id=co.id WHERE co.id=$1 LIMIT 1`,
+        [schoolId(req)]
+      )).rows[0] || {};
+      let details = [];
+      try { details = Array.isArray(rc.details) ? rc.details : JSON.parse(rc.details || "[]"); } catch { details = []; }
+      const ref = `BUL-${rc.id}`;
+      const subjectRows = details.map((d) => {
+        const coef = Number(d.coefficient) || 0;
+        const avg = d.subject_average == null ? null : Number(d.subject_average);
+        return [
+          d.subject_name,
+          coef.toString(),
+          avg == null ? "—" : avg.toFixed(2),
+          avg == null ? "—" : (avg * coef).toFixed(2),
+          avg == null ? "—" : mention(avg),
+        ];
+      });
+      const totalCoef = details.reduce((s, d) => s + (Number(d.coefficient) || 0), 0);
+      const totalPts = details.reduce((s, d) => s + (d.subject_average == null ? 0 : Number(d.subject_average) * (Number(d.coefficient) || 0)), 0);
+      await edupdf.renderDocument(res, {
+        filename: `bulletin-${rc.student_matricule || rc.id}`,
+        title: "Bulletin de notes",
+        subtitle: `${rc.term_label || ""}${rc.year_label ? " · " + rc.year_label : ""}`,
+        reference: ref,
+        qrText: edupdf.docToken("BULLETIN", ref),
+        school,
+        sections: [
+          { title: "Élève", rows: [
+            { label: "Nom complet", value: `${rc.first_name} ${rc.last_name}` },
+            { label: "Matricule", value: rc.student_matricule },
+            { label: "Classe", value: rc.class_name || "—" },
+          ] },
+          { title: "Résultats par matière", table: {
+            columns: [
+              { label: "Matière", width: 200 },
+              { label: "Coef", width: 45, align: "center" },
+              { label: "Moy./20", width: 70, align: "center" },
+              { label: "Moy×Coef", width: 80, align: "center" },
+              { label: "Mention", width: 110 },
+            ],
+            rows: [
+              ...subjectRows,
+              ["TOTAL", totalCoef.toString(), "", totalPts.toFixed(2), ""],
+            ],
+          } },
+          { title: "Synthèse", rows: [
+            { label: "Moyenne générale", value: rc.general_average == null ? "—" : `${Number(rc.general_average).toFixed(2)}/20` },
+            { label: "Mention", value: mention(rc.general_average) },
+            { label: "Rang", value: rc.rank_in_class ? `${rc.rank_in_class}ᵉ / ${rc.class_size}` : "—" },
+            { label: "Absences", value: String(rc.absences_count ?? 0) },
+            { label: "Retards", value: String(rc.late_count ?? 0) },
+            { label: "Conduite", value: rc.conduct || "—" },
+            { label: "Appréciation", value: rc.appreciation || "—" },
+            { label: "Décision du conseil", value: rc.council_decision || "—" },
+          ] },
+        ],
+        footerNote: `Bulletin généré par MaliLink Éducation le ${new Date().toLocaleDateString("fr-FR")}. Authenticité vérifiable par le QR code.`,
+      });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération du bulletin PDF" }); }
+  });
+
   // ---------- PAIEMENTS SCOLAIRES ----------
 
   router.get("/fees", requireRoles([...MONEY_ROLES, "parent"]), async (req, res) => {
