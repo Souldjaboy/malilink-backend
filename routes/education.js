@@ -417,6 +417,148 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur modification professeur" }); }
   });
 
+  // ---------- EMPLOIS DU TEMPS (§7) + CONFLITS (§8) ----------
+
+  const DAYS = ["", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
+
+  // Détecte un chevauchement pour le professeur, la classe ou la salle.
+  async function scheduleConflict(companyId, s, excludeId = null) {
+    const { rows } = await pool.query(
+      `SELECT sc.*, t.first_name, t.last_name, c.name AS class_name
+         FROM edu_schedules sc
+         LEFT JOIN edu_teachers t ON t.id=sc.teacher_id
+         LEFT JOIN edu_classes c ON c.id=sc.class_id
+        WHERE sc.company_id=$1 AND sc.status='actif' AND sc.day_of_week=$2
+          AND sc.start_time < $4 AND sc.end_time > $3
+          AND ($7::int IS NULL OR sc.id <> $7)
+          AND (
+            ($5::int IS NOT NULL AND sc.teacher_id=$5)
+            OR sc.class_id=$6
+            OR ($8 <> '' AND lower(sc.room)=lower($8))
+          )
+        LIMIT 1`,
+      [companyId, s.day_of_week, s.start_time, s.end_time, s.teacher_id || null, s.class_id, excludeId, s.room || ""]
+    );
+    const c = rows[0];
+    if (!c) return null;
+    const h = (t) => String(t).slice(0, 5);
+    let who;
+    if (s.teacher_id && c.teacher_id === s.teacher_id) who = `${c.first_name} ${c.last_name} enseigne déjà`;
+    else if (c.class_id === s.class_id) who = `La classe ${c.class_name} a déjà cours`;
+    else who = `La salle ${c.room} est déjà occupée`;
+    return `Impossible d'enregistrer ce cours. ${who} le ${DAYS[s.day_of_week]} de ${h(c.start_time)} à ${h(c.end_time)}.`;
+  }
+
+  router.get("/schedules", async (req, res) => {
+    try {
+      const classId = req.query.class_id ? Number(req.query.class_id) : null;
+      const teacherId = req.query.teacher_id ? Number(req.query.teacher_id) : null;
+      const { rows } = await pool.query(
+        `SELECT sc.*, t.first_name AS teacher_first, t.last_name AS teacher_last,
+                c.name AS class_name, s.name AS subject_name
+           FROM edu_schedules sc
+           LEFT JOIN edu_teachers t ON t.id=sc.teacher_id
+           LEFT JOIN edu_classes c ON c.id=sc.class_id
+           LEFT JOIN edu_subjects s ON s.id=sc.subject_id
+          WHERE sc.company_id=$1 AND sc.status<>'annule'
+            AND ($2::int IS NULL OR sc.class_id=$2)
+            AND ($3::int IS NULL OR sc.teacher_id=$3)
+          ORDER BY sc.day_of_week, sc.start_time`,
+        [schoolId(req), classId, teacherId]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur emploi du temps" }); }
+  });
+
+  router.post("/schedules", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const day = Number(b.day_of_week);
+      if (!b.class_id || !day || day < 1 || day > 7 || !b.start_time || !b.end_time) {
+        return res.status(400).json({ error: "Classe, jour (1-7), heure de début et de fin obligatoires." });
+      }
+      if (b.end_time <= b.start_time) return res.status(400).json({ error: "L'heure de fin doit être après l'heure de début." });
+      const own = await pool.query(`SELECT 1 FROM edu_classes WHERE id=$1 AND company_id=$2`, [b.class_id, schoolId(req)]);
+      if (!own.rows[0]) return res.status(403).json({ error: "Classe hors de votre établissement." });
+
+      const conflict = await scheduleConflict(schoolId(req), {
+        day_of_week: day, start_time: b.start_time, end_time: b.end_time, teacher_id: b.teacher_id || null, class_id: b.class_id, room: b.room || "",
+      });
+      if (conflict) return res.status(409).json({ error: conflict });
+
+      const { rows } = await pool.query(
+        `INSERT INTO edu_schedules
+           (company_id, assignment_id, teacher_id, class_id, subject_id, school_year_id, day_of_week,
+            start_time, end_time, room, frequency, session_type, mode, meeting_link, valid_from, valid_to, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+        [schoolId(req), b.assignment_id || null, b.teacher_id || null, b.class_id, b.subject_id || null,
+         b.school_year_id || null, day, b.start_time, b.end_time, b.room || "", b.frequency || "weekly",
+         b.session_type || "cours", b.mode || "presentiel", b.meeting_link || "", b.valid_from || null, b.valid_to || null, req.user.id]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur création du cours" }); }
+  });
+
+  router.patch("/schedules/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const cur = await pool.query(`SELECT * FROM edu_schedules WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
+      if (!cur.rows[0]) return res.status(404).json({ error: "Cours introuvable" });
+      const merged = { ...cur.rows[0], ...b };
+      if (merged.end_time <= merged.start_time) return res.status(400).json({ error: "L'heure de fin doit être après l'heure de début." });
+      const conflict = await scheduleConflict(schoolId(req), merged, Number(req.params.id));
+      if (conflict) return res.status(409).json({ error: conflict });
+      const fields = ["teacher_id", "subject_id", "day_of_week", "start_time", "end_time", "room",
+        "frequency", "session_type", "mode", "meeting_link", "valid_from", "valid_to", "status"];
+      const set = []; const vals = [];
+      for (const f of fields) { if (b[f] !== undefined) { vals.push(b[f]); set.push(`${f}=$${vals.length}`); } }
+      if (set.length === 0) return res.status(400).json({ error: "Aucune modification" });
+      vals.push(req.params.id, schoolId(req));
+      const { rows } = await pool.query(
+        `UPDATE edu_schedules SET ${set.join(", ")}, updated_at=NOW() WHERE id=$${vals.length - 1} AND company_id=$${vals.length} RETURNING *`,
+        vals
+      );
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur modification du cours" }); }
+  });
+
+  router.delete("/schedules/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const { rowCount } = await pool.query(`DELETE FROM edu_schedules WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
+      if (!rowCount) return res.status(404).json({ error: "Cours introuvable" });
+      res.json({ ok: true });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur suppression du cours" }); }
+  });
+
+  // Vues d'emploi du temps (par classe / par professeur).
+  router.get("/timetables/class/:classId", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT sc.*, t.first_name AS teacher_first, t.last_name AS teacher_last, s.name AS subject_name
+           FROM edu_schedules sc LEFT JOIN edu_teachers t ON t.id=sc.teacher_id
+           LEFT JOIN edu_subjects s ON s.id=sc.subject_id
+          WHERE sc.company_id=$1 AND sc.class_id=$2 AND sc.status='actif'
+          ORDER BY sc.day_of_week, sc.start_time`,
+        [schoolId(req), req.params.classId]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur emploi du temps classe" }); }
+  });
+
+  router.get("/timetables/teacher/:teacherId", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT sc.*, c.name AS class_name, s.name AS subject_name
+           FROM edu_schedules sc LEFT JOIN edu_classes c ON c.id=sc.class_id
+           LEFT JOIN edu_subjects s ON s.id=sc.subject_id
+          WHERE sc.company_id=$1 AND sc.teacher_id=$2 AND sc.status='actif'
+          ORDER BY sc.day_of_week, sc.start_time`,
+        [schoolId(req), req.params.teacherId]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur emploi du temps professeur" }); }
+  });
+
   // ---------- ÉLÈVES + BADGES QR ----------
 
   router.get("/students", async (req, res) => {
