@@ -561,6 +561,159 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch { res.status(500).json({ valid: false }); }
   });
 
+  // ---------- PAIEMENTS D'INSCRIPTION + REÇUS PDF (§12) ----------
+
+  async function nextReceiptRef(companyId) {
+    const year = new Date().getFullYear();
+    const { rows } = await pool.query(
+      `INSERT INTO edu_receipt_counters (company_id, year, last_seq) VALUES ($1,$2,1)
+       ON CONFLICT (company_id, year) DO UPDATE SET last_seq = edu_receipt_counters.last_seq + 1
+       RETURNING last_seq`,
+      [companyId, year]
+    );
+    return `MLK-REC-${year}-${String(rows[0].last_seq).padStart(5, "0")}`;
+  }
+
+  // Recalcule montant payé + statut d'une inscription à partir de ses paiements actifs.
+  async function recomputeEnrollment(companyId, enrollmentId) {
+    const agg = await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS paid
+         FROM edu_enrollment_payments
+        WHERE company_id=$1 AND enrollment_id=$2 AND status='paid'`,
+      [companyId, enrollmentId]
+    );
+    const paid = Number(agg.rows[0].paid);
+    const enr = await pool.query(
+      `SELECT enrollment_fee FROM edu_enrollments WHERE company_id=$1 AND id=$2`,
+      [companyId, enrollmentId]
+    );
+    if (!enr.rows[0]) return null;
+    const fee = Number(enr.rows[0].enrollment_fee);
+    const { rows } = await pool.query(
+      `UPDATE edu_enrollments SET amount_paid=$3, status=$4, updated_at=NOW()
+        WHERE company_id=$1 AND id=$2 RETURNING *`,
+      [companyId, enrollmentId, paid, enrollmentStatus(fee, paid)]
+    );
+    return rows[0];
+  }
+
+  // Historique des versements d'une inscription.
+  router.get("/enrollments/:id/payments", async (req, res) => {
+    try {
+      const own = await pool.query(
+        `SELECT 1 FROM edu_enrollments WHERE id=$1 AND company_id=$2`,
+        [req.params.id, schoolId(req)]
+      );
+      if (!own.rows[0]) return res.status(404).json({ error: "Inscription introuvable" });
+      const { rows } = await pool.query(
+        `SELECT p.*, COALESCE(u.fullname,'') AS recorded_by_name
+           FROM edu_enrollment_payments p
+           LEFT JOIN users u ON u.id=p.recorded_by
+          WHERE p.company_id=$1 AND p.enrollment_id=$2
+          ORDER BY p.created_at DESC`,
+        [schoolId(req), req.params.id]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur paiements" }); }
+  });
+
+  // Enregistre un nouveau versement (génère un numéro de reçu, met à jour l'inscription).
+  router.post("/enrollments/:id/payments", requireRoles(MONEY_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const amount = Number(b.amount || 0);
+      if (!(amount > 0)) return res.status(400).json({ error: "Montant invalide." });
+      const enr = await pool.query(
+        `SELECT id, enrollment_fee, amount_paid FROM edu_enrollments WHERE id=$1 AND company_id=$2`,
+        [req.params.id, schoolId(req)]
+      );
+      if (!enr.rows[0]) return res.status(404).json({ error: "Inscription introuvable" });
+      const receipt = await nextReceiptRef(schoolId(req));
+      const signature = edupdf.signRef(["RECU", receipt]);
+      const { rows } = await pool.query(
+        `INSERT INTO edu_enrollment_payments
+           (company_id, enrollment_id, receipt_number, amount, method, reference, status, signature, notes, recorded_by)
+         VALUES ($1,$2,$3,$4,$5,$6,'paid',$7,$8,$9) RETURNING *`,
+        [schoolId(req), req.params.id, receipt, amount, b.method || "", b.reference || "", signature, b.notes || "", req.user.id]
+      );
+      const enrollment = await recomputeEnrollment(schoolId(req), req.params.id);
+      res.status(201).json({ payment: rows[0], enrollment });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur enregistrement du paiement" }); }
+  });
+
+  // Annule un versement (statut cancelled) et recalcule l'inscription.
+  router.patch("/enrollment-payments/:id/cancel", requireRoles(MONEY_ROLES), async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE edu_enrollment_payments SET status='cancelled'
+          WHERE id=$1 AND company_id=$2 AND status='paid' RETURNING enrollment_id`,
+        [req.params.id, schoolId(req)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Paiement introuvable ou déjà annulé." });
+      const enrollment = await recomputeEnrollment(schoolId(req), rows[0].enrollment_id);
+      res.json({ ok: true, enrollment });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur annulation du paiement" }); }
+  });
+
+  // Reçu de paiement PDF (§12) — QR de vérification signé.
+  router.get("/enrollment-payments/:id/receipt", async (req, res) => {
+    try {
+      const pay = (await pool.query(
+        `SELECT p.*, e.reference AS enrollment_ref, e.enrollment_fee, e.amount_paid,
+                s.first_name, s.last_name, s.matricule AS student_matricule,
+                c.name AS class_name, y.label AS year_label,
+                COALESCE(u.fullname,'') AS recorded_by_name
+           FROM edu_enrollment_payments p
+           JOIN edu_enrollments e ON e.id=p.enrollment_id
+           JOIN edu_students s ON s.id=e.student_id
+           LEFT JOIN edu_classes c ON c.id=e.class_id
+           LEFT JOIN edu_school_years y ON y.id=e.school_year_id
+           LEFT JOIN users u ON u.id=p.recorded_by
+          WHERE p.id=$1 AND p.company_id=$2`,
+        [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!pay) return res.status(404).json({ error: "Reçu introuvable" });
+      const school = (await pool.query(
+        `SELECT co.name, es.address, es.phone, es.director_name, es.logo_url
+           FROM companies co LEFT JOIN edu_schools es ON es.company_id=co.id
+          WHERE co.id=$1 LIMIT 1`,
+        [schoolId(req)]
+      )).rows[0] || {};
+      const ref = pay.receipt_number || `PAY-${pay.id}`;
+      const rest = Math.max(0, Number(pay.enrollment_fee) - Number(pay.amount_paid));
+      await edupdf.renderDocument(res, {
+        filename: `recu-${ref}`,
+        title: pay.status === "cancelled" ? "Reçu (ANNULÉ)" : "Reçu de paiement",
+        reference: ref,
+        qrText: edupdf.docToken("RECU", ref),
+        school,
+        sections: [
+          { title: "Élève", rows: [
+            { label: "Nom complet", value: `${pay.first_name} ${pay.last_name}` },
+            { label: "Matricule", value: pay.student_matricule },
+            { label: "Classe", value: pay.class_name || "—" },
+            { label: "Année scolaire", value: pay.year_label || "—" },
+            { label: "Inscription", value: pay.enrollment_ref },
+          ] },
+          { title: "Versement", rows: [
+            { label: "Numéro de reçu", value: ref },
+            { label: "Date", value: new Date(pay.created_at).toLocaleDateString("fr-FR") },
+            { label: "Montant reçu", value: `${Number(pay.amount).toLocaleString("fr-FR")} FCFA` },
+            { label: "Moyen de paiement", value: pay.method || "—" },
+            { label: "Référence transaction", value: pay.reference || "—" },
+            { label: "Encaissé par", value: pay.recorded_by_name || "—" },
+          ] },
+          { title: "Situation de l'inscription", rows: [
+            { label: "Frais total", value: `${Number(pay.enrollment_fee).toLocaleString("fr-FR")} FCFA` },
+            { label: "Total payé", value: `${Number(pay.amount_paid).toLocaleString("fr-FR")} FCFA` },
+            { label: "Reste à payer", value: `${rest.toLocaleString("fr-FR")} FCFA` },
+          ] },
+        ],
+        footerNote: `Reçu généré par MaliLink Éducation le ${new Date().toLocaleDateString("fr-FR")}. Authenticité vérifiable par le QR code.`,
+      });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération du reçu PDF" }); }
+  });
+
   // ---------- EMPLOIS DU TEMPS (§7) + CONFLITS (§8) ----------
 
   const DAYS = ["", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
