@@ -714,6 +714,289 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération du reçu PDF" }); }
   });
 
+  // ---------- PLANS DE MENSUALITÉS + ÉCHÉANCIER & REÇUS PDF (§13) ----------
+
+  // Répartit un montant total en N échéances mensuelles à partir d'une date.
+  // Dates calculées en UTC pour éviter toute dérive de fuseau horaire.
+  function buildInstallments(total, count, firstDue) {
+    const n = Math.max(1, Number(count) || 1);
+    const cents = Math.round(Number(total) * 100);
+    const base = Math.floor(cents / n);
+    let y, m, d;
+    if (firstDue && /^\d{4}-\d{2}-\d{2}/.test(String(firstDue))) {
+      [y, m, d] = String(firstDue).slice(0, 10).split("-").map(Number);
+    } else {
+      const now = new Date();
+      y = now.getFullYear(); m = now.getMonth() + 1; d = now.getDate();
+    }
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const amountCents = i === n - 1 ? cents - base * (n - 1) : base;
+      const due = new Date(Date.UTC(y, m - 1 + i, d));
+      out.push({
+        seq: i + 1,
+        label: `Mensualité ${i + 1}`,
+        due_date: due.toISOString().slice(0, 10),
+        amount: (amountCents / 100).toFixed(2),
+      });
+    }
+    return out;
+  }
+
+  function installmentStatus(amount, paid) {
+    if (paid <= 0) return "pending";
+    if (paid >= amount) return "paid";
+    return "partial";
+  }
+
+  // Réaffecte en cascade le total payé (versements actifs) sur les échéances.
+  async function recomputeFeePlan(companyId, planId) {
+    const plan = (await pool.query(
+      `SELECT * FROM edu_feeplans WHERE company_id=$1 AND id=$2`, [companyId, planId]
+    )).rows[0];
+    if (!plan) return null;
+    const totalPaid = Number((await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS s FROM edu_feeplan_payments
+        WHERE company_id=$1 AND plan_id=$2 AND status='paid'`, [companyId, planId]
+    )).rows[0].s);
+    const insts = (await pool.query(
+      `SELECT * FROM edu_feeplan_installments WHERE company_id=$1 AND plan_id=$2 ORDER BY seq`,
+      [companyId, planId]
+    )).rows;
+    let remaining = totalPaid;
+    for (const inst of insts) {
+      const amt = Number(inst.amount);
+      const paid = Math.min(remaining, amt);
+      remaining -= paid;
+      await pool.query(
+        `UPDATE edu_feeplan_installments SET amount_paid=$3, status=$4 WHERE id=$1 AND company_id=$2`,
+        [inst.id, companyId, paid.toFixed(2), installmentStatus(amt, paid)]
+      );
+    }
+    const status = plan.status === "cancelled" ? "cancelled"
+      : totalPaid >= Number(plan.total_amount) ? "completed" : "active";
+    const { rows } = await pool.query(
+      `UPDATE edu_feeplans SET status=$3, updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING *`,
+      [planId, companyId, status]
+    );
+    return { ...rows[0], total_paid: totalPaid.toFixed(2) };
+  }
+
+  router.get("/fee-plans", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT p.*, s.first_name, s.last_name, s.matricule AS student_matricule, c.name AS class_name,
+                COALESCE((SELECT SUM(amount) FROM edu_feeplan_payments fp
+                          WHERE fp.plan_id=p.id AND fp.status='paid'),0) AS total_paid
+           FROM edu_feeplans p
+           JOIN edu_students s ON s.id=p.student_id
+           LEFT JOIN edu_classes c ON c.id=p.class_id
+          WHERE p.company_id=$1 ORDER BY p.created_at DESC LIMIT 300`,
+        [schoolId(req)]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur plans" }); }
+  });
+
+  router.post("/fee-plans", requireRoles(MONEY_ROLES), async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const b = req.body || {};
+      if (!b.student_id) return res.status(400).json({ error: "Élève requis" });
+      const total = Number(b.total_amount || 0);
+      const count = Math.max(1, Math.min(24, Number(b.installments_count || 1)));
+      if (!(total > 0)) return res.status(400).json({ error: "Montant total invalide." });
+      const own = await client.query(`SELECT 1 FROM edu_students WHERE id=$1 AND company_id=$2`, [b.student_id, schoolId(req)]);
+      if (!own.rows[0]) return res.status(403).json({ error: "Élève hors de votre établissement." });
+      await client.query("BEGIN");
+      const plan = (await client.query(
+        `INSERT INTO edu_feeplans
+           (company_id, student_id, school_year_id, class_id, label, total_amount, installments_count, currency, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [schoolId(req), b.student_id, b.school_year_id || null, b.class_id || null,
+         b.label || "Scolarité", total, count, b.currency || "FCFA", b.notes || "", req.user.id]
+      )).rows[0];
+      for (const inst of buildInstallments(total, count, b.first_due_date)) {
+        await client.query(
+          `INSERT INTO edu_feeplan_installments (company_id, plan_id, seq, label, due_date, amount)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [schoolId(req), plan.id, inst.seq, inst.label, inst.due_date, inst.amount]
+        );
+      }
+      await client.query("COMMIT");
+      res.status(201).json(plan);
+    } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur création du plan" }); }
+    finally { client.release(); }
+  });
+
+  async function feePlanDetail(companyId, id) {
+    const plan = (await pool.query(
+      `SELECT p.*, s.first_name, s.last_name, s.matricule AS student_matricule,
+              c.name AS class_name, y.label AS year_label
+         FROM edu_feeplans p
+         JOIN edu_students s ON s.id=p.student_id
+         LEFT JOIN edu_classes c ON c.id=p.class_id
+         LEFT JOIN edu_school_years y ON y.id=p.school_year_id
+        WHERE p.company_id=$1 AND p.id=$2`, [companyId, id]
+    )).rows[0];
+    if (!plan) return null;
+    plan.installments = (await pool.query(
+      `SELECT id, company_id, plan_id, seq, label, due_date::text AS due_date, amount, amount_paid, status, created_at
+         FROM edu_feeplan_installments WHERE company_id=$1 AND plan_id=$2 ORDER BY seq`, [companyId, id]
+    )).rows;
+    plan.payments = (await pool.query(
+      `SELECT fp.*, COALESCE(u.fullname,'') AS recorded_by_name
+         FROM edu_feeplan_payments fp LEFT JOIN users u ON u.id=fp.recorded_by
+        WHERE fp.company_id=$1 AND fp.plan_id=$2 ORDER BY fp.created_at DESC`, [companyId, id]
+    )).rows;
+    plan.total_paid = plan.payments.filter((p) => p.status === "paid")
+      .reduce((s, p) => s + Number(p.amount), 0).toFixed(2);
+    return plan;
+  }
+
+  router.get("/fee-plans/:id", async (req, res) => {
+    const d = await feePlanDetail(schoolId(req), req.params.id);
+    if (!d) return res.status(404).json({ error: "Plan introuvable" });
+    res.json(d);
+  });
+
+  // Enregistre un versement sur un plan (affectation en cascade), génère le reçu.
+  router.post("/fee-plans/:id/payments", requireRoles(MONEY_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const amount = Number(b.amount || 0);
+      if (!(amount > 0)) return res.status(400).json({ error: "Montant invalide." });
+      const plan = (await pool.query(
+        `SELECT id FROM edu_feeplans WHERE id=$1 AND company_id=$2 AND status<>'cancelled'`,
+        [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!plan) return res.status(404).json({ error: "Plan introuvable" });
+      const receipt = await nextReceiptRef(schoolId(req));
+      const signature = edupdf.signRef(["RECU", receipt]);
+      const pay = (await pool.query(
+        `INSERT INTO edu_feeplan_payments
+           (company_id, plan_id, installment_id, receipt_number, amount, method, reference, status, signature, notes, recorded_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'paid',$8,$9,$10) RETURNING *`,
+        [schoolId(req), req.params.id, b.installment_id || null, receipt, amount,
+         b.method || "", b.reference || "", signature, b.notes || "", req.user.id]
+      )).rows[0];
+      const planState = await recomputeFeePlan(schoolId(req), req.params.id);
+      res.status(201).json({ payment: pay, plan: planState });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur enregistrement du paiement" }); }
+  });
+
+  router.patch("/fee-payments/:id/cancel", requireRoles(MONEY_ROLES), async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE edu_feeplan_payments SET status='cancelled'
+          WHERE id=$1 AND company_id=$2 AND status='paid' RETURNING plan_id`,
+        [req.params.id, schoolId(req)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Paiement introuvable ou déjà annulé." });
+      const plan = await recomputeFeePlan(schoolId(req), rows[0].plan_id);
+      res.json({ ok: true, plan });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur annulation" }); }
+  });
+
+  async function feeSchoolHeader(companyId) {
+    return (await pool.query(
+      `SELECT co.name, es.address, es.phone, es.director_name, es.logo_url
+         FROM companies co LEFT JOIN edu_schools es ON es.company_id=co.id WHERE co.id=$1 LIMIT 1`,
+      [companyId]
+    )).rows[0] || {};
+  }
+
+  // Échéancier PDF (§13) — tableau des mensualités.
+  router.get("/fee-plans/:id/schedule/pdf", async (req, res) => {
+    try {
+      const d = await feePlanDetail(schoolId(req), req.params.id);
+      if (!d) return res.status(404).json({ error: "Plan introuvable" });
+      const school = await feeSchoolHeader(schoolId(req));
+      const rest = Math.max(0, Number(d.total_amount) - Number(d.total_paid));
+      await edupdf.renderDocument(res, {
+        filename: `echeancier-${d.reference || d.id}`,
+        title: "Échéancier de scolarité",
+        reference: `PLAN-${d.id}`,
+        qrText: edupdf.docToken("PLAN", `PLAN-${d.id}`),
+        school,
+        sections: [
+          { title: "Élève", rows: [
+            { label: "Nom complet", value: `${d.first_name} ${d.last_name}` },
+            { label: "Matricule", value: d.student_matricule },
+            { label: "Classe", value: d.class_name || "—" },
+            { label: "Année scolaire", value: d.year_label || "—" },
+            { label: "Intitulé", value: d.label },
+          ] },
+          { title: "Échéancier", rows: d.installments.map((i) => ({
+            label: `${i.label} — échéance ${i.due_date ? new Date(i.due_date).toLocaleDateString("fr-FR", { timeZone: "UTC" }) : "—"}`,
+            value: `${Number(i.amount).toLocaleString("fr-FR")} FCFA · ${i.status === "paid" ? "payé" : i.status === "partial" ? `partiel (${Number(i.amount_paid).toLocaleString("fr-FR")})` : "à payer"}`,
+          })) },
+          { title: "Totaux", rows: [
+            { label: "Total scolarité", value: `${Number(d.total_amount).toLocaleString("fr-FR")} FCFA` },
+            { label: "Total payé", value: `${Number(d.total_paid).toLocaleString("fr-FR")} FCFA` },
+            { label: "Reste à payer", value: `${rest.toLocaleString("fr-FR")} FCFA` },
+          ] },
+        ],
+        footerNote: `Échéancier généré par MaliLink Éducation le ${new Date().toLocaleDateString("fr-FR")}. Authenticité vérifiable par le QR code.`,
+      });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération de l'échéancier PDF" }); }
+  });
+
+  // Reçu de mensualité PDF (§13).
+  router.get("/fee-payments/:id/receipt", async (req, res) => {
+    try {
+      const pay = (await pool.query(
+        `SELECT fp.*, p.label AS plan_label, p.total_amount,
+                s.first_name, s.last_name, s.matricule AS student_matricule,
+                c.name AS class_name, y.label AS year_label,
+                COALESCE(u.fullname,'') AS recorded_by_name,
+                COALESCE((SELECT SUM(amount) FROM edu_feeplan_payments x WHERE x.plan_id=fp.plan_id AND x.status='paid'),0) AS total_paid
+           FROM edu_feeplan_payments fp
+           JOIN edu_feeplans p ON p.id=fp.plan_id
+           JOIN edu_students s ON s.id=p.student_id
+           LEFT JOIN edu_classes c ON c.id=p.class_id
+           LEFT JOIN edu_school_years y ON y.id=p.school_year_id
+           LEFT JOIN users u ON u.id=fp.recorded_by
+          WHERE fp.id=$1 AND fp.company_id=$2`,
+        [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!pay) return res.status(404).json({ error: "Reçu introuvable" });
+      const school = await feeSchoolHeader(schoolId(req));
+      const ref = pay.receipt_number || `PAY-${pay.id}`;
+      const rest = Math.max(0, Number(pay.total_amount) - Number(pay.total_paid));
+      await edupdf.renderDocument(res, {
+        filename: `recu-${ref}`,
+        title: pay.status === "cancelled" ? "Reçu de mensualité (ANNULÉ)" : "Reçu de mensualité",
+        reference: ref,
+        qrText: edupdf.docToken("RECU", ref),
+        school,
+        sections: [
+          { title: "Élève", rows: [
+            { label: "Nom complet", value: `${pay.first_name} ${pay.last_name}` },
+            { label: "Matricule", value: pay.student_matricule },
+            { label: "Classe", value: pay.class_name || "—" },
+            { label: "Année scolaire", value: pay.year_label || "—" },
+            { label: "Plan", value: pay.plan_label },
+          ] },
+          { title: "Versement", rows: [
+            { label: "Numéro de reçu", value: ref },
+            { label: "Date", value: new Date(pay.created_at).toLocaleDateString("fr-FR") },
+            { label: "Montant reçu", value: `${Number(pay.amount).toLocaleString("fr-FR")} FCFA` },
+            { label: "Moyen de paiement", value: pay.method || "—" },
+            { label: "Référence transaction", value: pay.reference || "—" },
+            { label: "Encaissé par", value: pay.recorded_by_name || "—" },
+          ] },
+          { title: "Situation de la scolarité", rows: [
+            { label: "Total scolarité", value: `${Number(pay.total_amount).toLocaleString("fr-FR")} FCFA` },
+            { label: "Total payé", value: `${Number(pay.total_paid).toLocaleString("fr-FR")} FCFA` },
+            { label: "Reste à payer", value: `${rest.toLocaleString("fr-FR")} FCFA` },
+          ] },
+        ],
+        footerNote: `Reçu généré par MaliLink Éducation le ${new Date().toLocaleDateString("fr-FR")}. Authenticité vérifiable par le QR code.`,
+      });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération du reçu PDF" }); }
+  });
+
   // ---------- EMPLOIS DU TEMPS (§7) + CONFLITS (§8) ----------
 
   const DAYS = ["", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
@@ -1285,7 +1568,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const student = await assertStudentAccess(req, student_id);
       if (!student) return res.status(404).json({ error: "Élève introuvable" });
       const { rows } = await pool.query(
-        `INSERT INTO edu_fee_payments (company_id, fee_id, student_id, amount, payment_method, reference, paid_by_user_id, recorded_by_user_id)
+        `INSERT INTO edu_feeplan_payments (company_id, fee_id, student_id, amount, payment_method, reference, paid_by_user_id, recorded_by_user_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
         [schoolId(req), fee_id, student_id, amount, payment_method || "especes",
          reference || null, paid_by_user_id || null, req.user.id]
@@ -1304,7 +1587,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
                 (f.amount - COALESCE(p.paid, 0)) AS remaining
          FROM edu_fees f
          LEFT JOIN LATERAL (
-           SELECT SUM(amount) AS paid FROM edu_fee_payments
+           SELECT SUM(amount) AS paid FROM edu_feeplan_payments
            WHERE fee_id=f.id AND student_id=$1
          ) p ON true
          WHERE f.company_id=$2 AND (f.class_id IS NULL OR f.class_id=$3)
@@ -1312,7 +1595,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         [student.id, schoolId(req), student.class_id]
       );
       const payments = await pool.query(
-        `SELECT * FROM edu_fee_payments WHERE student_id=$1 ORDER BY paid_at DESC LIMIT 100`,
+        `SELECT * FROM edu_feeplan_payments WHERE student_id=$1 ORDER BY paid_at DESC LIMIT 100`,
         [student.id]
       );
       res.json({ fees: fees.rows, payments: payments.rows });
@@ -1458,7 +1741,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
           `SELECT COALESCE(SUM(f.amount), 0) - COALESCE(SUM(p.total_paid), 0) AS impaye
            FROM edu_fees f
            LEFT JOIN LATERAL (
-             SELECT SUM(amount) AS total_paid FROM edu_fee_payments WHERE fee_id=f.id
+             SELECT SUM(amount) AS total_paid FROM edu_feeplan_payments WHERE fee_id=f.id
            ) p ON true
            WHERE f.company_id=$1`,
           [cid]
