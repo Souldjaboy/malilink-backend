@@ -13,8 +13,25 @@
 
 const express = require("express");
 const crypto = require("crypto");
+const path = require("path");
+const fs = require("fs");
+const multer = require("multer");
 const QRCode = require("qrcode");
 const edupdf = require("../services/education/pdf");
+
+// Stockage des pièces jointes de cours (uploads/education/).
+const EDU_UPLOAD_DIR = path.join(__dirname, "..", "uploads", "education");
+try { fs.mkdirSync(EDU_UPLOAD_DIR, { recursive: true }); } catch { /* déjà présent */ }
+const eduUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, EDU_UPLOAD_DIR),
+    filename: (req, file, cb) => {
+      const safe = (file.originalname || "fichier").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-60);
+      cb(null, `${Date.now()}_${crypto.randomBytes(4).toString("hex")}_${safe}`);
+    },
+  }),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 Mo
+});
 
 const STAFF_ROLES = ["super_admin", "school_admin", "director", "secretary", "supervisor"];
 const GRADE_ROLES = [...STAFF_ROLES, "teacher"];
@@ -1728,21 +1745,55 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur finances" }); }
   });
 
-  // ---------- COURS / DEVOIRS ----------
+  // ---------- COURS EN LIGNE / DEVOIRS ----------
+
+  // Classes visibles selon le rôle (null = toutes celles de l'établissement).
+  async function visibleClassIds(req) {
+    if (req.user.role === "teacher") return await teacherClassIds(req);
+    if (req.user.role === "parent") {
+      const kids = await parentStudentIds(req);
+      if (kids.length === 0) return [];
+      const { rows } = await pool.query(
+        "SELECT DISTINCT class_id FROM edu_students WHERE id=ANY($1) AND class_id IS NOT NULL", [kids]
+      );
+      return rows.map((r) => r.class_id);
+    }
+    if (req.user.role === "student") {
+      const { rows } = await pool.query(
+        "SELECT class_id FROM edu_students WHERE user_id=$1 AND company_id=$2", [req.user.id, schoolId(req)]
+      );
+      return rows.map((r) => r.class_id).filter(Boolean);
+    }
+    return null;
+  }
+
+  // Téléversement d'une pièce jointe de cours → renvoie une URL servie par /uploads.
+  router.post("/courses/upload", requireRoles(GRADE_ROLES), eduUpload.single("file"), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu." });
+    res.status(201).json({
+      file_url: `/uploads/education/${req.file.filename}`,
+      file_name: req.file.originalname,
+      size: req.file.size,
+    });
+  });
 
   router.post("/courses", requireRoles(GRADE_ROLES), async (req, res) => {
     try {
-      const { class_id, subject_id, course_type, title, content, file_url, due_date } = req.body || {};
+      const b = req.body || {};
+      const { class_id, subject_id, course_type, title, content, file_url, file_name, video_url, due_date } = b;
       if (!class_id || !title) return res.status(400).json({ error: "Classe et titre requis" });
       if (req.user.role === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(Number(class_id))) return res.status(403).json({ error: "Classe non affectée" });
       }
       const { rows } = await pool.query(
-        `INSERT INTO edu_courses (company_id, class_id, subject_id, teacher_user_id, course_type, title, content, file_url, due_date)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        `INSERT INTO edu_courses
+           (company_id, class_id, subject_id, teacher_user_id, course_type, title, content,
+            file_url, file_name, video_url, due_date, is_published)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
         [schoolId(req), class_id, subject_id || null, req.user.id,
-         course_type || "cours", title, content || null, file_url || null, due_date || null]
+         course_type || "cours", title, content || null, file_url || null, file_name || null,
+         video_url || null, due_date || null, b.is_published !== false]
       );
       res.status(201).json(rows[0]);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur cours" }); }
@@ -1751,38 +1802,69 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   router.get("/courses", async (req, res) => {
     try {
       const classId = req.query.class_id ? Number(req.query.class_id) : null;
-      let allowedClasses = null;
-      if (req.user.role === "teacher") allowedClasses = await teacherClassIds(req);
-      if (req.user.role === "parent") {
-        const kids = await parentStudentIds(req);
-        if (kids.length === 0) return res.json([]);
-        const { rows } = await pool.query(
-          "SELECT DISTINCT class_id FROM edu_students WHERE id=ANY($1) AND class_id IS NOT NULL",
-          [kids]
-        );
-        allowedClasses = rows.map((r) => r.class_id);
-      }
-      if (req.user.role === "student") {
-        const { rows } = await pool.query(
-          "SELECT class_id FROM edu_students WHERE user_id=$1 AND company_id=$2",
-          [req.user.id, schoolId(req)]
-        );
-        allowedClasses = rows.map((r) => r.class_id).filter(Boolean);
-      }
-
+      const type = req.query.type ? String(req.query.type) : null;
+      const allowedClasses = await visibleClassIds(req);
+      // Les élèves et parents ne voient que les cours publiés.
+      const publishedOnly = ["student", "parent"].includes(req.user.role);
       const { rows } = await pool.query(
-        `SELECT co.*, c.name AS class_name, s.name AS subject_name
+        `SELECT co.*, c.name AS class_name, s.name AS subject_name,
+                COALESCE(u.fullname,'') AS teacher_name
          FROM edu_courses co
          JOIN edu_classes c ON c.id=co.class_id
          LEFT JOIN edu_subjects s ON s.id=co.subject_id
+         LEFT JOIN users u ON u.id=co.teacher_user_id
          WHERE co.company_id=$1
            AND ($2::int IS NULL OR co.class_id=$2)
            AND ($3::int[] IS NULL OR co.class_id=ANY($3))
+           AND ($4::text IS NULL OR co.course_type=$4)
+           AND ($5::bool = FALSE OR co.is_published = TRUE)
          ORDER BY co.created_at DESC LIMIT 200`,
-        [schoolId(req), classId, allowedClasses]
+        [schoolId(req), classId, allowedClasses, type, publishedOnly]
       );
       res.json(rows);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur cours" }); }
+  });
+
+  // Modification (professeur propriétaire ou staff).
+  router.patch("/courses/:id", requireRoles(GRADE_ROLES), async (req, res) => {
+    try {
+      const existing = (await pool.query(
+        `SELECT * FROM edu_courses WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!existing) return res.status(404).json({ error: "Cours introuvable" });
+      if (req.user.role === "teacher" && existing.teacher_user_id !== req.user.id) {
+        return res.status(403).json({ error: "Vous ne pouvez modifier que vos cours." });
+      }
+      const b = req.body || {};
+      const fields = ["title", "content", "file_url", "file_name", "video_url", "subject_id", "due_date", "is_published"];
+      const sets = []; const vals = []; let i = 1;
+      for (const f of fields) if (b[f] !== undefined) { sets.push(`${f}=$${i++}`); vals.push(b[f]); }
+      if (sets.length === 0) return res.json(existing);
+      sets.push("updated_at=NOW()");
+      vals.push(req.params.id, schoolId(req));
+      const { rows } = await pool.query(
+        `UPDATE edu_courses SET ${sets.join(", ")} WHERE id=$${i++} AND company_id=$${i} RETURNING *`, vals
+      );
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur modification cours" }); }
+  });
+
+  router.delete("/courses/:id", requireRoles(GRADE_ROLES), async (req, res) => {
+    try {
+      const existing = (await pool.query(
+        `SELECT * FROM edu_courses WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!existing) return res.status(404).json({ error: "Cours introuvable" });
+      if (req.user.role === "teacher" && existing.teacher_user_id !== req.user.id) {
+        return res.status(403).json({ error: "Vous ne pouvez supprimer que vos cours." });
+      }
+      // Supprime le fichier local associé s'il est dans uploads/education.
+      if (existing.file_url && existing.file_url.startsWith("/uploads/education/")) {
+        fs.unlink(path.join(__dirname, "..", existing.file_url), () => {});
+      }
+      await pool.query(`DELETE FROM edu_courses WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
+      res.json({ ok: true });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur suppression cours" }); }
   });
 
   // ---------- CONDUITE ----------
