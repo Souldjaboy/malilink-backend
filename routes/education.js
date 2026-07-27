@@ -228,19 +228,97 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur matière" }); }
   });
 
+  // Liste des affectations (professeur ↔ matière ↔ classe) — §6.
+  router.get("/teacher-assignments", async (req, res) => {
+    try {
+      const teacherId = req.query.teacher_id ? Number(req.query.teacher_id) : null;
+      const classId = req.query.class_id ? Number(req.query.class_id) : null;
+      const { rows } = await pool.query(
+        `SELECT a.*, t.first_name AS teacher_first, t.last_name AS teacher_last, t.matricule,
+                c.name AS class_name, s.name AS subject_name
+           FROM edu_teacher_assignments a
+           LEFT JOIN edu_teachers t ON t.id=a.teacher_id
+           LEFT JOIN edu_classes c ON c.id=a.class_id
+           LEFT JOIN edu_subjects s ON s.id=a.subject_id
+          WHERE a.company_id=$1
+            AND ($2::int IS NULL OR a.teacher_id=$2)
+            AND ($3::int IS NULL OR a.class_id=$3)
+          ORDER BY a.id DESC`,
+        [schoolId(req), teacherId, classId]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur affectations" }); }
+  });
+
+  // Créer une affectation complète (§6) : coefficient, volume horaire, permissions…
   router.post("/teacher-assignments", requireRoles(STAFF_ROLES), async (req, res) => {
     try {
-      const { teacher_user_id, class_id, subject_id } = req.body || {};
-      if (!teacher_user_id || !class_id) return res.status(400).json({ error: "Professeur et classe requis" });
-      const { rows } = await pool.query(
-        `INSERT INTO edu_teacher_assignments (company_id, teacher_user_id, class_id, subject_id)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (teacher_user_id, class_id, subject_id) DO NOTHING
-         RETURNING *`,
-        [schoolId(req), teacher_user_id, class_id, subject_id || null]
+      const b = req.body || {};
+      const teacherId = b.teacher_id ? Number(b.teacher_id) : null;
+      if (!teacherId || !b.class_id) return res.status(400).json({ error: "Professeur et classe requis" });
+      // Vérifie l'appartenance à l'établissement (isolation school_id).
+      const own = await pool.query(
+        `SELECT (SELECT 1 FROM edu_teachers WHERE id=$1 AND company_id=$3) AS t,
+                (SELECT 1 FROM edu_classes WHERE id=$2 AND company_id=$3) AS c`,
+        [teacherId, b.class_id, schoolId(req)]
       );
-      res.status(201).json(rows[0] || { ok: true });
+      if (!own.rows[0].t || !own.rows[0].c) return res.status(403).json({ error: "Professeur ou classe hors de votre établissement." });
+      // Anti-doublon (professeur + classe + matière).
+      const dup = await pool.query(
+        `SELECT 1 FROM edu_teacher_assignments WHERE company_id=$1 AND teacher_id=$2 AND class_id=$3 AND COALESCE(subject_id,0)=COALESCE($4,0)`,
+        [schoolId(req), teacherId, b.class_id, b.subject_id || null]
+      );
+      if (dup.rows[0]) return res.status(409).json({ error: "Cette affectation existe déjà." });
+      const { rows } = await pool.query(
+        `INSERT INTO edu_teacher_assignments
+           (company_id, teacher_id, class_id, subject_id, school_year_id, term_id, coefficient,
+            weekly_hours, start_date, end_date, status, is_main_teacher, can_enter_grades,
+            can_take_attendance, can_publish_courses)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+        [schoolId(req), teacherId, b.class_id, b.subject_id || null, b.school_year_id || null,
+         b.term_id || null, b.coefficient != null ? Number(b.coefficient) : null,
+         b.weekly_hours != null ? Number(b.weekly_hours) : null, b.start_date || null, b.end_date || null,
+         b.status || "actif", Boolean(b.is_main_teacher), b.can_enter_grades !== false,
+         b.can_take_attendance !== false, b.can_publish_courses !== false]
+      );
+      res.status(201).json(rows[0]);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur affectation" }); }
+  });
+
+  // Modifier une affectation ; l'évolution du coefficient est journalisée (§6).
+  router.patch("/teacher-assignments/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const current = await pool.query(`SELECT * FROM edu_teacher_assignments WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
+      if (!current.rows[0]) return res.status(404).json({ error: "Affectation introuvable" });
+      const fields = ["subject_id", "coefficient", "weekly_hours", "start_date", "end_date", "status",
+        "is_main_teacher", "can_enter_grades", "can_take_attendance", "can_publish_courses", "term_id"];
+      const set = []; const vals = [];
+      for (const f of fields) { if (b[f] !== undefined) { vals.push(b[f]); set.push(`${f}=$${vals.length}`); } }
+      if (set.length === 0) return res.status(400).json({ error: "Aucune modification" });
+      vals.push(req.params.id, schoolId(req));
+      const { rows } = await pool.query(
+        `UPDATE edu_teacher_assignments SET ${set.join(", ")} WHERE id=$${vals.length - 1} AND company_id=$${vals.length} RETURNING *`,
+        vals
+      );
+      // Historique du coefficient si modifié.
+      if (b.coefficient !== undefined && Number(b.coefficient) !== Number(current.rows[0].coefficient)) {
+        await pool.query(
+          `INSERT INTO edu_coefficient_history (company_id, assignment_id, old_value, new_value, changed_by)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [schoolId(req), req.params.id, current.rows[0].coefficient, Number(b.coefficient), req.user.id]
+        ).catch(() => {});
+      }
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur modification affectation" }); }
+  });
+
+  router.delete("/teacher-assignments/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const { rowCount } = await pool.query(`DELETE FROM edu_teacher_assignments WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
+      if (!rowCount) return res.status(404).json({ error: "Affectation introuvable" });
+      res.json({ ok: true });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur suppression affectation" }); }
   });
 
   // ---------- PROFESSEURS (fiches professionnelles, §4) ----------
