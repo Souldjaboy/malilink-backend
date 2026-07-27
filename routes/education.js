@@ -243,6 +243,102 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur affectation" }); }
   });
 
+  // ---------- PROFESSEURS (fiches professionnelles, §4) ----------
+
+  // Génère un matricule PROF-AAAA-NNNNN unique par établissement/année.
+  async function nextTeacherMatricule(companyId) {
+    const year = new Date().getFullYear();
+    const { rows } = await pool.query(
+      `INSERT INTO edu_teacher_counters (company_id, year, last_seq)
+       VALUES ($1,$2,1)
+       ON CONFLICT (company_id, year) DO UPDATE SET last_seq = edu_teacher_counters.last_seq + 1
+       RETURNING last_seq`,
+      [companyId, year]
+    );
+    return `PROF-${year}-${String(rows[0].last_seq).padStart(5, "0")}`;
+  }
+
+  router.get("/teachers", async (req, res) => {
+    try {
+      const q = req.query.q ? `%${String(req.query.q)}%` : null;
+      const status = ["actif", "inactif"].includes(req.query.status) ? req.query.status : null;
+      const { rows } = await pool.query(
+        `SELECT t.*,
+                (SELECT COUNT(*) FROM edu_teacher_assignments a WHERE a.teacher_id=t.id) AS assignment_count
+           FROM edu_teachers t
+          WHERE t.company_id=$1
+            AND ($2::text IS NULL OR (t.first_name||' '||t.last_name ILIKE $2 OR t.matricule ILIKE $2 OR t.phone ILIKE $2))
+            AND ($3::text IS NULL OR t.status=$3)
+          ORDER BY t.last_name, t.first_name`,
+        [schoolId(req), q, status]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur professeurs" }); }
+  });
+
+  router.post("/teachers", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      if (!b.first_name || !b.last_name) return res.status(400).json({ error: "Prénom et nom requis" });
+      const matricule = b.matricule && String(b.matricule).trim() ? String(b.matricule).trim() : await nextTeacherMatricule(schoolId(req));
+      const { rows } = await pool.query(
+        `INSERT INTO edu_teachers
+           (company_id, user_id, matricule, first_name, last_name, gender, photo_url, phone, email,
+            address, birth_date, diploma, specialty, hire_date, contract_type, signature_url, status,
+            school_year_id, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+        [schoolId(req), b.user_id || null, matricule, b.first_name, b.last_name, b.gender || "",
+         b.photo_url || "", b.phone || "", b.email || "", b.address || "", b.birth_date || null,
+         b.diploma || "", b.specialty || "", b.hire_date || null, b.contract_type || "",
+         b.signature_url || "", b.status || "actif", b.school_year_id || null, req.user.id]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) {
+      if (String(e.message).includes("edu_teachers_company_id_matricule")) {
+        return res.status(409).json({ error: "Ce matricule existe déjà dans cet établissement." });
+      }
+      console.error(e); res.status(500).json({ error: "Erreur création professeur" });
+    }
+  });
+
+  router.get("/teachers/:id", async (req, res) => {
+    try {
+      const t = await pool.query(`SELECT * FROM edu_teachers WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
+      if (!t.rows[0]) return res.status(404).json({ error: "Professeur introuvable" });
+      const assignments = await pool.query(
+        `SELECT a.*, c.name AS class_name, s.name AS subject_name
+           FROM edu_teacher_assignments a
+           LEFT JOIN edu_classes c ON c.id=a.class_id
+           LEFT JOIN edu_subjects s ON s.id=a.subject_id
+          WHERE a.teacher_id=$1 ORDER BY a.id DESC`,
+        [req.params.id]
+      );
+      res.json({ ...t.rows[0], assignments: assignments.rows });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur professeur" }); }
+  });
+
+  router.patch("/teachers/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const fields = ["first_name", "last_name", "gender", "photo_url", "phone", "email", "address",
+        "birth_date", "diploma", "specialty", "hire_date", "contract_type", "signature_url", "status"];
+      const set = [];
+      const vals = [];
+      for (const f of fields) {
+        if (b[f] !== undefined) { vals.push(b[f]); set.push(`${f}=$${vals.length}`); }
+      }
+      if (set.length === 0) return res.status(400).json({ error: "Aucune modification" });
+      vals.push(req.params.id, schoolId(req));
+      const { rows } = await pool.query(
+        `UPDATE edu_teachers SET ${set.join(", ")}, updated_at=NOW()
+          WHERE id=$${vals.length - 1} AND company_id=$${vals.length} RETURNING *`,
+        vals
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Professeur introuvable" });
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur modification professeur" }); }
+  });
+
   // ---------- ÉLÈVES + BADGES QR ----------
 
   router.get("/students", async (req, res) => {
