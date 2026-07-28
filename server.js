@@ -1511,13 +1511,32 @@ for (const [prefix, key] of MODULE_ROUTE_GUARDS) app.use(prefix, requireCompanyM
 
 // Gardes SOUS-MODULES sur chemins CRUD précis (accès + permission par méthode).
 const SUBMODULE_ROUTE_GUARDS = [
+  // Restaurant
   ["/restaurant/orders", "restaurant.commandes"],
   ["/restaurant/menu-items", "restaurant.menu"],
   ["/restaurant/tables", "restaurant.tables"],
+  // Éducation
   ["/education/students", "education.eleves"],
   ["/education/enrollments", "education.inscriptions"],
   ["/education/exams", "education.notes"],
   ["/education/grades", "education.notes"],
+  ["/education/teachers", "education.professeurs"],
+  ["/education/classes", "education.classes"],
+  ["/education/schedules", "education.emploi_du_temps"],
+  ["/education/attendance", "education.presences"],
+  ["/education/fee-plans", "education.mensualites"],
+  // Immobilier
+  ["/immobilier/properties", "immobilier.biens"],
+  ["/immobilier/rentals", "immobilier.locations"],
+  ["/immobilier/sales", "immobilier.ventes"],
+  ["/immobilier/hotel", "immobilier.hotel"],
+  // Automobile
+  ["/automobile/vehicles", "automobile.vehicules"],
+  ["/automobile/rentals", "automobile.locations"],
+  ["/automobile/sales", "automobile.ventes"],
+  // Voyage
+  ["/travel/partner", "voyage.partenaire"],
+  ["/travel/bookings", "voyage.reservations"],
 ];
 for (const [prefix, key] of SUBMODULE_ROUTE_GUARDS) app.use(prefix, requireModuleGuard(key));
 
