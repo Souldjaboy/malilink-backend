@@ -1323,7 +1323,11 @@ const COMPANY_MODULE_KEYS = [
   "informatique",
   "beaute",
   "maison_meubles",
-  "services"
+  "services",
+  "education",
+  "wallet",
+  "voyage",
+  "social"
 ];
 
 async function getCompanyModules(companyId) {
@@ -1354,6 +1358,93 @@ async function getCompanyModules(companyId) {
     acc[key] = configured ? configured.is_enabled === true : true;
     return acc;
   }, {});
+}
+
+/* ============================================================
+   APPLICATION BACKEND DES MODULES PAR ENTREPRISE (403)
+   ------------------------------------------------------------
+   Le frontend masque déjà les modules désactivés, mais la
+   sécurité réelle est côté serveur. Règle : défaut = AUTORISÉ
+   (aucune ligne = module actif) pour ne casser aucune route
+   existante ; on ne renvoie 403 que si le module est
+   EXPLICITEMENT désactivé pour l'entreprise de l'utilisateur.
+   ============================================================ */
+async function isCompanyModuleEnabled(companyId, moduleKey) {
+  if (!companyId || !moduleKey) return true;
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(is_enabled, enabled, TRUE) AS on
+         FROM company_modules
+        WHERE company_id=$1 AND module_key=$2
+        LIMIT 1`,
+      [companyId, moduleKey]
+    );
+    if (rows.length === 0) return true; // non configuré → autorisé
+    return rows[0].on === true;
+  } catch (error) {
+    console.error("isCompanyModuleEnabled:", error.message || error);
+    return true; // en cas d'erreur, ne jamais bloquer
+  }
+}
+
+/* Middleware de garde : 403 uniquement si le module est explicitement
+   désactivé pour l'entreprise. Les routes publiques (sans jeton valide)
+   et le super admin passent toujours — aucune régression. */
+function requireCompanyModule(moduleKey) {
+  return async (req, res, next) => {
+    try {
+      let user = req.user;
+      if (!user) {
+        const header = req.headers.authorization || "";
+        const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+        if (token) {
+          try { user = jwt.verify(token, JWT_SECRET); } catch { user = null; }
+        }
+      }
+      if (!user) return next(); // route publique → auth gérée par le handler
+      if (isSuperAdminUser(user)) return next(); // super admin : accès total
+      const companyId = user.company_id || getEffectiveCompanyId(req);
+      if (!companyId) return next();
+      const enabled = await isCompanyModuleEnabled(companyId, moduleKey);
+      if (!enabled) {
+        return res.status(403).json({
+          error: `Module « ${moduleKey} » désactivé pour votre entreprise.`,
+          code: "MODULE_DISABLED",
+          module: moduleKey
+        });
+      }
+      return next();
+    } catch (error) {
+      console.error("requireCompanyModule:", error.message || error);
+      return next(); // ne jamais bloquer sur une erreur de garde
+    }
+  };
+}
+
+/* Gardes par préfixe de route (routes inline définies plus bas). Enregistrées
+   ici, donc AVANT les handlers → elles s'exécutent en premier. */
+const MODULE_ROUTE_GUARDS = [
+  ["/pos", "pos"],
+  ["/produits", "produits"],
+  ["/stocks", "stock"],
+  ["/inventaires", "inventaire"],
+  ["/scanner", "scanner"],
+  ["/entrepots", "entrepots"],
+  ["/emplacements", "emplacements"],
+  ["/marketplace", "marketplace"],
+  ["/partenaires", "partenaires"],
+  ["/comptabilite", "comptabilite"],
+  ["/rapports", "rapports"],
+  ["/activites", "activites"],
+  ["/parametres-pointage", "parametres_pointage"],
+  ["/badges", "badges"],
+  ["/restaurant", "restaurant"],
+  ["/immobilier", "immobilier"],
+  ["/automobile", "automobile"],
+  ["/laboratoire", "laboratoire"]
+];
+for (const [prefix, key] of MODULE_ROUTE_GUARDS) {
+  app.use(prefix, requireCompanyModule(key));
 }
 
 async function tableExists(tableName) {
@@ -18755,6 +18846,7 @@ app.use(
 const createEducationRouter = require("./routes/education");
 app.use(
   "/education",
+  requireCompanyModule("education"),
   createEducationRouter({ pool, authenticateToken, authorizeRoles })
 );
 
@@ -18770,7 +18862,7 @@ const realtime = createRealtime({ httpServer, jwt, jwtSecret: JWT_SECRET, pool }
 app.set("realtime", realtime);
 
 const createSocialRouter = require("./routes/social");
-app.use("/social", createSocialRouter({ pool, authenticateToken, createNotification, realtime }));
+app.use("/social", requireCompanyModule("social"), createSocialRouter({ pool, authenticateToken, createNotification, realtime }));
 
 const createBadgesRouter = require("./routes/badges");
 app.use("/badges", createBadgesRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser }));
@@ -18778,6 +18870,7 @@ app.use("/badges", createBadgesRouter({ pool, authenticateToken, getEffectiveCom
 const createWalletRouter = require("./routes/wallet");
 app.use(
   "/wallet",
+  requireCompanyModule("wallet"),
   createWalletRouter({
     pool,
     authenticateToken,
@@ -18798,6 +18891,7 @@ app.use(
 const createTravelRouter = require("./routes/travel");
 app.use(
   "/travel",
+  requireCompanyModule("voyage"),
   createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId, phoneVariants: maliPhoneVariants })
 );
 
