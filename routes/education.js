@@ -1867,6 +1867,207 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur suppression cours" }); }
   });
 
+  // ---------- DEVOIRS ET CORRECTIONS (§18) ----------
+
+  // Rôles autorisés à téléverser un rendu (élèves + parents + staff/prof).
+  const SUBMIT_ROLES = [...GRADE_ROLES, "student", "parent"];
+
+  // Établissement effectif de l'élève courant (rôle student).
+  async function currentStudentId(req) {
+    const { rows } = await pool.query(
+      "SELECT id, class_id FROM edu_students WHERE user_id=$1 AND company_id=$2",
+      [req.user.id, schoolId(req)]
+    );
+    return rows[0] || null;
+  }
+
+  // Téléversement d'un fichier de rendu (accessible aux élèves/parents).
+  router.post("/submissions/upload", requireRoles(SUBMIT_ROLES), eduUpload.single("file"), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu." });
+    res.status(201).json({
+      file_url: `/uploads/education/${req.file.filename}`,
+      file_name: req.file.originalname,
+      size: req.file.size,
+    });
+  });
+
+  // Liste des devoirs (course_type='devoir') avec nombre de rendus.
+  router.get("/assignments", async (req, res) => {
+    try {
+      const classId = req.query.class_id ? Number(req.query.class_id) : null;
+      const allowedClasses = await visibleClassIds(req);
+      const publishedOnly = ["student", "parent"].includes(req.user.role);
+      const { rows } = await pool.query(
+        `SELECT co.*, c.name AS class_name, s.name AS subject_name, COALESCE(u.fullname,'') AS teacher_name,
+                (SELECT COUNT(*) FROM edu_assignment_submissions sub WHERE sub.course_id=co.id) AS submissions_count,
+                (SELECT COUNT(*) FROM edu_assignment_submissions sub WHERE sub.course_id=co.id AND sub.status='graded') AS graded_count,
+                (SELECT COUNT(*) FROM edu_students st WHERE st.class_id=co.class_id AND st.status='actif') AS class_size
+         FROM edu_courses co
+         JOIN edu_classes c ON c.id=co.class_id
+         LEFT JOIN edu_subjects s ON s.id=co.subject_id
+         LEFT JOIN users u ON u.id=co.teacher_user_id
+         WHERE co.company_id=$1 AND co.course_type='devoir'
+           AND ($2::int IS NULL OR co.class_id=$2)
+           AND ($3::int[] IS NULL OR co.class_id=ANY($3))
+           AND ($4::bool = FALSE OR co.is_published = TRUE)
+         ORDER BY co.due_date NULLS LAST, co.created_at DESC LIMIT 200`,
+        [schoolId(req), classId, allowedClasses, publishedOnly]
+      );
+      res.json(rows);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur devoirs" }); }
+  });
+
+  // Création d'un devoir (réutilise edu_courses en type 'devoir').
+  router.post("/assignments", requireRoles(GRADE_ROLES), async (req, res) => {
+    try {
+      const b = req.body || {};
+      if (!b.class_id || !b.title) return res.status(400).json({ error: "Classe et titre requis" });
+      if (req.user.role === "teacher") {
+        const classes = await teacherClassIds(req);
+        if (!classes.includes(Number(b.class_id))) return res.status(403).json({ error: "Classe non affectée" });
+      }
+      const { rows } = await pool.query(
+        `INSERT INTO edu_courses
+           (company_id, class_id, subject_id, teacher_user_id, course_type, title, content,
+            file_url, file_name, due_date, is_published)
+         VALUES ($1,$2,$3,$4,'devoir',$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [schoolId(req), b.class_id, b.subject_id || null, req.user.id, b.title, b.content || null,
+         b.file_url || null, b.file_name || null, b.due_date || null, b.is_published !== false]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur création devoir" }); }
+  });
+
+  // Devoir + son état pour l'utilisateur courant.
+  async function assignmentById(companyId, id) {
+    const { rows } = await pool.query(
+      `SELECT co.*, c.name AS class_name, s.name AS subject_name
+         FROM edu_courses co JOIN edu_classes c ON c.id=co.class_id
+         LEFT JOIN edu_subjects s ON s.id=co.subject_id
+        WHERE co.id=$1 AND co.company_id=$2 AND co.course_type='devoir'`,
+      [id, companyId]
+    );
+    return rows[0] || null;
+  }
+
+  // Soumettre / mettre à jour un rendu. student_id requis pour le staff/prof ;
+  // pour un élève, c'est son propre rendu.
+  router.post("/assignments/:id/submissions", requireRoles(SUBMIT_ROLES), async (req, res) => {
+    try {
+      const devoir = await assignmentById(schoolId(req), req.params.id);
+      if (!devoir) return res.status(404).json({ error: "Devoir introuvable" });
+      const b = req.body || {};
+      let studentId = b.student_id ? Number(b.student_id) : null;
+      if (req.user.role === "student") {
+        const me = await currentStudentId(req);
+        if (!me) return res.status(403).json({ error: "Profil élève introuvable." });
+        studentId = me.id;
+      } else if (!studentId) {
+        return res.status(400).json({ error: "Élève requis." });
+      } else {
+        // Staff/prof/parent : vérifier l'accès à l'élève.
+        const st = await assertStudentAccess(req, studentId);
+        if (!st) return res.status(403).json({ error: "Accès à cet élève refusé." });
+      }
+      const { rows } = await pool.query(
+        `INSERT INTO edu_assignment_submissions
+           (company_id, course_id, student_id, content, file_url, file_name, max_score, submitted_by, status, submitted_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'submitted',NOW())
+         ON CONFLICT (course_id, student_id) DO UPDATE SET
+           content=EXCLUDED.content, file_url=EXCLUDED.file_url, file_name=EXCLUDED.file_name,
+           status='submitted', submitted_by=EXCLUDED.submitted_by, submitted_at=NOW()
+         RETURNING *`,
+        [schoolId(req), devoir.id, studentId, b.content || null, b.file_url || null, b.file_name || null,
+         Number(devoir.max_score || b.max_score || 20), req.user.id]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur soumission" }); }
+  });
+
+  // Liste des rendus d'un devoir (professeur/staff) avec noms d'élèves.
+  router.get("/assignments/:id/submissions", requireRoles(GRADE_ROLES), async (req, res) => {
+    try {
+      const devoir = await assignmentById(schoolId(req), req.params.id);
+      if (!devoir) return res.status(404).json({ error: "Devoir introuvable" });
+      if (req.user.role === "teacher") {
+        const classes = await teacherClassIds(req);
+        if (!classes.includes(devoir.class_id)) return res.status(403).json({ error: "Classe non affectée" });
+      }
+      // Tous les élèves actifs de la classe + leur rendu éventuel.
+      const { rows } = await pool.query(
+        `SELECT st.id AS student_id, st.first_name, st.last_name, st.matricule,
+                sub.id AS submission_id, sub.content, sub.file_url, sub.file_name, sub.status,
+                sub.score, sub.max_score, sub.feedback, sub.correction_file_url, sub.correction_file_name,
+                sub.submitted_at, sub.graded_at
+           FROM edu_students st
+           LEFT JOIN edu_assignment_submissions sub
+             ON sub.student_id=st.id AND sub.course_id=$2
+          WHERE st.company_id=$1 AND st.class_id=$3 AND st.status='actif'
+          ORDER BY st.last_name, st.first_name`,
+        [schoolId(req), devoir.id, devoir.class_id]
+      );
+      res.json({ assignment: devoir, submissions: rows });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur rendus" }); }
+  });
+
+  // Rendu de l'élève courant (ou d'un enfant pour un parent).
+  router.get("/assignments/:id/my-submission", async (req, res) => {
+    try {
+      const devoir = await assignmentById(schoolId(req), req.params.id);
+      if (!devoir) return res.status(404).json({ error: "Devoir introuvable" });
+      let studentId = req.query.student_id ? Number(req.query.student_id) : null;
+      if (req.user.role === "student") {
+        const me = await currentStudentId(req);
+        if (!me) return res.json(null);
+        studentId = me.id;
+      } else if (studentId) {
+        const st = await assertStudentAccess(req, studentId);
+        if (!st) return res.status(403).json({ error: "Accès refusé" });
+      } else {
+        return res.status(400).json({ error: "Élève requis." });
+      }
+      const { rows } = await pool.query(
+        `SELECT * FROM edu_assignment_submissions WHERE course_id=$1 AND student_id=$2`,
+        [devoir.id, studentId]
+      );
+      res.json(rows[0] || null);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur rendu" }); }
+  });
+
+  // Correction : note + appréciation + fichier de correction.
+  router.patch("/submissions/:id/grade", requireRoles(GRADE_ROLES), async (req, res) => {
+    try {
+      const sub = (await pool.query(
+        `SELECT sub.*, co.class_id FROM edu_assignment_submissions sub
+           JOIN edu_courses co ON co.id=sub.course_id
+          WHERE sub.id=$1 AND sub.company_id=$2`,
+        [req.params.id, schoolId(req)]
+      )).rows[0];
+      if (!sub) return res.status(404).json({ error: "Rendu introuvable" });
+      if (req.user.role === "teacher") {
+        const classes = await teacherClassIds(req);
+        if (!classes.includes(sub.class_id)) return res.status(403).json({ error: "Classe non affectée" });
+      }
+      const b = req.body || {};
+      const score = b.score != null && b.score !== "" ? Number(b.score) : null;
+      if (score != null && (!Number.isFinite(score) || score < 0 || score > Number(sub.max_score))) {
+        return res.status(400).json({ error: `Note invalide (0 à ${sub.max_score}).` });
+      }
+      const { rows } = await pool.query(
+        `UPDATE edu_assignment_submissions SET
+           score=$3::numeric, feedback=COALESCE($4, feedback),
+           correction_file_url=COALESCE($5, correction_file_url),
+           correction_file_name=COALESCE($6, correction_file_name),
+           status=CASE WHEN $3::numeric IS NOT NULL THEN 'graded' ELSE status END,
+           graded_by=$7, graded_at=NOW()
+         WHERE id=$1 AND company_id=$2 RETURNING *`,
+        [req.params.id, schoolId(req), score, b.feedback ?? null,
+         b.correction_file_url ?? null, b.correction_file_name ?? null, req.user.id]
+      );
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur correction" }); }
+  });
+
   // ---------- CONDUITE ----------
 
   router.post("/conduct", requireRoles(GRADE_ROLES), async (req, res) => {
