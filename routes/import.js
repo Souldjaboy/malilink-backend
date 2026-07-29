@@ -14,9 +14,11 @@ const ic = require("../import-center");
 const { executeStock } = require("../import-center/executor");
 const { rollbackStock } = require("../import-center/rollback");
 const { simulateStock } = require("../import-center/simulator");
+const { executeAccounting, simulateAccounting, reverseAccounting } = require("../import-center/executor-accounting");
+const closure = require("../import-center/closure");
 
 module.exports = function createImportRouter(deps) {
-  const { pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission } = deps;
+  const { pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission, accounting } = deps;
   const router = express.Router();
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: ic.security.MAX_FILE_SIZE } });
 
@@ -29,6 +31,9 @@ module.exports = function createImportRouter(deps) {
   const companyOf = (req) => getEffectiveCompanyId(req) || req.user.company_id;
   const productOf = (req) => String(req.headers["x-app-product"] || req.tenant_id || req.body.product_code || "triangle").toLowerCase();
   const isStock = (profile) => profile.module_key === "logistique";
+  const isAccounting = (profile) => profile.module_key === "comptabilite";
+  const acctHelpers = { ...(accounting || {}), isPeriodClosed: closure.isPeriodClosed };
+  const executable = (profile) => isStock(profile) || (isAccounting(profile) && accounting && accounting.nextAccountingNumber);
 
   async function audit(jobId, companyId, productCode, action, userId, detail) {
     await pool.query(
@@ -155,13 +160,15 @@ module.exports = function createImportRouter(deps) {
       let simulation;
       if (isStock(profile)) {
         simulation = await simulateStock(pool, companyId, profile, rows, job.options || {});
+      } else if (isAccounting(profile)) {
+        simulation = await simulateAccounting(pool, companyId, profile, rows);
       } else {
         const valid = rows.filter((r) => ["new", "warning"].includes(r.status)).length;
-        simulation = { rows: [], totals: { willCreate: valid }, note: "Simulation détaillée disponible pour le stock ; exécution des autres profils en phase ultérieure." };
+        simulation = { rows: [], totals: { willCreate: valid }, note: "Simulation détaillée disponible pour le stock et la comptabilité ; autres profils en phase ultérieure." };
       }
       await pool.query(`UPDATE import_jobs SET status='simulated', summary = summary || $2 WHERE id=$1`, [job.id, JSON.stringify({ simulation: simulation.totals })]);
       await audit(job.id, companyId, job.product_code, "simulate", req.user.id, simulation.totals);
-      res.json({ status: "simulated", ...simulation, executable: isStock(profile) });
+      res.json({ status: "simulated", ...simulation, executable: executable(profile) });
     } catch (e) { console.error("import simulate:", e); res.status(500).json({ error: "Erreur de simulation." }); }
   });
 
@@ -172,10 +179,12 @@ module.exports = function createImportRouter(deps) {
       if (error) return res.status(error).json({ error: "Accès refusé." });
       if (job.status === "imported") return res.status(409).json({ error: "Import déjà exécuté." });
       const profile = ic.registry.getProfile(job.import_type);
-      if (!isStock(profile)) return res.status(400).json({ error: "L'exécution de ce profil sera disponible dans une phase ultérieure. Seule la simulation est possible." });
+      if (!executable(profile)) return res.status(400).json({ error: "L'exécution de ce profil sera disponible dans une phase ultérieure. Seule la simulation est possible." });
 
       const rows = (await pool.query(`SELECT id, row_index AS "__row", mapped, status FROM import_rows WHERE job_id=$1 ORDER BY row_index`, [job.id])).rows;
-      const { report, rowResults } = await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
+      const { report, rowResults } = isAccounting(profile)
+        ? await executeAccounting(pool, companyId, req.user.id, profile, rows, job.options || {}, acctHelpers)
+        : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
 
       for (const rr of rowResults) {
         await pool.query(`UPDATE import_rows SET status=$3, result_ref=$4 WHERE job_id=$1 AND row_index=$2`,
@@ -197,9 +206,11 @@ module.exports = function createImportRouter(deps) {
       if (error) return res.status(error).json({ error: "Accès refusé." });
       if (job.status !== "imported") return res.status(400).json({ error: "Seul un import exécuté peut être annulé." });
       const profile = ic.registry.getProfile(job.import_type);
-      if (!isStock(profile)) return res.status(400).json({ error: "Rollback non disponible pour ce profil." });
+      if (!executable(profile)) return res.status(400).json({ error: "Rollback non disponible pour ce profil." });
       const rows = (await pool.query(`SELECT row_index, result_ref FROM import_rows WHERE job_id=$1 AND status='imported'`, [job.id])).rows;
-      const result = await rollbackStock(pool, companyId, req.user.id, job, rows);
+      const result = isAccounting(profile)
+        ? await reverseAccounting(pool, companyId, req.user.id, job, rows, acctHelpers)
+        : await rollbackStock(pool, companyId, req.user.id, job, rows);
       await audit(job.id, companyId, job.product_code, "rollback", req.user.id, result.detail);
       res.json({ status: "rolled_back", ...result });
     } catch (e) { console.error("import rollback:", e); res.status(500).json({ error: "Erreur de rollback." }); }

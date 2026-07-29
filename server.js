@@ -19114,7 +19114,17 @@ app.use(
 const createImportRouter = require("./routes/import");
 app.use(
   "/import",
-  createImportRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission })
+  createImportRouter({
+    pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission,
+    accounting: { nextAccountingNumber, createAccountingEntry },
+  })
+);
+
+// Clôtures comptables mensuelles.
+const createAccountingRouter = require("./routes/accounting");
+app.use(
+  "/accounting",
+  createAccountingRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission })
 );
 
 const listenPort = process.env.PORT || 5050;

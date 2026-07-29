@@ -11,7 +11,8 @@
     "migrate:mark-all": "node scripts/migrate.js --mark-all",
     "test": "node --test services/*.test.js services/**/*.test.js",
     "test:rbac": "node tests/rbac.test.js",
-    "test:import": "node tests/import.test.js"
+    "test:import": "node tests/import.test.js",
+    "test:import:acct": "node tests/import-accounting.test.js"
   },
   "keywords": [],
   "author": "",
