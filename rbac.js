@@ -45,7 +45,7 @@ const SUBMODULES = {
   education: ["eleves", "professeurs", "classes", "cours", "emploi_du_temps", "presences", "notes", "paiements", "mensualites", "inscriptions", "parents", "parametres"],
   laboratoire: ["patients", "rendez_vous", "analyses", "resultats", "paiements", "documents", "parametres"],
   finance: ["wallet", "finance", "comptabilite", "rapports", "documents", "activites"],
-  administration: ["utilisateurs", "parametres", "entrepots", "emplacements", "pointage", "badges", "alertes", "support", "super_admin"],
+  administration: ["utilisateurs", "parametres", "entrepots", "emplacements", "pointage", "badges", "alertes", "support", "import", "super_admin"],
   ia: ["assistant", "social", "chat", "notifications", "recherche", "reunions"],
   // Triangle WMS Pro (logistique / entrepôt / ressources humaines)
   logistique: ["mouvements", "transferts", "demandes", "reception", "expedition", "inventaire"],

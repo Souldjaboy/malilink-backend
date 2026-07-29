@@ -19110,6 +19110,13 @@ app.use(
   createTravelRouter({ pool, authenticateToken, isSuperAdminUser, getEffectiveCompanyId, phoneVariants: maliPhoneVariants })
 );
 
+// Centre d'importation intelligent (multi-produits, isolé par le token).
+const createImportRouter = require("./routes/import");
+app.use(
+  "/import",
+  createImportRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission })
+);
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);

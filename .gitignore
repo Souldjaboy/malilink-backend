@@ -13,3 +13,4 @@ _archives/
 *backup*
 *.bak
 *.old
+uploads/imports/
