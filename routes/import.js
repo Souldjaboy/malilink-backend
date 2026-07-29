@@ -66,7 +66,6 @@ module.exports = function createImportRouter(deps) {
 
       const check = ic.security.validateUpload({ originalName: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, buffer: req.file.buffer });
       if (!check.ok) return res.status(400).json({ error: check.error });
-      if (check.kind === "docx") return res.status(400).json({ error: "Les fichiers DOCX seront pris en charge dans une prochaine phase." });
 
       const companyId = companyOf(req);
       const productCode = productOf(req);
@@ -79,7 +78,7 @@ module.exports = function createImportRouter(deps) {
         [companyId, hash]
       );
 
-      const analysis = ic.analyzeBuffer(req.file.buffer, check.kind, { sheet: req.body.sheet || null, headerRow: req.body.header_row != null ? Number(req.body.header_row) : null });
+      const analysis = await ic.analyzeBuffer(req.file.buffer, check.kind, { sheet: req.body.sheet || null, headerRow: req.body.header_row != null ? Number(req.body.header_row) : null });
       const stored = ic.security.safeStoredName(req.file.originalname);
       fs.writeFileSync(path.join(STORE_DIR, stored), req.file.buffer);
 
@@ -102,15 +101,18 @@ module.exports = function createImportRouter(deps) {
         suggestedMapping: suggestion.mapping, columns: suggestion.columns,
         alreadyImported: dup.rows[0] || null,
       });
-    } catch (e) { console.error("import/jobs:", e); res.status(500).json({ error: "Erreur d'analyse du fichier." }); }
+    } catch (e) {
+      console.error("import/jobs:", e);
+      res.status(e.statusCode === 400 ? 400 : 500).json({ error: e.statusCode === 400 ? e.message : "Erreur d'analyse du fichier." });
+    }
   });
 
-  // Re-lit le fichier stocké et ré-extrait la feuille.
-  function reanalyze(job) {
+  // Re-lit le fichier stocké et ré-extrait la feuille/tableau (async pour DOCX).
+  async function reanalyze(job) {
     const buf = fs.readFileSync(path.join(STORE_DIR, job.stored_filename));
-    const kind = job.stored_filename.endsWith(".csv") ? "csv" : "excel";
+    const kind = job.stored_filename.endsWith(".csv") ? "csv" : job.stored_filename.endsWith(".docx") ? "docx" : "excel";
     const meta = job.file_meta || {};
-    return ic.analyzeBuffer(buf, kind, { sheet: meta.activeSheet || null, headerRow: meta.headerRowIndex != null ? meta.headerRowIndex : null });
+    return ic.analyzeBuffer(buf, kind, { sheet: meta.activeSheet || null, headerRow: meta.headerRowIndex != null ? meta.headerRowIndex : null, tableIndex: meta.tableIndex });
   }
 
   // ÉTAPE 6-7 : mapping + validation (staging import_rows).
@@ -121,7 +123,7 @@ module.exports = function createImportRouter(deps) {
       const profile = ic.registry.getProfile(job.import_type);
       const mapping = req.body.mapping || {};
       const options = req.body.options || {};
-      const analysis = reanalyze(job);
+      const analysis = await reanalyze(job);
       const result = ic.validate(analysis, job.import_type, mapping, companyId, options);
 
       await pool.query(`DELETE FROM import_rows WHERE job_id=$1`, [job.id]);

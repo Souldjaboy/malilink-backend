@@ -10,9 +10,21 @@ const detector = require("./detector");
 const mapper = require("./mapper");
 const validator = require("./validator");
 const registry = require("./registry");
+const docx = require("./docx");
 
-/** Étape 3-5 : analyse le fichier (feuilles, colonnes, aperçu). */
-function analyzeBuffer(buffer, kind, { sheet = null, headerRow = null } = {}) {
+/** Étape 3-5 : analyse le fichier (feuilles/tableaux, colonnes, aperçu). Async (DOCX). */
+async function analyzeBuffer(buffer, kind, { sheet = null, headerRow = null, tableIndex = null } = {}) {
+  if (kind === "docx") {
+    const { tables } = await docx.extractDocxTables(buffer);
+    const idx = tableIndex != null ? Number(tableIndex) : 0;
+    const { header, rows } = docx.tableToRows(tables[idx] || tables[0], headerRow != null ? Number(headerRow) : 0);
+    const columns = header.map((h) => detector.analyzeColumn(h, rows.map((r) => r[h])));
+    return {
+      sheets: tables.map((t, i) => ({ name: `Tableau ${i + 1}`, rows: t.length })),
+      activeSheet: `Tableau ${idx + 1}`, tableIndex: idx, headerRowIndex: headerRow != null ? Number(headerRow) : 0,
+      header, columns, previewRows: rows.slice(0, 20), rowCount: rows.length, _rows: rows,
+    };
+  }
   const wb = parser.readWorkbook(buffer, kind);
   const sheets = parser.describeSheets(wb);
   const active = sheet || (sheets[0] && sheets[0].name);

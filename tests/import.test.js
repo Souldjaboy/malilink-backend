@@ -45,6 +45,7 @@ test("xlsx valide accepté", () => {
 });
 test("neutralisation injection de formule", () => assert.strictEqual(sanitizeCell("=1+2"), "'=1+2"));
 
+(async () => {
 console.log("Import — pipeline XLSX (analyse -> mapping -> validation)");
 const buf = xlsxBuffer([
   ["Désignation", "Type", "Quantité", "Date opération"],
@@ -53,7 +54,7 @@ const buf = xlsxBuffer([
   ["", "ENTREE", "3", "07/10/2026"],       // produit manquant -> invalid
   ["Nescafé", "SORTIE", "5", "05/10/2026"], // doublon exact
 ]);
-const analysis = ic.analyzeBuffer(buf, "excel");
+const analysis = await ic.analyzeBuffer(buf, "excel");
 test("feuilles détectées", () => assert.strictEqual(analysis.sheets.length, 1));
 test("4 lignes de données", () => assert.strictEqual(analysis.rowCount, 4));
 const { mapping } = ic.suggestMapping(analysis, "triangle.stock_movement");
@@ -80,4 +81,27 @@ test("résultats HAFIYA en statut BROUILLON (non validés auto)", () => {
   assert.strictEqual(ic.registry.getProfile("hafiya.lab_results").importStatus, "BROUILLON");
 });
 
+console.log("Import — DOCX (tableaux)");
+const docx = require("../import-center/docx");
+const sampleHtml = "<p>Texte libre</p><table><tr><th>Produit</th><th>Type</th><th>Quantité</th></tr><tr><td>Nescafé</td><td>SORTIE</td><td>5</td></tr><tr><td>Lait</td><td>ENTREE</td><td>7</td></tr></table>";
+test("extraction des tableaux HTML DOCX", () => {
+  const tables = docx.tablesFromHtml(sampleHtml);
+  assert.strictEqual(tables.length, 1);
+  assert.strictEqual(tables[0].length, 3);
+  assert.deepStrictEqual(tables[0][0], ["Produit", "Type", "Quantité"]);
+});
+test("conversion tableau -> lignes structurées", () => {
+  const { header, rows } = docx.tableToRows(docx.tablesFromHtml(sampleHtml)[0]);
+  assert.deepStrictEqual(header, ["Produit", "Type", "Quantité"]);
+  assert.strictEqual(rows.length, 2);
+  assert.strictEqual(rows[0]["Produit"], "Nescafé");
+});
+test("DOCX sans tableau -> aucun tableau détecté", () => {
+  assert.strictEqual(docx.tablesFromHtml("<p>Juste du texte libre.</p>").length, 0);
+});
+test("plusieurs tableaux détectés", () => {
+  assert.strictEqual(docx.tablesFromHtml(sampleHtml + "<table><tr><td>A</td></tr></table>").length, 2);
+});
+
 console.log(`\n✅ ${passed} tests centre d'importation passés.`);
+})();
