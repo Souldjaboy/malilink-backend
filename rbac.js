@@ -47,6 +47,9 @@ const SUBMODULES = {
   finance: ["wallet", "finance", "comptabilite", "rapports", "documents", "activites"],
   administration: ["utilisateurs", "parametres", "entrepots", "emplacements", "pointage", "badges", "alertes", "support", "super_admin"],
   ia: ["assistant", "social", "chat", "notifications", "recherche", "reunions"],
+  // Triangle WMS Pro (logistique / entrepôt / ressources humaines)
+  logistique: ["mouvements", "transferts", "demandes", "reception", "expedition", "inventaire"],
+  rh: ["employes", "contrats", "conges", "paie", "pointage"],
 };
 
 // Libellés lisibles (UI). Facultatif — défaut = clé humanisée.
@@ -54,7 +57,7 @@ const MODULE_LABELS = {
   commerce: "Commerce", livraison: "Livraison", voyage: "Voyage", restaurant: "Restaurant",
   immobilier: "Immobilier / Hôtel", automobile: "Automobile", education: "Éducation",
   laboratoire: "Laboratoire", finance: "Finance / Gestion", administration: "Administration",
-  ia: "IA / Communication",
+  ia: "IA / Communication", logistique: "Logistique / Entrepôt", rh: "Ressources humaines",
 };
 
 /** Toutes les clés (modules + sous-modules) connues. */
