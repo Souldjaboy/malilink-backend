@@ -12,6 +12,22 @@ module.exports = function registerMaliLink({ register }) {
     requiredFields: ["product_name", "unit_price"],
     optionalFields: ["product_code", "barcode", "quantity", "description", "supplier_name"],
     fieldTypes: { product_name: "text", unit_price: "amount", quantity: "quantity" },
+    entity: {
+      table: "marketplace_products",
+      labelColumn: "title",
+      map: { title: "product_name", description: "description", category: "category", price: "unit_price" },
+      compute: { available_stock: (m) => Number(m.quantity) || 0 },
+      defaults: { status: "draft" },
+      createdByColumn: "created_by",
+      dedupBy: [["title"]],
+      updatable: ["price", "description", "category"],
+      canDelete: true,
+      // Ne pas supprimer un produit déjà commandé.
+      dependencyCheck: async (client, id) => {
+        const r = await client.query("SELECT COUNT(*)::int n FROM marketplace_order_items WHERE product_id=$1", [id]).catch(() => ({ rows: [{ n: 0 }] }));
+        return r.rows[0].n > 0;
+      },
+    },
     dedupKey: (m) => ["mlk_product", (m.product_code || m.barcode || m.product_name || "").toString().trim().toLowerCase()].join("|"),
     validate: (m) => {
       const errs = [];
@@ -20,6 +36,23 @@ module.exports = function registerMaliLink({ register }) {
       return errs;
     },
   });
+
+  // Profils supplémentaires (simulation ; exécution branchable ultérieurement).
+  for (const [key, name, mod, sub] of [
+    ["malilink.orders", "Commandes", "marketplace", "commandes"],
+    ["malilink.payments", "Paiements", "marketplace", "paiements"],
+    ["malilink.vehicles", "Véhicules", "automobile", "vehicules"],
+    ["malilink.properties", "Biens immobiliers", "immobilier", "biens"],
+    ["malilink.restaurant_menu", "Menus restaurant", "restaurant", "menu"],
+  ]) {
+    register({
+      key, product_code: "malilink", module_key: mod, submodule_key: sub, name, permission: mod,
+      requiredFields: ["product_name"], optionalFields: ["unit_price", "quantity", "description", "customer_name", "transaction_date"],
+      fieldTypes: { product_name: "text", unit_price: "amount", quantity: "quantity", transaction_date: "date" },
+      dedupKey: (m) => [key, (m.product_code || m.product_name || "").toString().trim().toLowerCase(), String(m.transaction_date || "")].join("|"),
+      validate: (m) => (!m.product_name ? [{ field: "product_name", code: "REQUIRED", message: "Libellé manquant.", severity: "error" }] : []),
+    });
+  }
 
   register({
     key: "malilink.customers",

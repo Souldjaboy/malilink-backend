@@ -32,6 +32,20 @@ module.exports = function registerTriangle({ register }) {
     requiredFields: ["product_name"],
     optionalFields: ["product_code", "barcode", "quantity", "unit_price", "description"],
     fieldTypes: { product_name: "text", product_code: "text", barcode: "text", quantity: "quantity", unit_price: "amount" },
+    entity: {
+      table: "products",
+      labelColumn: "name",
+      map: { name: "product_name", reference: "product_code", barcode: "barcode", sale_price: "unit_price", description: "description" },
+      compute: { stock: (m) => Number(m.quantity) || 0 },
+      defaults: { is_active: true },
+      dedupBy: [["barcode"], ["sku"], ["reference"], ["name"]],
+      updatable: ["sale_price", "description", "barcode"],
+      canDelete: true,
+      dependencyCheck: async (client, id, companyId) => {
+        const r = await client.query("SELECT COUNT(*)::int n FROM stock_movements WHERE product_id=$1 AND company_id=$2", [id, companyId]);
+        return r.rows[0].n > 0;
+      },
+    },
     dedupKey: (m) => ["product", (m.product_code || m.barcode || m.product_name || "").toString().trim().toLowerCase()].join("|"),
     validate: (m) => {
       const errs = [];

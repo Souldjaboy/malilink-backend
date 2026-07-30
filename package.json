@@ -12,7 +12,8 @@
     "test": "node --test services/*.test.js services/**/*.test.js",
     "test:rbac": "node tests/rbac.test.js",
     "test:import": "node tests/import.test.js",
-    "test:import:acct": "node tests/import-accounting.test.js"
+    "test:import:acct": "node tests/import-accounting.test.js",
+    "test:import:entity": "node tests/import-entity.test.js"
   },
   "keywords": [],
   "author": "",

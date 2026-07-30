@@ -15,6 +15,7 @@ const { executeStock } = require("../import-center/executor");
 const { rollbackStock } = require("../import-center/rollback");
 const { simulateStock } = require("../import-center/simulator");
 const { executeAccounting, simulateAccounting, reverseAccounting } = require("../import-center/executor-accounting");
+const { executeEntity, simulateEntity, rollbackEntity } = require("../import-center/executor-entity");
 const closure = require("../import-center/closure");
 
 module.exports = function createImportRouter(deps) {
@@ -32,8 +33,9 @@ module.exports = function createImportRouter(deps) {
   const productOf = (req) => String(req.headers["x-app-product"] || req.tenant_id || req.body.product_code || "triangle").toLowerCase();
   const isStock = (profile) => profile.module_key === "logistique";
   const isAccounting = (profile) => profile.module_key === "comptabilite";
+  const isEntity = (profile) => !!profile.entity;
   const acctHelpers = { ...(accounting || {}), isPeriodClosed: closure.isPeriodClosed };
-  const executable = (profile) => isStock(profile) || (isAccounting(profile) && accounting && accounting.nextAccountingNumber);
+  const executable = (profile) => isStock(profile) || isEntity(profile) || (isAccounting(profile) && accounting && accounting.nextAccountingNumber);
 
   async function audit(jobId, companyId, productCode, action, userId, detail) {
     await pool.query(
@@ -164,6 +166,8 @@ module.exports = function createImportRouter(deps) {
         simulation = await simulateStock(pool, companyId, profile, rows, job.options || {});
       } else if (isAccounting(profile)) {
         simulation = await simulateAccounting(pool, companyId, profile, rows);
+      } else if (isEntity(profile)) {
+        simulation = await simulateEntity(pool, companyId, profile, rows);
       } else {
         const valid = rows.filter((r) => ["new", "warning"].includes(r.status)).length;
         simulation = { rows: [], totals: { willCreate: valid }, note: "Simulation détaillée disponible pour le stock et la comptabilité ; autres profils en phase ultérieure." };
@@ -186,7 +190,9 @@ module.exports = function createImportRouter(deps) {
       const rows = (await pool.query(`SELECT id, row_index AS "__row", mapped, status FROM import_rows WHERE job_id=$1 ORDER BY row_index`, [job.id])).rows;
       const { report, rowResults } = isAccounting(profile)
         ? await executeAccounting(pool, companyId, req.user.id, profile, rows, job.options || {}, acctHelpers)
-        : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
+        : isEntity(profile)
+          ? await executeEntity(pool, companyId, req.user.id, profile, rows, job.options || {})
+          : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
 
       for (const rr of rowResults) {
         await pool.query(`UPDATE import_rows SET status=$3, result_ref=$4 WHERE job_id=$1 AND row_index=$2`,
@@ -212,7 +218,9 @@ module.exports = function createImportRouter(deps) {
       const rows = (await pool.query(`SELECT row_index, result_ref FROM import_rows WHERE job_id=$1 AND status='imported'`, [job.id])).rows;
       const result = isAccounting(profile)
         ? await reverseAccounting(pool, companyId, req.user.id, job, rows, acctHelpers)
-        : await rollbackStock(pool, companyId, req.user.id, job, rows);
+        : isEntity(profile)
+          ? await rollbackEntity(pool, companyId, req.user.id, profile, job, rows)
+          : await rollbackStock(pool, companyId, req.user.id, job, rows);
       await audit(job.id, companyId, job.product_code, "rollback", req.user.id, result.detail);
       res.json({ status: "rolled_back", ...result });
     } catch (e) { console.error("import rollback:", e); res.status(500).json({ error: "Erreur de rollback." }); }
