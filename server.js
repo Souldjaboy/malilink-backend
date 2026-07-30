@@ -19127,6 +19127,13 @@ app.use(
   createAccountingRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission })
 );
 
+// Modules Factures & Camions (saisie directe + consultation).
+const createFacturesCamionsRouter = require("./routes/factures-camions");
+app.use(
+  "/",
+  createFacturesCamionsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
