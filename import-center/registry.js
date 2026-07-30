@@ -36,6 +36,7 @@ function listProfiles(productCode) {
 
 // Charge les profils de chaque produit (effet de bord : appellent register()).
 require("./products/triangle")({ register });
+require("./products/triangle-real")({ register });
 require("./products/malilink")({ register });
 require("./products/hafiya")({ register });
 

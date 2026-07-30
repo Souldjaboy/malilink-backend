@@ -16,6 +16,9 @@ const { rollbackStock } = require("../import-center/rollback");
 const { simulateStock } = require("../import-center/simulator");
 const { executeAccounting, simulateAccounting, reverseAccounting } = require("../import-center/executor-accounting");
 const { executeEntity, simulateEntity, rollbackEntity } = require("../import-center/executor-entity");
+const { executeFactures, simulateFactures, rollbackFactures } = require("../import-center/executor-factures");
+const { executeCashbook, simulateCashbook, rollbackCashbook } = require("../import-center/executor-cashbook");
+const { recognizeWorkbook } = require("../import-center/recognizer");
 const closure = require("../import-center/closure");
 
 module.exports = function createImportRouter(deps) {
@@ -36,11 +39,16 @@ module.exports = function createImportRouter(deps) {
   const headerSignature = (header) => crypto.createHash("sha256")
     .update((header || []).map((h) => String(h).trim().toLowerCase()).sort().join("|")).digest("hex").slice(0, 24);
   const isTransfer = (profile) => !!profile.isTransfer;
+  const isFactures = (profile) => profile.kind === "factures";
+  const isCashbook = (profile) => profile.kind === "cashbook";
   const isStock = (profile) => profile.module_key === "logistique" && !isTransfer(profile);
-  const isAccounting = (profile) => profile.module_key === "comptabilite";
+  const isAccounting = (profile) => profile.module_key === "comptabilite" && !isFactures(profile) && !isCashbook(profile);
   const isEntity = (profile) => !!profile.entity;
   const acctHelpers = { ...(accounting || {}), isPeriodClosed: closure.isPeriodClosed };
-  const executable = (profile) => isStock(profile) || isTransfer(profile) || isEntity(profile) || (isAccounting(profile) && accounting && accounting.nextAccountingNumber);
+  const hasAcct = accounting && accounting.nextAccountingNumber;
+  const executable = (profile) =>
+    isStock(profile) || isTransfer(profile) || isEntity(profile) || isFactures(profile) ||
+    (isCashbook(profile) && hasAcct) || (isAccounting(profile) && hasAcct);
 
   async function audit(jobId, companyId, productCode, action, userId, detail) {
     await pool.query(
@@ -67,15 +75,27 @@ module.exports = function createImportRouter(deps) {
   router.post("/jobs", authenticateToken, perm("create"), upload.single("file"), async (req, res) => {
     try {
       if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu." });
-      const profileKey = String(req.body.import_type || "").trim();
-      const profile = ic.registry.getProfile(profileKey);
-      if (!profile) return res.status(400).json({ error: "Type d'importation inconnu." });
-
       const check = ic.security.validateUpload({ originalName: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, buffer: req.file.buffer });
       if (!check.ok) return res.status(400).json({ error: check.error });
 
       const companyId = companyOf(req);
       const productCode = productOf(req);
+
+      // RECONNAISSANCE AUTOMATIQUE : import_type absent ou "auto".
+      let profileKey = String(req.body.import_type || "").trim();
+      let autoSheet = req.body.sheet || null, autoHeaderRow = req.body.header_row != null ? Number(req.body.header_row) : null, autoMapping = null, recognizedSheets = null;
+      if (!profileKey || profileKey === "auto") {
+        if (check.kind === "docx") return res.status(400).json({ error: "L'import automatique ne gère pas encore les DOCX ; choisissez le type." });
+        recognizedSheets = recognizeWorkbook(req.file.buffer, productCode);
+        const usable = recognizedSheets.filter((s) => s.recognized);
+        if (usable.length === 0) return res.status(400).json({ error: "Type de fichier non reconnu automatiquement. Choisissez le type manuellement.", recognizedSheets });
+        const chosen = autoSheet ? usable.find((s) => s.sheet === autoSheet) : usable[0];
+        if (!chosen) return res.status(400).json({ error: "Feuille non reconnue.", recognizedSheets });
+        profileKey = chosen.profileKey; autoSheet = chosen.sheet; autoHeaderRow = chosen.headerRow; autoMapping = chosen.mapping;
+      }
+      const profile = ic.registry.getProfile(profileKey);
+      if (!profile) return res.status(400).json({ error: "Type d'importation inconnu." });
+
       const hash = ic.security.fileHash(req.file.buffer);
 
       // Anti double import : fichier déjà importé avec succès ?
@@ -85,7 +105,7 @@ module.exports = function createImportRouter(deps) {
         [companyId, hash]
       );
 
-      const analysis = await ic.analyzeBuffer(req.file.buffer, check.kind, { sheet: req.body.sheet || null, headerRow: req.body.header_row != null ? Number(req.body.header_row) : null });
+      const analysis = await ic.analyzeBuffer(req.file.buffer, check.kind, { sheet: autoSheet, headerRow: autoHeaderRow });
       const stored = ic.security.safeStoredName(req.file.originalname);
       fs.writeFileSync(path.join(STORE_DIR, stored), req.file.buffer);
 
@@ -113,9 +133,11 @@ module.exports = function createImportRouter(deps) {
         job_uid: uid, status: "analyzed",
         profile: { key: profile.key, name: profile.name, requiredFields: profile.requiredFields, optionalFields: profile.optionalFields },
         analysis: fileMeta, preview: analysis.previewRows,
-        suggestedMapping: (matched && matched.mapping) || suggestion.mapping, columns: suggestion.columns,
+        suggestedMapping: autoMapping || (matched && matched.mapping) || suggestion.mapping, columns: suggestion.columns,
         savedMappings: saved.map((s) => ({ id: s.id, name: s.name, is_default: s.is_default })),
-        appliedMapping: matched ? matched.name : null,
+        appliedMapping: autoMapping ? "détection automatique" : (matched ? matched.name : null),
+        autoDetected: !!autoMapping,
+        recognizedSheets: recognizedSheets ? recognizedSheets.map((s) => ({ sheet: s.sheet, recognized: s.recognized, profileKey: s.profileKey || null })) : null,
         headerSignature: sig,
         alreadyImported: dup.rows[0] || null,
       });
@@ -180,6 +202,10 @@ module.exports = function createImportRouter(deps) {
       let simulation;
       if (isTransfer(profile)) {
         simulation = await simulateTransfer(pool, companyId, profile, rows);
+      } else if (isFactures(profile)) {
+        simulation = await simulateFactures(pool, companyId, profile, rows);
+      } else if (isCashbook(profile)) {
+        simulation = await simulateCashbook(pool, companyId, profile, rows);
       } else if (isStock(profile)) {
         simulation = await simulateStock(pool, companyId, profile, rows, job.options || {});
       } else if (isAccounting(profile)) {
@@ -206,13 +232,18 @@ module.exports = function createImportRouter(deps) {
       if (!executable(profile)) return res.status(400).json({ error: "L'exécution de ce profil sera disponible dans une phase ultérieure. Seule la simulation est possible." });
 
       const rows = (await pool.query(`SELECT id, row_index AS "__row", mapped, status FROM import_rows WHERE job_id=$1 ORDER BY row_index`, [job.id])).rows;
+      const opts = { ...(job.options || {}), jobId: job.id };
       const { report, rowResults } = isTransfer(profile)
         ? await executeTransfer(pool, companyId, req.user.id, profile, rows)
-        : isAccounting(profile)
-          ? await executeAccounting(pool, companyId, req.user.id, profile, rows, job.options || {}, acctHelpers)
-          : isEntity(profile)
-            ? await executeEntity(pool, companyId, req.user.id, profile, rows, job.options || {})
-            : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
+        : isFactures(profile)
+          ? await executeFactures(pool, companyId, req.user.id, profile, rows, opts)
+          : isCashbook(profile)
+            ? await executeCashbook(pool, companyId, req.user.id, profile, rows, opts, acctHelpers)
+            : isAccounting(profile)
+              ? await executeAccounting(pool, companyId, req.user.id, profile, rows, job.options || {}, acctHelpers)
+              : isEntity(profile)
+                ? await executeEntity(pool, companyId, req.user.id, profile, rows, job.options || {})
+                : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
 
       for (const rr of rowResults) {
         await pool.query(`UPDATE import_rows SET status=$3, result_ref=$4 WHERE job_id=$1 AND row_index=$2`,
@@ -238,11 +269,15 @@ module.exports = function createImportRouter(deps) {
       const rows = (await pool.query(`SELECT row_index, result_ref FROM import_rows WHERE job_id=$1 AND status='imported'`, [job.id])).rows;
       const result = isTransfer(profile)
         ? await rollbackTransfer(pool, companyId, req.user.id, job, rows)
-        : isAccounting(profile)
-          ? await reverseAccounting(pool, companyId, req.user.id, job, rows, acctHelpers)
-          : isEntity(profile)
-            ? await rollbackEntity(pool, companyId, req.user.id, profile, job, rows)
-            : await rollbackStock(pool, companyId, req.user.id, job, rows);
+        : isFactures(profile)
+          ? await rollbackFactures(pool, companyId, req.user.id, profile, job, rows)
+          : isCashbook(profile)
+            ? await rollbackCashbook(pool, companyId, req.user.id, job, rows, acctHelpers)
+            : isAccounting(profile)
+              ? await reverseAccounting(pool, companyId, req.user.id, job, rows, acctHelpers)
+              : isEntity(profile)
+                ? await rollbackEntity(pool, companyId, req.user.id, profile, job, rows)
+                : await rollbackStock(pool, companyId, req.user.id, job, rows);
       await audit(job.id, companyId, job.product_code, "rollback", req.user.id, result.detail);
       res.json({ status: "rolled_back", ...result });
     } catch (e) { console.error("import rollback:", e); res.status(500).json({ error: "Erreur de rollback." }); }

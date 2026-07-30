@@ -14,7 +14,8 @@
     "test:import": "node tests/import.test.js",
     "test:import:acct": "node tests/import-accounting.test.js",
     "test:import:entity": "node tests/import-entity.test.js",
-    "test:import:more": "node tests/import-more.test.js"
+    "test:import:more": "node tests/import-more.test.js",
+    "test:import:real": "node tests/import-real.test.js"
   },
   "keywords": [],
   "author": "",

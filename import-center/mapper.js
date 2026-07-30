@@ -4,7 +4,7 @@
  * Mapping colonne -> champ. Combine la détection (en-tête + valeurs) et les
  * champs attendus par le profil. L'utilisateur peut corriger chaque ligne.
  */
-const { analyzeColumn, parseNumber, parseDate } = require("./detector");
+const { analyzeColumn, parseNumber, parseDate, fmtYMD } = require("./detector");
 
 /** Analyse chaque colonne et propose une correspondance vers les champs du profil. */
 function suggestMapping(header, rows, profile) {
@@ -44,7 +44,7 @@ function applyMapping(rows, mapping, profile) {
       let value = raw[col];
       if (value === "" || value == null) { mapped[field] = null; continue; }
       if (type === "amount" || type === "quantity") mapped[field] = parseNumber(value);
-      else if (type === "date") { const d = parseDate(value); mapped[field] = d ? d.toISOString().slice(0, 10) : null; }
+      else if (type === "date") { mapped[field] = fmtYMD(parseDate(value)); }
       else mapped[field] = String(value).trim();
     }
     return { __row: raw.__row, raw, mapped };

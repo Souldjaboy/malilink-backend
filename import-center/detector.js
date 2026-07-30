@@ -80,7 +80,15 @@ function parseNumber(value) {
     if (s.lastIndexOf(",") > s.lastIndexOf(".")) s = s.replace(/\./g, "").replace(",", ".");
     else s = s.replace(/,/g, "");
   } else if (hasComma) {
-    s = s.replace(",", "."); // virgule décimale FR
+    // « 3,900,000 » (milliers) vs « 1 234,56 » (décimal FR). Plusieurs virgules,
+    // ou dernière tranche de 3 chiffres → séparateur de milliers (fréquent FCFA).
+    const parts = s.split(",");
+    const last = parts[parts.length - 1];
+    if (parts.length > 2 || last.length === 3) s = s.replace(/,/g, "");
+    else s = s.replace(",", ".");
+  } else if (hasDot) {
+    // « 3.900.000 » (milliers européens) : plusieurs points → séparateur de milliers.
+    if ((s.match(/\./g) || []).length > 1) s = s.replace(/\./g, "");
   }
   const num = Number(s);
   return Number.isFinite(num) ? num : null;
@@ -106,7 +114,26 @@ function parseDate(value) {
   }
   m = s.match(/^\d{4}-\d{2}-\d{2}/);
   if (m) { const d = new Date(s); return isNaN(d) ? null : d; }
+  // Mois en toutes lettres (EN/FR) : « 18 May 2026 », « February 23, 2026 », « Monday, February 23, 2026 ».
+  const MONTHS = { jan:0, feb:1, fev:1, mar:2, apr:3, avr:3, may:4, mai:4, jun:5, jui:5, jul:6, aug:7, aou:7, sep:8, oct:9, nov:10, dec:11 };
+  const norm = s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  let mm2 = norm.match(/(\d{1,2})\s+([a-z]{3,})\.?\s+(\d{4})/);        // 18 may 2026
+  if (!mm2) mm2 = norm.match(/([a-z]{3,})\.?\s+(\d{1,2}),?\s+(\d{4})/); // february 23, 2026
+  if (mm2) {
+    const a = mm2[1], b = mm2[2], c = mm2[3];
+    let day, mon, year;
+    if (/^\d/.test(a)) { day = Number(a); mon = MONTHS[b.slice(0, 3)]; year = Number(c); }
+    else { mon = MONTHS[a.slice(0, 3)]; day = Number(b); year = Number(c); }
+    if (mon != null && day >= 1 && day <= 31) { const d = new Date(year, mon, day); return isNaN(d) ? null : d; }
+  }
   return null;
+}
+
+// Formate une Date en AAAA-MM-JJ à partir des composantes LOCALES (pas d'UTC → pas de décalage).
+function fmtYMD(d) {
+  if (!(d instanceof Date) || isNaN(d)) return null;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 function looksMoney(value) {
@@ -155,4 +182,4 @@ function analyzeColumn(header, values) {
   return { header, suggestedField: byHeader.field, valueType: byValue.type, confidence: Number(confidence.toFixed(2)), level };
 }
 
-module.exports = { normalize, SYNONYMS, bestFieldForHeader, parseNumber, parseDate, looksMoney, detectValueType, analyzeColumn };
+module.exports = { normalize, SYNONYMS, bestFieldForHeader, parseNumber, parseDate, fmtYMD, looksMoney, detectValueType, analyzeColumn };
