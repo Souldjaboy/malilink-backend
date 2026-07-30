@@ -33,6 +33,8 @@ const SYNONYMS = {
   description: ["motif", "description", "libelle", "observation", "commentaire", "notes", "reason", "details", "designation operation"],
   customer_name: ["client", "nom client", "customer", "customer name", "raison sociale"],
   supplier_name: ["fournisseur", "nom fournisseur", "supplier", "supplier name"],
+  source_warehouse: ["entrepot source", "source", "magasin source", "from warehouse", "depart", "entrepot depart"],
+  destination_warehouse: ["entrepot destination", "destination", "magasin destination", "to warehouse", "arrivee", "entrepot arrivee"],
   phone: ["telephone", "tel", "phone", "portable", "gsm", "numero", "contact"],
   email: ["email", "mail", "courriel", "e mail"],
   // HAFIYA

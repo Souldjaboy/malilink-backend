@@ -11,7 +11,7 @@ const path = require("path");
 const crypto = require("crypto");
 const XLSX = require("xlsx");
 const ic = require("../import-center");
-const { executeStock } = require("../import-center/executor");
+const { executeStock, simulateTransfer, executeTransfer, rollbackTransfer } = require("../import-center/executor");
 const { rollbackStock } = require("../import-center/rollback");
 const { simulateStock } = require("../import-center/simulator");
 const { executeAccounting, simulateAccounting, reverseAccounting } = require("../import-center/executor-accounting");
@@ -31,11 +31,16 @@ module.exports = function createImportRouter(deps) {
 
   const companyOf = (req) => getEffectiveCompanyId(req) || req.user.company_id;
   const productOf = (req) => String(req.headers["x-app-product"] || req.tenant_id || req.body.product_code || "triangle").toLowerCase();
-  const isStock = (profile) => profile.module_key === "logistique";
+
+  // Empreinte stable des en-têtes d'un fichier (pour l'auto-suggestion de mapping).
+  const headerSignature = (header) => crypto.createHash("sha256")
+    .update((header || []).map((h) => String(h).trim().toLowerCase()).sort().join("|")).digest("hex").slice(0, 24);
+  const isTransfer = (profile) => !!profile.isTransfer;
+  const isStock = (profile) => profile.module_key === "logistique" && !isTransfer(profile);
   const isAccounting = (profile) => profile.module_key === "comptabilite";
   const isEntity = (profile) => !!profile.entity;
   const acctHelpers = { ...(accounting || {}), isPeriodClosed: closure.isPeriodClosed };
-  const executable = (profile) => isStock(profile) || isEntity(profile) || (isAccounting(profile) && accounting && accounting.nextAccountingNumber);
+  const executable = (profile) => isStock(profile) || isTransfer(profile) || isEntity(profile) || (isAccounting(profile) && accounting && accounting.nextAccountingNumber);
 
   async function audit(jobId, companyId, productCode, action, userId, detail) {
     await pool.query(
@@ -96,11 +101,22 @@ module.exports = function createImportRouter(deps) {
       await audit(rows[0].id, companyId, productCode, "upload", req.user.id, { filename: req.file.originalname, rows: analysis.rowCount });
 
       const suggestion = ic.suggestMapping(analysis, profileKey);
+      // Auto-suggestion : mapping enregistré correspondant aux mêmes en-têtes, sinon défaut du profil.
+      const sig = headerSignature(analysis.header);
+      const saved = (await pool.query(
+        `SELECT id, name, mapping, is_default FROM import_mapping_templates
+          WHERE company_id=$1 AND profile_key=$2 ORDER BY (header_signature=$3) DESC, is_default DESC, updated_at DESC`,
+        [companyId, profileKey, sig]
+      )).rows;
+      const matched = saved.find((s) => true) || null;
       res.status(201).json({
         job_uid: uid, status: "analyzed",
         profile: { key: profile.key, name: profile.name, requiredFields: profile.requiredFields, optionalFields: profile.optionalFields },
         analysis: fileMeta, preview: analysis.previewRows,
-        suggestedMapping: suggestion.mapping, columns: suggestion.columns,
+        suggestedMapping: (matched && matched.mapping) || suggestion.mapping, columns: suggestion.columns,
+        savedMappings: saved.map((s) => ({ id: s.id, name: s.name, is_default: s.is_default })),
+        appliedMapping: matched ? matched.name : null,
+        headerSignature: sig,
         alreadyImported: dup.rows[0] || null,
       });
     } catch (e) {
@@ -162,7 +178,9 @@ module.exports = function createImportRouter(deps) {
       const profile = ic.registry.getProfile(job.import_type);
       const rows = (await pool.query(`SELECT row_index AS "__row", mapped, status FROM import_rows WHERE job_id=$1 ORDER BY row_index`, [job.id])).rows;
       let simulation;
-      if (isStock(profile)) {
+      if (isTransfer(profile)) {
+        simulation = await simulateTransfer(pool, companyId, profile, rows);
+      } else if (isStock(profile)) {
         simulation = await simulateStock(pool, companyId, profile, rows, job.options || {});
       } else if (isAccounting(profile)) {
         simulation = await simulateAccounting(pool, companyId, profile, rows);
@@ -188,11 +206,13 @@ module.exports = function createImportRouter(deps) {
       if (!executable(profile)) return res.status(400).json({ error: "L'exécution de ce profil sera disponible dans une phase ultérieure. Seule la simulation est possible." });
 
       const rows = (await pool.query(`SELECT id, row_index AS "__row", mapped, status FROM import_rows WHERE job_id=$1 ORDER BY row_index`, [job.id])).rows;
-      const { report, rowResults } = isAccounting(profile)
-        ? await executeAccounting(pool, companyId, req.user.id, profile, rows, job.options || {}, acctHelpers)
-        : isEntity(profile)
-          ? await executeEntity(pool, companyId, req.user.id, profile, rows, job.options || {})
-          : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
+      const { report, rowResults } = isTransfer(profile)
+        ? await executeTransfer(pool, companyId, req.user.id, profile, rows)
+        : isAccounting(profile)
+          ? await executeAccounting(pool, companyId, req.user.id, profile, rows, job.options || {}, acctHelpers)
+          : isEntity(profile)
+            ? await executeEntity(pool, companyId, req.user.id, profile, rows, job.options || {})
+            : await executeStock(pool, companyId, req.user.id, profile, rows, job.options || {});
 
       for (const rr of rowResults) {
         await pool.query(`UPDATE import_rows SET status=$3, result_ref=$4 WHERE job_id=$1 AND row_index=$2`,
@@ -216,11 +236,13 @@ module.exports = function createImportRouter(deps) {
       const profile = ic.registry.getProfile(job.import_type);
       if (!executable(profile)) return res.status(400).json({ error: "Rollback non disponible pour ce profil." });
       const rows = (await pool.query(`SELECT row_index, result_ref FROM import_rows WHERE job_id=$1 AND status='imported'`, [job.id])).rows;
-      const result = isAccounting(profile)
-        ? await reverseAccounting(pool, companyId, req.user.id, job, rows, acctHelpers)
-        : isEntity(profile)
-          ? await rollbackEntity(pool, companyId, req.user.id, profile, job, rows)
-          : await rollbackStock(pool, companyId, req.user.id, job, rows);
+      const result = isTransfer(profile)
+        ? await rollbackTransfer(pool, companyId, req.user.id, job, rows)
+        : isAccounting(profile)
+          ? await reverseAccounting(pool, companyId, req.user.id, job, rows, acctHelpers)
+          : isEntity(profile)
+            ? await rollbackEntity(pool, companyId, req.user.id, profile, job, rows)
+            : await rollbackStock(pool, companyId, req.user.id, job, rows);
       await audit(job.id, companyId, job.product_code, "rollback", req.user.id, result.detail);
       res.json({ status: "rolled_back", ...result });
     } catch (e) { console.error("import rollback:", e); res.status(500).json({ error: "Erreur de rollback." }); }
@@ -269,6 +291,107 @@ module.exports = function createImportRouter(deps) {
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="modele_${profile.key}.xlsx"`);
     res.send(buf);
+  });
+
+  // ---------- MAPPINGS RÉUTILISABLES (isolés company/product/profil) ----------
+  router.get("/mappings", authenticateToken, perm("view"), async (req, res) => {
+    try {
+      const params = [companyOf(req)];
+      let where = "company_id=$1";
+      if (req.query.profile_key) { params.push(req.query.profile_key); where += ` AND profile_key=$${params.length}`; }
+      const { rows } = await pool.query(
+        `SELECT id, product_code, module_key, profile_key, name, mapping, is_default, created_at
+           FROM import_mapping_templates WHERE ${where} ORDER BY is_default DESC, name`,
+        params
+      );
+      res.json(rows);
+    } catch (e) { console.error("mappings list:", e); res.status(500).json({ error: "Erreur mappings." }); }
+  });
+
+  router.post("/mappings", authenticateToken, perm("create"), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const profileKey = String(b.profile_key || "").trim();
+      const profile = ic.registry.getProfile(profileKey);
+      if (!profile) return res.status(400).json({ error: "Profil inconnu." });
+      if (!b.name || !b.mapping) return res.status(400).json({ error: "Nom et mapping requis." });
+      const companyId = companyOf(req);
+      if (b.is_default) await pool.query(`UPDATE import_mapping_templates SET is_default=FALSE WHERE company_id=$1 AND profile_key=$2`, [companyId, profileKey]);
+      const { rows } = await pool.query(
+        `INSERT INTO import_mapping_templates (company_id, tenant_id, product_code, module_key, profile_key, name, mapping, header_signature, is_default, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (company_id, profile_key, name) DO UPDATE SET mapping=EXCLUDED.mapping, header_signature=EXCLUDED.header_signature, is_default=EXCLUDED.is_default, updated_at=NOW()
+         RETURNING id, name, is_default`,
+        [companyId, req.tenant_id || productOf(req), profile.product_code, profile.module_key, profileKey, String(b.name).trim(), JSON.stringify(b.mapping), b.header_signature || null, !!b.is_default, req.user.id]
+      );
+      res.status(201).json(rows[0]);
+    } catch (e) { console.error("mappings save:", e); res.status(500).json({ error: "Erreur enregistrement mapping." }); }
+  });
+
+  router.patch("/mappings/:id", authenticateToken, perm("create"), async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      const owned = (await pool.query(`SELECT profile_key FROM import_mapping_templates WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
+      if (!owned) return res.status(404).json({ error: "Mapping introuvable." });
+      const b = req.body || {};
+      if (b.is_default === true) await pool.query(`UPDATE import_mapping_templates SET is_default=FALSE WHERE company_id=$1 AND profile_key=$2`, [companyId, owned.profile_key]);
+      const { rows } = await pool.query(
+        `UPDATE import_mapping_templates SET name=COALESCE($3,name), is_default=COALESCE($4,is_default), updated_at=NOW()
+          WHERE id=$1 AND company_id=$2 RETURNING id, name, is_default`,
+        [req.params.id, companyId, b.name ? String(b.name).trim() : null, typeof b.is_default === "boolean" ? b.is_default : null]
+      );
+      res.json(rows[0]);
+    } catch (e) { console.error("mappings patch:", e); res.status(500).json({ error: "Erreur mapping." }); }
+  });
+
+  router.delete("/mappings/:id", authenticateToken, perm("create"), async (req, res) => {
+    try {
+      const r = await pool.query(`DELETE FROM import_mapping_templates WHERE id=$1 AND company_id=$2`, [req.params.id, companyOf(req)]);
+      if (!r.rowCount) return res.status(404).json({ error: "Mapping introuvable." });
+      res.json({ ok: true });
+    } catch (e) { console.error("mappings delete:", e); res.status(500).json({ error: "Erreur suppression mapping." }); }
+  });
+
+  // ---------- RAPPORT DÉTAILLÉ (XLSX / CSV) ----------
+  router.get("/jobs/:uid/report", authenticateToken, perm("view"), async (req, res) => {
+    try {
+      const { job, error } = await loadJob(req);
+      if (error) return res.status(error).json({ error: "Accès refusé." });
+      const rows = (await pool.query(
+        `SELECT row_index, raw, mapped, status, fingerprint, messages, result_ref FROM import_rows WHERE job_id=$1 ORDER BY row_index`,
+        [job.id]
+      )).rows;
+      const s = job.summary || {};
+      const summary = [
+        ["Rapport d'importation"], ["Entreprise (id)", job.company_id], ["Produit", job.product_code],
+        ["Module", job.module_key], ["Profil", job.import_type], ["Fichier", job.original_filename],
+        ["Créé par (id)", job.created_by], ["Date", job.created_at], ["Statut", job.status],
+        ["Total", job.total_rows], ["Valides", job.valid_rows], ["Invalides", job.invalid_rows],
+        ["Doublons", job.duplicate_rows], ["Importées", job.imported_rows],
+        ["Résumé exécution", JSON.stringify(s.report || {})],
+      ];
+      const detailHeader = ["Ligne", "Données originales", "Mapping", "Statut", "Message", "Identifiant créé"];
+      const detail = rows.map((r) => [
+        r.row_index, JSON.stringify(r.raw), JSON.stringify(r.mapped), r.status,
+        (Array.isArray(r.messages) ? r.messages : []).map((m) => m.message).join(" ; "),
+        (r.result_ref && (r.result_ref.id || r.result_ref.movement_id || r.result_ref.transaction_id)) || "",
+      ]);
+
+      if (String(req.query.format).toLowerCase() === "csv") {
+        const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+        const csv = [detailHeader.map(esc).join(",")].concat(detail.map((d) => d.map(esc).join(","))).join("\n");
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="rapport_import_${job.job_uid}.csv"`);
+        return res.send("﻿" + csv);
+      }
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summary), "Résumé");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([detailHeader, ...detail]), "Détail");
+      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="rapport_import_${job.job_uid}.xlsx"`);
+      res.send(buf);
+    } catch (e) { console.error("import report:", e); res.status(500).json({ error: "Erreur rapport." }); }
   });
 
   return router;

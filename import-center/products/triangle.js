@@ -88,7 +88,57 @@ module.exports = function registerTriangle({ register }) {
   stockProfile("triangle.stock_in", "Entrées de stock", "IN", "mouvements");
   stockProfile("triangle.stock_out", "Sorties de stock", "OUT", "mouvements");
   stockProfile("triangle.damage", "Casse et pertes", "DAMAGE", "mouvements");
+  stockProfile("triangle.loss", "Pertes", "LOSS", "mouvements");
+  stockProfile("triangle.adjustment", "Ajustements", "ADJUSTMENT_IN", "inventaire");
   stockProfile("triangle.inventory", "Inventaire (correction)", "INVENTORY_CORRECTION", "inventaire");
+
+  // Transferts : double mouvement (TRANSFER_OUT source + TRANSFER_IN destination).
+  register({
+    key: "triangle.transfer",
+    product_code: "triangle",
+    module_key: "logistique",
+    submodule_key: "mouvements",
+    name: "Transferts entre entrepôts",
+    permission: "stock",
+    isTransfer: true,
+    requiredFields: ["product_name", "quantity", "source_warehouse", "destination_warehouse"],
+    optionalFields: ["product_code", "transaction_date", "description"],
+    fieldTypes: { product_name: "text", quantity: "quantity", source_warehouse: "text", destination_warehouse: "text", transaction_date: "date" },
+    dedupKey: (m) => ["transfer", (m.product_code || m.product_name || "").toString().trim().toLowerCase(), String(m.quantity ?? ""), (m.source_warehouse || "") + ">" + (m.destination_warehouse || ""), String(m.transaction_date || "")].join("|"),
+    validate: (m) => {
+      const errs = [];
+      if (!m.product_name) errs.push({ field: "product_name", code: "REQUIRED", message: "Produit manquant.", severity: "error" });
+      if (!(Number(m.quantity) > 0)) errs.push({ field: "quantity", code: "INVALID_QTY", message: "Quantité invalide.", severity: "error" });
+      if (!m.source_warehouse) errs.push({ field: "source_warehouse", code: "REQUIRED", message: "Entrepôt source manquant.", severity: "error" });
+      if (!m.destination_warehouse) errs.push({ field: "destination_warehouse", code: "REQUIRED", message: "Entrepôt destination manquant.", severity: "error" });
+      if (m.source_warehouse && m.source_warehouse === m.destination_warehouse) errs.push({ field: "destination_warehouse", code: "SAME_WH", message: "Source et destination identiques.", severity: "error" });
+      return errs;
+    },
+  });
+
+  // Fournisseurs (entité réelle -> table suppliers).
+  register({
+    key: "triangle.suppliers",
+    product_code: "triangle",
+    module_key: "partenaires",
+    submodule_key: "fournisseurs",
+    name: "Fournisseurs",
+    permission: "partenaires",
+    requiredFields: ["supplier_name"],
+    optionalFields: ["phone", "email", "description"],
+    fieldTypes: { supplier_name: "text", phone: "text", email: "text" },
+    entity: {
+      table: "suppliers",
+      labelColumn: "name",
+      map: { name: "supplier_name", phone: "phone", email: "email", address: "description" },
+      defaults: { status: "actif" },
+      dedupBy: [["phone"], ["email"], ["name"]],
+      updatable: ["phone", "email", "address"],
+      canDelete: true,
+    },
+    dedupKey: (m) => ["supplier", (m.phone || m.email || m.supplier_name || "").toString().trim().toLowerCase()].join("|"),
+    validate: (m) => (!m.supplier_name ? [{ field: "supplier_name", code: "REQUIRED", message: "Nom du fournisseur manquant.", severity: "error" }] : []),
+  });
 
   // --- Comptabilité (Phase 4 pour l'exécution ; profil déclaré dès maintenant) ---
   register({
