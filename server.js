@@ -19131,7 +19131,10 @@ app.use(
 const createFacturesCamionsRouter = require("./routes/factures-camions");
 app.use(
   "/",
-  createFacturesCamionsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+  createFacturesCamionsRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    accounting: { nextAccountingNumber, createAccountingEntry },
+  })
 );
 
 const listenPort = process.env.PORT || 5050;

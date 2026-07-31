@@ -42,14 +42,37 @@ async function computeClosure(pool, companyId, year, month) {
     [companyId, year, month]
   )).rows[0];
 
+  // Contrôle partie double : total débit vs total crédit des écritures du mois.
+  const bal = (await pool.query(
+    `SELECT COALESCE(SUM(debit),0) d, COALESCE(SUM(credit),0) c FROM accounting_entries
+      WHERE company_id=$1 AND EXTRACT(YEAR FROM created_at)=$2 AND EXTRACT(MONTH FROM created_at)=$3`,
+    [companyId, year, month]
+  )).rows[0];
+  const debit = Number(bal.d), credit = Number(bal.c);
+  const unbalanced = Math.round(debit) !== Math.round(credit);
+
+  // Imports en erreur / partiels sur la période.
+  const badImports = Number((await pool.query(
+    `SELECT COUNT(*) n FROM import_jobs
+      WHERE company_id=$1 AND status IN ('failed') AND EXTRACT(YEAR FROM created_at)=$2 AND EXTRACT(MONTH FROM created_at)=$3`,
+    [companyId, year, month]
+  )).rows[0].n);
+
   const income = Number(agg.income), expense = Number(agg.expense);
   const closing = opening + income - expense;
+  const anomalies = [];
+  if (Number(agg.not_validated) > 0) anomalies.push(`${agg.not_validated} opération(s) non validée(s).`);
+  if (unbalanced) anomalies.push(`Écritures déséquilibrées : débit ${debit} ≠ crédit ${credit}.`);
+  if (badImports > 0) anomalies.push(`${badImports} import(s) en erreur sur la période.`);
+
   return {
     period_year: year, period_month: month,
     opening_balance: opening, total_income: income, total_expense: expense,
     result: income - expense, closing_balance: closing,
     not_validated: Number(agg.not_validated),
-    anomalies: Number(agg.not_validated) > 0 ? [`${agg.not_validated} opération(s) non validée(s).`] : [],
+    total_debit: debit, total_credit: credit, unbalanced, bad_imports: badImports,
+    anomalies,
+    can_close: !unbalanced && badImports === 0,
   };
 }
 
@@ -61,8 +84,14 @@ async function listClosures(pool, companyId, year) {
   return rows;
 }
 
-async function closePeriod(pool, companyId, userId, year, month) {
+async function closePeriod(pool, companyId, userId, year, month, options = {}) {
   const snap = await computeClosure(pool, companyId, year, month);
+  // Sécurité : refuser la clôture en cas d'anomalie bloquante, sauf forçage explicite.
+  if (!snap.can_close && !options.force) {
+    const err = new Error("Clôture bloquée par des anomalies.");
+    err.statusCode = 409; err.anomalies = snap.anomalies; err.snapshot = snap;
+    throw err;
+  }
   const { rows } = await pool.query(
     `INSERT INTO accounting_period_closures
        (company_id, period_year, period_month, status, opening_balance, total_income, total_expense, closing_balance, snapshot, closed_by, closed_at)

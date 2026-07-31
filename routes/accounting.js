@@ -36,9 +36,12 @@ module.exports = function createAccountingRouter(deps) {
     try {
       const y = Number(req.params.year), m = Number(req.params.month);
       if (!ok(y) || !(m >= 1 && m <= 12)) return res.status(400).json({ error: "Période invalide." });
-      const row = await closure.closePeriod(pool, companyOf(req), req.user.id, y, m);
+      const row = await closure.closePeriod(pool, companyOf(req), req.user.id, y, m, { force: req.body && req.body.force === true });
       res.json({ ok: true, closure: row });
-    } catch (e) { console.error("closure close:", e); res.status(500).json({ error: "Erreur clôture." }); }
+    } catch (e) {
+      if (e.statusCode === 409) return res.status(409).json({ error: e.message, code: "CLOSURE_BLOCKED", anomalies: e.anomalies, snapshot: e.snapshot });
+      console.error("closure close:", e); res.status(500).json({ error: "Erreur clôture." });
+    }
   });
 
   // Rouvrir un mois (permission spéciale + audité).

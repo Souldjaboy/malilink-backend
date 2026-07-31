@@ -2,13 +2,24 @@
 
 /** Modules Factures & Camions (saisie directe + consultation), isolés par le token. */
 const express = require("express");
+const ic = require("../import-center");
+const { executeCashbook } = require("../import-center/executor-cashbook");
+const closure = require("../import-center/closure");
 
 module.exports = function createFacturesCamionsRouter(deps) {
-  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission } = deps;
+  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, accounting } = deps;
   const router = express.Router();
   const perm = (mod, action) => (requirePermission ? requirePermission(mod, action) : (req, res, next) => next());
   const companyOf = (req) => getEffectiveCompanyId(req) || req.user.company_id;
   const invoiceStatus = (inv, pd) => (inv > 0 && pd >= inv ? "paye" : pd <= 0 ? "impaye" : "partiel");
+  const acctHelpers = { ...(accounting || {}), isPeriodClosed: closure.isPeriodClosed };
+
+  // Saisie manuelle -> écriture comptable équilibrée, en réutilisant l'exécuteur cashbook testé.
+  async function postCashLine(companyId, userId, profileKey, mapped) {
+    const profile = ic.registry.getProfile(profileKey);
+    const row = { __row: 1, status: "new", mapped };
+    return executeCashbook(pool, companyId, userId, profile, [row], {}, acctHelpers);
+  }
 
   // ---------- FACTURES ----------
   router.get("/factures", authenticateToken, perm("comptabilite", "view"), async (req, res) => {
@@ -73,6 +84,32 @@ module.exports = function createFacturesCamionsRouter(deps) {
       );
       res.status(201).json(rows[0]);
     } catch (e) { console.error("camions create:", e); res.status(500).json({ error: "Erreur création camion." }); }
+  });
+
+  // Saisie manuelle d'une opération de trésorerie (recette/dépense) -> écriture équilibrée.
+  router.post("/tresorerie", authenticateToken, perm("comptabilite", "create"), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const income = Number(b.income) || 0, expense = Number(b.expense) || 0;
+      if (income <= 0 && expense <= 0) return res.status(400).json({ error: "Renseignez une entrée ou une sortie." });
+      const r = await postCashLine(companyOf(req), req.user.id, "triangle.tresorerie", { op_date: b.op_date || null, libelle: b.libelle || null, income, expense });
+      res.status(201).json({ ok: true, report: r.report });
+    } catch (e) { console.error("tresorerie create:", e); res.status(500).json({ error: "Erreur trésorerie." }); }
+  });
+
+  // Saisie manuelle d'une opération camion -> camion_operation + écriture équilibrée.
+  router.post("/camions/:id/operations", authenticateToken, perm("comptabilite", "create"), async (req, res) => {
+    try {
+      const cam = (await pool.query(`SELECT id, code FROM camions WHERE id=$1 AND company_id=$2`, [req.params.id, companyOf(req)])).rows[0];
+      if (!cam) return res.status(404).json({ error: "Camion introuvable." });
+      const b = req.body || {};
+      const recette = Number(b.recette) || 0, depense = Number(b.depense) || 0;
+      if (recette <= 0 && depense <= 0) return res.status(400).json({ error: "Renseignez une recette ou une dépense." });
+      const r = await postCashLine(companyOf(req), req.user.id, "triangle.suivi", {
+        op_date: b.op_date || null, libelle: b.libelle || null, camion: cam.code, piece_ref: b.piece_ref || null, income: recette, expense: depense,
+      });
+      res.status(201).json({ ok: true, report: r.report });
+    } catch (e) { console.error("camion op create:", e); res.status(500).json({ error: "Erreur opération camion." }); }
   });
 
   router.get("/camions/:id/operations", authenticateToken, perm("comptabilite", "view"), async (req, res) => {

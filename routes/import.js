@@ -164,6 +164,15 @@ module.exports = function createImportRouter(deps) {
       const mapping = req.body.mapping || {};
       const options = req.body.options || {};
       const analysis = await reanalyze(job);
+      // Anti-doublons PERSISTANT : empreintes déjà importées (même entreprise + profil),
+      // hors imports annulés / hors ce job. Permet l'import incrémental d'un même mois.
+      const existing = await pool.query(
+        `SELECT DISTINCT r.fingerprint FROM import_rows r JOIN import_jobs j ON j.id=r.job_id
+          WHERE r.company_id=$1 AND j.import_type=$2 AND j.status='imported'
+            AND r.status='imported' AND r.fingerprint IS NOT NULL AND j.id<>$3`,
+        [companyId, job.import_type, job.id]
+      );
+      options.existingFingerprints = new Set(existing.rows.map((x) => x.fingerprint));
       const result = ic.validate(analysis, job.import_type, mapping, companyId, options);
 
       await pool.query(`DELETE FROM import_rows WHERE job_id=$1`, [job.id]);

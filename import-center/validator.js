@@ -14,12 +14,15 @@ function fingerprint(companyId, profile, mapped) {
 
 /**
  * @param items  [{ __row, raw, mapped }]
+ * @param options.existingFingerprints Set d'empreintes DÉJÀ importées en base
+ *   (anti-doublons persistant / import incrémental).
  * @returns { rows: [{__row, mapped, fingerprint, status, messages}], summary }
  */
 function validateRows(items, profile, companyId, options = {}) {
-  const seen = new Map(); // fingerprint -> premier __row
+  const seen = new Map(); // fingerprint -> premier __row (intra-fichier)
+  const existing = options.existingFingerprints instanceof Set ? options.existingFingerprints : new Set(options.existingFingerprints || []);
   const out = [];
-  let valid = 0, invalid = 0, warnings = 0, duplicates = 0;
+  let valid = 0, invalid = 0, warnings = 0, duplicates = 0, existingCount = 0;
 
   for (const it of items) {
     const messages = [];
@@ -41,7 +44,11 @@ function validateRows(items, profile, companyId, options = {}) {
     let status;
     const hasError = messages.some((m) => m.severity === "error");
     if (hasError) { status = "invalid"; invalid++; }
-    else if (seen.has(fp)) {
+    else if (existing.has(fp)) {
+      // Déjà présent en base (import précédent) : import incrémental -> ignoré.
+      status = "duplicate"; duplicates++; existingCount++;
+      messages.push({ code: "ALREADY_IMPORTED", message: "Ligne déjà importée lors d'un import précédent.", severity: "warning" });
+    } else if (seen.has(fp)) {
       status = "duplicate"; duplicates++;
       messages.push({ code: "DUPLICATE_IN_FILE", message: `Doublon dans le fichier (ligne ${seen.get(fp)}).`, severity: "warning" });
     } else {
@@ -59,6 +66,8 @@ function validateRows(items, profile, companyId, options = {}) {
     summary: {
       total: items.length,
       valid, invalid, warnings, duplicates,
+      existing: existingCount,   // déjà importées (import incrémental)
+      new: valid,                // nouvelles lignes réellement importables
     },
   };
 }
