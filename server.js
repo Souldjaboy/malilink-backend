@@ -9,6 +9,8 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+/* Contrat public du catalogue : liste blanche des champs indexables. */
+const publicCatalog = require("./services/public-catalog");
 require("dotenv").config();
 
 let webPush = null;
@@ -9961,22 +9963,26 @@ app.get("/marketplace/products", async (req, res) => {
       where += ` AND COALESCE(NULLIF(mp.public_price,0), mp.price, 0) <= $${values.length}`;
     }
 
+    /* Route PUBLIQUE : mêmes règles que la fiche. Aucun `mp.*`. */
     const result = await pool.query(
-      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+      `SELECT mp.id, mp.company_id, mp.category, mp.slug, mp.created_at, mp.updated_at,
+              mp.image_url, mp.images,
+              COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
               COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
               COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-              p.reference, p.name AS product_name, p.stock,
-              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
-              c.name AS vendor_name
+              mp.available_quantity, mp.available_stock,
+              p.reference, p.stock, c.name AS vendor_name,
+              cpp.slug AS vendor_slug, cpp.city AS vendor_city, cpp.quartier AS vendor_quartier
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        LEFT JOIN companies c ON c.id=mp.company_id
+       LEFT JOIN company_public_profile cpp ON cpp.company_id=mp.company_id
        ${where}
        ORDER BY mp.id DESC
        LIMIT 100`,
       values
     );
-    res.json(result.rows);
+    res.json(result.rows.map(publicCatalog.publicProduct));
   } catch (error) {
     console.error("ERREUR MARKETPLACE PRODUCTS :", error);
     res.status(500).json({ error: "Erreur lecture produits marketplace" });
@@ -9985,23 +9991,29 @@ app.get("/marketplace/products", async (req, res) => {
 
 app.get("/marketplace/products/:id", async (req, res) => {
   try {
+    /* Route PUBLIQUE : ni `mp.*`, ni emplacement, ni entrepôt, ni niveau de
+       stock. Le stock interne n'est lu que pour en déduire une disponibilité,
+       et publicProduct ne le laisse pas ressortir. */
     const result = await pool.query(
-      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+      `SELECT mp.id, mp.company_id, mp.category, mp.slug, mp.created_at, mp.updated_at,
+              mp.image_url, mp.images,
+              COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
               COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
               COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
-              p.reference, p.name AS product_name, p.stock, p.minimum_stock,
-              p.location_code, p.warehouse, c.name AS vendor_name
+              mp.available_quantity, mp.available_stock,
+              p.reference, p.stock, c.name AS vendor_name,
+              cpp.slug AS vendor_slug, cpp.city AS vendor_city, cpp.quartier AS vendor_quartier
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        LEFT JOIN companies c ON c.id=mp.company_id
+       LEFT JOIN company_public_profile cpp ON cpp.company_id=mp.company_id
        WHERE mp.id=$1
          AND (mp.status='published' OR mp.is_published=true)
        LIMIT 1`,
-      [req.params.id]
+      [Number(req.params.id) || 0]
     );
     if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    res.json(result.rows[0]);
+    res.json(publicCatalog.publicProduct(result.rows[0]));
   } catch (error) {
     console.error("ERREUR MARKETPLACE PRODUCT DETAIL :", error);
     res.status(500).json({ error: "Erreur détail produit marketplace" });
@@ -10011,6 +10023,10 @@ app.get("/marketplace/products/:id", async (req, res) => {
 /* ---------- Catalogue central MaliLink (Lot A) — offres transverses ----------
    Agrège les offres PUBLIÉES de tous les modules (Voyage d'abord). Public,
    additif : ne modifie pas les endpoints /marketplace/products existants. */
+/* Surface publique indexable (SEO) : lecture seule, sans authentification.
+   Toutes ses réponses passent par la liste blanche de public-catalog. */
+app.use("/", require("./routes/public-seo")({ pool }));
+
 const catalogService = require("./services/catalog");
 
 // Arbre des catégories (Voyages et réservations + sous-catégories, etc.)
