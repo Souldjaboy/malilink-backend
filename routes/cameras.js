@@ -133,7 +133,7 @@ module.exports = function createCamerasRouter(deps) {
 
   /* Les sites sont les entrepôts de la société (quel que soit leur type),
      plus les bureaux et sièges créés ici, hors stock. */
-  router.get("/cameras/sites", authenticateToken, perm("cameras", "view"), async (req, res) => {
+  router.get("/cameras/sites", authenticateToken, perm("cameras.sites", "view"), async (req, res) => {
     try {
       const { rows } = await pool.query(
         `SELECT w.id, w.code, w.name, w.type, w.address, w.status,

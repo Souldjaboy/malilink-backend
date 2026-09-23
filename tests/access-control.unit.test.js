@@ -180,6 +180,23 @@ test("chaque préfixe d'API renvoie au bon module", () => {
   assert.strictEqual(access.ruleForPath("/travel/search"), null, "voyage côté voyageur non gardé");
   assert.strictEqual(access.ruleForPath("/travel/partner/routes").module, "voyage");
   assert.strictEqual(access.ruleForPath("/productsX"), null, "préfixe exact, pas une sous-chaîne");
+  assert.strictEqual(access.ruleForPath("/marketing/publications/4/publier").module, "marketing.publications");
+  assert.strictEqual(access.ruleForPath("/marketing/tableau-de-bord").module, "marketing");
+  assert.strictEqual(access.ruleForPath("/cameras/journal").module, "cameras.identifiants");
+});
+
+test("un « Valider » accordé sur un sous-module suffit, même si le parent ne le porte pas", () => {
+  const c = ctx({
+    role: "community_manager",
+    // Marketing est une option : ouvert ici par décision du super-admin.
+    companyRows: new Map([["marketing", { enabled: true, source: "super_admin" }]]),
+    permRows: new Map([
+      ["marketing", { can_view: true, can_validate: false }],
+      ["marketing.publications", { can_view: true, can_validate: true }],
+    ]),
+  });
+  assert.strictEqual(access.effectiveAccess(c, "marketing.publications", "validate").allowed, true);
+  assert.strictEqual(access.effectiveAccess(c, "marketing", "validate").allowed, false);
 });
 
 test("l'action vient de la méthode, ou du dernier segment", () => {
@@ -190,6 +207,10 @@ test("l'action vient de la méthode, ou du dernier segment", () => {
   assert.strictEqual(access.actionForRequest("POST", "/pos/sales/4/cancel"), "cancel");
   assert.strictEqual(access.actionForRequest("GET", "/documents/4/pdf"), "print");
   assert.strictEqual(access.actionForRequest("POST", "/import"), "import");
+  assert.strictEqual(access.actionForRequest("POST", "/marketing/publications/4/publier"), "validate");
+  assert.strictEqual(access.actionForRequest("POST", "/marketing/campagnes/2/statut"), "validate");
+  assert.strictEqual(access.actionForRequest("POST", "/cameras/9/verifier"), "update");
+  assert.strictEqual(access.actionForRequest("POST", "/marketing/publications/4/medias"), "update");
 });
 
 console.log(`\n✅ ${passes} tests du moteur d'accès passés.`);

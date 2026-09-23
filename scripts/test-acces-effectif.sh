@@ -11,6 +11,7 @@ export JWT_SECRET="${JWT_SECRET:-secret-de-test-acces-effectif-2026}"
 export DATABASE_URL="postgresql://postgres:malilink_test_password@127.0.0.1:5434/${BASE_NOM}"
 export DEFAULT_TENANT_ID=malilink
 export NODE_ENV=test
+export TZ="${TZ:-Europe/Paris}"   # hors UTC : un décalage de fuseau ne passe pas inaperçu
 
 docker exec malilink-postgres-test psql -U postgres -qc "DROP DATABASE IF EXISTS ${BASE_NOM};" >/dev/null
 docker exec malilink-postgres-test psql -U postgres -qc "CREATE DATABASE ${BASE_NOM};" >/dev/null

@@ -11,6 +11,9 @@ export JWT_SECRET="${JWT_SECRET:-secret-de-test-integration-2026}"
 export DATABASE_URL="postgresql://postgres:malilink_test_password@127.0.0.1:5434/${BASE_NOM}"
 export DEFAULT_TENANT_ID=malilink
 export NODE_ENV=test
+# Serveur volontairement hors UTC : un décalage de fuseau (dates, heures
+# programmées) ferait échouer les tests au lieu de passer inaperçu au Mali (UTC+0).
+export TZ="${TZ:-Europe/Paris}"
 docker exec malilink-postgres-test psql -U postgres -qc "DROP DATABASE IF EXISTS ${BASE_NOM};" >/dev/null 2>&1
 docker exec malilink-postgres-test psql -U postgres -qc "CREATE DATABASE ${BASE_NOM};" >/dev/null
 node scripts/migrate.js >"/tmp/${BASE_NOM}-migrations.log" 2>&1 || { echo "migrations en échec"; tail -20 "/tmp/${BASE_NOM}-migrations.log"; exit 1; }

@@ -471,6 +471,17 @@ const API_ROUTE_RULES = [
   { prefix: "/marketplace/vendor", module: "marketplace", readAlso: ["commandes_recues"] },
   { prefix: "/cameras", module: "cameras" },
   { prefix: "/marketing", module: "marketing" },
+  /* Sous-modules : le droit accordé sur un sous-module (ex. « Valider » sur
+     marketing.publications) doit suffire, même si le parent ne porte pas
+     cette action. Pas d'élargissement de lecture ici : un « Voir » refusé
+     sur le sous-module doit tenir. */
+  { prefix: "/marketing/publications", module: "marketing.publications" },
+  { prefix: "/marketing/medias", module: "marketing.publications" },
+  { prefix: "/marketing/campagnes", module: "marketing.campagnes" },
+  { prefix: "/marketing/comptes", module: "marketing.comptes" },
+  { prefix: "/cameras/sites", module: "cameras.sites" },
+  { prefix: "/cameras/enregistreurs", module: "cameras.enregistreurs" },
+  { prefix: "/cameras/journal", module: "cameras.identifiants" },
 ];
 
 // Le préfixe le plus long l'emporte (/marketplace/vendor avant /marketplace).
@@ -491,6 +502,10 @@ const SEGMENT_ACTIONS = [
   [/^(cancel|annuler|annulation|void)$/, "cancel"],
   [/^(validate|valider|validation|approve|approuver)$/, "validate"],
   [/^(share|partager|email|whatsapp)$/, "share"],
+  // Publier une publication, faire avancer une campagne : « Valider ».
+  [/^(publier|publish|statut|echec)$/, "validate"],
+  // Tester une caméra, ajouter un média à une publication : « Modifier ».
+  [/^(verifier|tester|medias)$/, "update"],
 ];
 
 function actionForRequest(method, path) {
