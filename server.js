@@ -19153,6 +19153,15 @@ app.use(
   })
 );
 
+// Modules génériques « Caméras & Sécurité » et « Marketing & Réseaux sociaux ».
+// Fermés par défaut pour toutes les sociétés (migration 074) : ils
+// n'apparaissent que chez celles qui les ont explicitement activés.
+const createCamerasRouter = require("./routes/cameras");
+app.use("/", createCamerasRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
+
+const createMarketingRouter = require("./routes/marketing");
+app.use("/", createMarketingRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
+
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
   console.log(`Backend sécurisé démarré sur le port ${listenPort} (HTTP + Socket.io)`);
