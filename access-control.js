@@ -539,6 +539,7 @@ const PAGE_ROUTE_RULES = [
   ["/automobile", "automobile"], ["/laboratoire", "laboratoire"], ["/travel/partenaire", "voyage"],
   ["/livreur", "livraison"], ["/client/livraison", "livraison"],
   ["/cameras", "cameras"], ["/marketing", "marketing"],
+  ["/parametres/profil-public", "parametres"],
 ];
 
 module.exports = {

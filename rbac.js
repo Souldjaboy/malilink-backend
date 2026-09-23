@@ -49,7 +49,8 @@ const SUBMODULES = {
   ia: ["assistant", "social", "chat", "notifications", "recherche", "reunions"],
   // Modules génériques optionnels
   cameras: ["sites", "enregistreurs", "identifiants", "visualisation"],
-  marketing: ["comptes", "publications", "campagnes", "profil_public"],
+  // Le profil public MaliLink relève de « Paramètres » (toutes offres), pas du marketing.
+  marketing: ["comptes", "publications", "campagnes"],
   // Triangle WMS Pro (logistique / entrepôt / ressources humaines)
   logistique: ["mouvements", "transferts", "demandes", "reception", "expedition", "inventaire"],
   rh: ["employes", "contrats", "conges", "paie", "pointage"],

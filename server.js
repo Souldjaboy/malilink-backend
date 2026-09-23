@@ -10129,7 +10129,9 @@ app.get("/marketplace/products", async (req, res) => {
               COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
               mp.available_quantity, mp.available_stock,
               p.reference, p.stock, c.name AS vendor_name,
-              cpp.slug AS vendor_slug, cpp.city AS vendor_city, cpp.quartier AS vendor_quartier
+              CASE WHEN cpp.is_public THEN cpp.slug END AS vendor_slug,
+              CASE WHEN cpp.is_public THEN cpp.city END AS vendor_city,
+              CASE WHEN cpp.is_public THEN cpp.quartier END AS vendor_quartier
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        LEFT JOIN companies c ON c.id=mp.company_id
@@ -10159,7 +10161,9 @@ app.get("/marketplace/products/:id", async (req, res) => {
               COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
               mp.available_quantity, mp.available_stock,
               p.reference, p.stock, c.name AS vendor_name,
-              cpp.slug AS vendor_slug, cpp.city AS vendor_city, cpp.quartier AS vendor_quartier
+              CASE WHEN cpp.is_public THEN cpp.slug END AS vendor_slug,
+              CASE WHEN cpp.is_public THEN cpp.city END AS vendor_city,
+              CASE WHEN cpp.is_public THEN cpp.quartier END AS vendor_quartier
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        LEFT JOIN companies c ON c.id=mp.company_id
@@ -19396,6 +19400,11 @@ app.use("/", createCamerasRouter({ pool, authenticateToken, getEffectiveCompanyI
 
 const createMarketingRouter = require("./routes/marketing");
 app.use("/", createMarketingRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
+
+// Profil public MaliLink (opt-in) : l'entreprise l'édite ici ; la lecture
+// publique (page /boutique, annuaire, sitemap) est dans routes/public-seo.
+const createProfilPublicRouter = require("./routes/profil-public");
+app.use("/", createProfilPublicRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
 
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {

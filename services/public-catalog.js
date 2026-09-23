@@ -17,6 +17,8 @@
  * sur l'activité du vendeur. On n'expose donc qu'une disponibilité.
  */
 
+const access = require("../access-control");
+
 /* Champs internes qui ne doivent jamais franchir la frontière publique.
    Sert uniquement d'assertion de test : le code de production, lui,
    construit la réponse par liste blanche. */
@@ -140,6 +142,82 @@ function publicProduct(row) {
   };
 }
 
+/* Réseaux acceptés sur un profil public, avec les domaines qui font foi.
+   Un lien « Facebook » qui mène ailleurs que sur Facebook serait un piège
+   pour le visiteur : le domaine est vérifié à l'écriture ET à la lecture. */
+const RESEAUX_PUBLICS = {
+  facebook: { label: "Facebook", domaines: ["facebook.com", "fb.com"] },
+  instagram: { label: "Instagram", domaines: ["instagram.com"] },
+  tiktok: { label: "TikTok", domaines: ["tiktok.com"] },
+  whatsapp: { label: "WhatsApp", domaines: ["wa.me", "whatsapp.com"] },
+  linkedin: { label: "LinkedIn", domaines: ["linkedin.com"] },
+  x: { label: "X", domaines: ["x.com", "twitter.com"] },
+  snapchat: { label: "Snapchat", domaines: ["snapchat.com"] },
+  youtube: { label: "YouTube", domaines: ["youtube.com", "youtu.be"] },
+  google_business: { label: "Google Business Profile", domaines: ["g.page", "google.com", "goo.gl"] },
+};
+
+/** L'URL https normalisée si elle pointe bien vers le réseau annoncé, sinon null. */
+function lienReseau(cle, valeur) {
+  const reseau = RESEAUX_PUBLICS[cle];
+  const brut = String(valeur ?? "").trim();
+  if (!reseau || !brut || brut.length > 300) return null;
+  try {
+    const u = new URL(brut);
+    if (u.protocol !== "https:" || u.username || u.password) return null;
+    const hote = u.hostname.toLowerCase();
+    const ok = reseau.domaines.some((d) => hote === d || hote.endsWith(`.${d}`));
+    return ok ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Uniquement les réseaux connus, aux liens vérifiés. */
+function reseauxPublics(brut) {
+  const source = brut && typeof brut === "object" && !Array.isArray(brut) ? brut : {};
+  const out = {};
+  for (const cle of Object.keys(RESEAUX_PUBLICS)) {
+    const lien = lienReseau(cle, source[cle]);
+    if (lien) out[cle] = lien;
+  }
+  return out;
+}
+
+/** Services saisis par l'entreprise : nom obligatoire, textes bornés. */
+function servicesPublics(brut) {
+  const liste = Array.isArray(brut) ? brut : [];
+  return liste
+    .map((s) => ({
+      name: String(s?.name ?? "").trim().slice(0, 80),
+      description: String(s?.description ?? "").trim().slice(0, 300),
+    }))
+    .filter((s) => s.name)
+    .slice(0, 20);
+}
+
+/** Début d'un texte, coupé sur un mot. */
+function extraitTexte(texte, longueur = 200) {
+  const t = String(texte ?? "").replace(/\s+/g, " ").trim();
+  if (t.length <= longueur) return t;
+  const coupe = t.slice(0, longueur);
+  const espace = coupe.lastIndexOf(" ");
+  return `${(espace > longueur * 0.6 ? coupe.slice(0, espace) : coupe).trim()}…`;
+}
+
+/** Horaires : un texte libre saisi par l'entreprise, jamais un objet interne. */
+function horairesPublics(brut) {
+  return typeof brut === "string" ? brut.trim().slice(0, 300) : "";
+}
+
+/* Type d'activité lisible. Le registre des profils métier est la seule
+   source : pas de seconde liste de libellés. */
+function activitePublique(businessType) {
+  const cle = access.normalizeBusinessType(businessType);
+  const profil = access.BUSINESS_PROFILES[cle] || access.BUSINESS_PROFILES.autre;
+  return { key: cle, label: profil?.label || "Entreprise" };
+}
+
 /**
  * Le profil public d'une entreprise. Téléphone et email ne sortent que si
  * l'entreprise a explicitement coché de les afficher.
@@ -160,16 +238,21 @@ function publicCompany(row) {
     address_line: row.address_line || "",
     latitude: row.latitude != null ? Number(row.latitude) : null,
     longitude: row.longitude != null ? Number(row.longitude) : null,
-    opening_hours: row.opening_hours || null,
+    opening_hours: horairesPublics(row.opening_hours),
     phone: row.show_phone ? row.public_phone || "" : "",
     email: row.show_email ? row.public_email || "" : "",
+    social_links: reseauxPublics(row.social_links),
+    services: servicesPublics(row.services),
+    activity: activitePublique(row.business_type),
+    products_public: row.show_products === true,
     url: companyPath(row),
     updated_at: row.updated_at || null,
   };
 }
 
 module.exports = {
-  CHAMPS_INTERNES_INTERDITS,
+  CHAMPS_INTERNES_INTERDITS, RESEAUX_PUBLICS,
   slugify, productPath, companyPath, idFromSlugParam,
   imageList, normaliserImage, availability, publicProduct, publicCompany,
+  lienReseau, reseauxPublics, servicesPublics, horairesPublics, activitePublique, extraitTexte,
 };

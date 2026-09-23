@@ -64,9 +64,9 @@ async function jeuDeDonnees() {
   await pool.query(
     `INSERT INTO company_public_profile
        (company_id,slug,description,country,region,city,quartier,address_line,
-        public_phone,public_email,is_public,show_phone,show_email)
+        public_phone,public_email,is_public,show_phone,show_email,show_products)
      VALUES ($1,'vitrine-test','Quincaillerie de test.','Mali','District de Bamako',
-             'Bamako','Sotuba','Rue 123','+22300000000','vitrine@test.local',true,true,false)
+             'Bamako','Sotuba','Rue 123','+22300000000','vitrine@test.local',true,true,false,true)
      ON CONFLICT (company_id) DO NOTHING`,
     [CIE]
   );
@@ -146,6 +146,12 @@ async function main() {
     verifier("email masqué car non autorisé", e.email === "");
     verifier("URL de vitrine, pas /partenaires", e.url === "/boutique/vitrine-test", e.url);
     verifier("seul le produit actif est listé", (corps.products || []).length === 1);
+
+    // Les produits ne s'affichent sur la vitrine que si l'entreprise l'a choisi.
+    await pool.query(`UPDATE company_public_profile SET show_products=false WHERE company_id=$1`, [CIE]);
+    const sans = await lire("/public/companies/vitrine-test");
+    verifier("produits masqués quand l'entreprise ne les montre pas", (sans.corps.products || []).length === 0);
+    await pool.query(`UPDATE company_public_profile SET show_products=true WHERE company_id=$1`, [CIE]);
   }
 
   console.log("\nINDEXABILITÉ — le sitemap ne contient que du publiable");

@@ -9,7 +9,9 @@
  * interne ne peut sortir d'ici, y compris après ajout d'une colonne.
  *
  *   GET /public/products/:id          fiche produit publiée
- *   GET /public/companies/:slugOrId   profil public d'entreprise + ses produits
+ *   GET /public/companies             annuaire : profils publics ET listés
+ *   GET /public/companies/:slugOrId   profil public d'entreprise (+ ses
+ *                                     produits si elle a choisi de les montrer)
  *   GET /public/categories            catégories réellement portées par des
  *                                     produits publiés
  *   GET /public/sitemap               tout ce qui est indexable, avec lastmod
@@ -31,7 +33,9 @@ const PRODUIT_PUBLIC = `
   AND p.is_active IS NOT FALSE`;
 
 /* Les colonnes lues : jamais `mp.*`. Le stock interne est chargé uniquement
-   pour calculer une disponibilité, et ne franchit pas le DTO. */
+   pour calculer une disponibilité, et ne franchit pas le DTO.
+   Le profil de l'entreprise (slug, ville, quartier) ne sort que s'il est
+   publié : un brouillon de profil n'a rien à faire sur une fiche produit. */
 const CHAMPS_PRODUIT = `
   mp.id, mp.company_id, mp.category, mp.slug, mp.created_at, mp.updated_at,
   mp.image_url, mp.images,
@@ -41,7 +45,9 @@ const CHAMPS_PRODUIT = `
   mp.available_quantity, mp.available_stock,
   p.reference, p.stock,
   c.name AS vendor_name,
-  cpp.slug AS vendor_slug, cpp.city AS vendor_city, cpp.quartier AS vendor_quartier`;
+  CASE WHEN cpp.is_public THEN cpp.slug END     AS vendor_slug,
+  CASE WHEN cpp.is_public THEN cpp.city END     AS vendor_city,
+  CASE WHEN cpp.is_public THEN cpp.quartier END AS vendor_quartier`;
 
 const JOINTURES = `
   FROM marketplace_products mp
@@ -73,6 +79,99 @@ module.exports = function createPublicSeoRouter({ pool }) {
   });
 
   /**
+   * Annuaire des entreprises MaliLink.
+   *
+   * N'y figurent que les entreprises actives qui ont publié leur profil ET
+   * accepté d'apparaître dans l'annuaire. Filtres : `q` (nom, description,
+   * services), `ville`, `activite` (clé de profil métier), `page`.
+   *
+   * Le type d'activité se déduit du registre des profils métier, en
+   * JavaScript : on lit donc l'ensemble borné des profils publics, puis on
+   * filtre et pagine. Au-delà de quelques milliers d'entreprises publiques,
+   * il faudra stocker la clé de profil pour filtrer en SQL.
+   */
+  router.get("/public/companies", async (req, res) => {
+    try {
+      const q = String(req.query.q || "").trim().slice(0, 80).toLowerCase();
+      const ville = String(req.query.ville || "").trim().slice(0, 80).toLowerCase();
+      const activite = String(req.query.activite || "").trim().slice(0, 40).toLowerCase();
+      const parPage = Math.min(Math.max(Number(req.query.limit) || 24, 1), 48);
+      const page = Math.max(Math.floor(Number(req.query.page) || 1), 1);
+
+      const { rows } = await pool.query(
+        `SELECT cpp.*, c.name, c.business_type,
+                CASE WHEN cpp.show_products THEN (
+                  SELECT count(*)::int
+                    FROM marketplace_products mp
+                    LEFT JOIN products p ON p.id = mp.product_id
+                   WHERE mp.company_id = cpp.company_id AND ${PRODUIT_PUBLIC}
+                ) ELSE 0 END AS produits_publics
+           FROM company_public_profile cpp
+           JOIN companies c ON c.id = cpp.company_id
+          WHERE cpp.is_public = true
+            AND cpp.listed_in_directory = true
+            AND c.status = 'active'
+          ORDER BY cpp.published_at DESC NULLS LAST, cpp.updated_at DESC, cpp.company_id DESC
+          LIMIT 5000`
+      );
+
+      const fiches = rows.map((r) => ({ ...catalogue.publicCompany(r), products_count: r.produits_publics || 0 }));
+
+      // Facettes calculées sur l'annuaire entier : on ne propose que ce qui existe.
+      const villes = new Map();
+      const activites = new Map();
+      for (const f of fiches) {
+        if (f.city) {
+          const k = f.city.toLowerCase();
+          villes.set(k, { name: villes.get(k)?.name || f.city, total: (villes.get(k)?.total || 0) + 1 });
+        }
+        const a = activites.get(f.activity.key) || { key: f.activity.key, label: f.activity.label, total: 0 };
+        a.total += 1;
+        activites.set(f.activity.key, a);
+      }
+
+      const retenues = fiches.filter((f) => {
+        if (ville && f.city.toLowerCase() !== ville) return false;
+        if (activite && f.activity.key !== activite) return false;
+        if (q) {
+          const texte = [f.name, f.description, f.city, f.quartier, ...f.services.map((s) => s.name)]
+            .join(" ").toLowerCase();
+          if (!texte.includes(q)) return false;
+        }
+        return true;
+      });
+
+      const total = retenues.length;
+      const debut = (page - 1) * parPage;
+      res.json({
+        companies: retenues.slice(debut, debut + parPage).map((f) => ({
+          company_id: f.company_id,
+          slug: f.slug,
+          name: f.name,
+          description: catalogue.extraitTexte(f.description, 220),
+          logo_url: f.logo_url,
+          city: f.city,
+          quartier: f.quartier,
+          activity: f.activity,
+          phone: f.phone,
+          services: f.services.slice(0, 4).map((s) => s.name),
+          products_count: f.products_public ? f.products_count : 0,
+          url: f.url,
+          updated_at: f.updated_at,
+        })),
+        total,
+        page,
+        pages: Math.max(Math.ceil(total / parPage), 1),
+        per_page: parPage,
+        facets: {
+          cities: [...villes.values()].sort((a, b) => b.total - a.total || a.name.localeCompare(b.name, "fr")),
+          activities: [...activites.values()].sort((a, b) => b.total - a.total || a.label.localeCompare(b.label, "fr")),
+        },
+      });
+    } catch (e) { echec(res, e, "Erreur lecture de l'annuaire."); }
+  });
+
+  /**
    * Profil public d'entreprise. Accepte le slug ou l'identifiant, pour que les
    * anciens liens `/partenaires/<id>` continuent de fonctionner.
    */
@@ -82,7 +181,7 @@ module.exports = function createPublicSeoRouter({ pool }) {
       const id = Number(brut) || 0;
 
       const { rows } = await pool.query(
-        `SELECT cpp.*, c.name
+        `SELECT cpp.*, c.name, c.business_type
            FROM company_public_profile cpp
            JOIN companies c ON c.id = cpp.company_id
           WHERE cpp.is_public = true
@@ -94,6 +193,9 @@ module.exports = function createPublicSeoRouter({ pool }) {
       if (!rows[0]) return res.status(404).json({ error: "Entreprise introuvable." });
 
       const entreprise = catalogue.publicCompany(rows[0]);
+      // Les produits ne s'affichent sur la page que si l'entreprise l'a choisi.
+      if (!entreprise.products_public) return res.json({ company: entreprise, products: [] });
+
       const { rows: produits } = await pool.query(
         `SELECT ${CHAMPS_PRODUIT} ${JOINTURES}
           WHERE mp.company_id = $1 AND ${PRODUIT_PUBLIC}
