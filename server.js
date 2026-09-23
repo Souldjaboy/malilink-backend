@@ -13381,6 +13381,14 @@ app.get("/warehouses", authenticateToken, async (req, res) => {
       values.push(companyId);
     }
 
+    /* Un bureau ou un siège créé pour y rattacher des caméras n'est pas un
+       lieu de stock : il n'apparaît pas dans les listes du stock, sauf
+       demande explicite (?tous=1). */
+    if (req.query.tous !== "1") {
+      query += values.length ? ` AND ` : ` WHERE `;
+      query += ` COALESCE(is_stock_visible, TRUE) = TRUE `;
+    }
+
     query += ` ORDER BY id DESC`;
 
     const result = await pool.query(query, values);

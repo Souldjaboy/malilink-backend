@@ -119,7 +119,17 @@ const ROLE_SCOPES = {
   teacher: ["education", "education.cours", "education.notes", "education.presences", "education.eleves", "education.classes", "education.emploi_du_temps"],
   laborantin: ["laboratoire"],
   receptionniste: ["reservations", "rendez_vous", "immobilier", "laboratoire", "restaurant"],
+  securite: ["cameras"],
+  agent_securite: ["cameras"],
+  marketing: ["marketing"],
+  community_manager: ["marketing"],
 };
+
+/* Modules sensibles : pour un rôle qui n'est ni direction ni dans leur
+   périmètre, le défaut est AUCUN accès — pas même « Voir ». Un magasinier ne
+   voit pas les caméras, un caissier ne gère pas les réseaux sociaux, sauf
+   droit accordé explicitement dans « Droits & permissions ». */
+const SENSITIVE_MODULES = new Set(["cameras", "marketing"]);
 
 const WRITE_ACTIONS = new Set(["view", "create", "update", "export", "print"]);
 
@@ -132,9 +142,16 @@ function defaultPermissionsForRole(role, moduleKey) {
   const grant = (all) => ACTIONS.reduce((acc, a) => { acc[a] = all === true ? true : (all === "write" ? WRITE_ACTIONS.has(a) : a === "view"); return acc; }, {});
 
   if (FULL_ACCESS_ROLES.has(r)) return grant(true);
+
+  const racine = String(moduleKey || "").split(".")[0];
+  const scope = ROLE_SCOPES[r];
+  if (SENSITIVE_MODULES.has(racine)) {
+    const autorise = Array.isArray(scope) && scope.includes(racine);
+    return autorise ? grant("write") : ACTIONS.reduce((acc, a) => { acc[a] = false; return acc; }, {});
+  }
+
   if (READONLY_ROLES.has(r)) return grant(false); // view only
 
-  const scope = ROLE_SCOPES[r];
   if (scope) {
     /* Le périmètre d'un rôle est exprimé en clés courtes (pos, stocks…) alors
        que le registre est hiérarchique (commerce.pos, commerce.stocks…). Sans
