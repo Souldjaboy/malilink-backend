@@ -47,6 +47,9 @@ const SUBMODULES = {
   finance: ["wallet", "finance", "comptabilite", "rapports", "documents", "activites"],
   administration: ["utilisateurs", "parametres", "entrepots", "emplacements", "pointage", "badges", "alertes", "support", "import", "super_admin"],
   ia: ["assistant", "social", "chat", "notifications", "recherche", "reunions"],
+  // Modules génériques optionnels
+  cameras: ["sites", "enregistreurs", "identifiants", "visualisation"],
+  marketing: ["comptes", "publications", "campagnes", "profil_public"],
   // Triangle WMS Pro (logistique / entrepôt / ressources humaines)
   logistique: ["mouvements", "transferts", "demandes", "reception", "expedition", "inventaire"],
   rh: ["employes", "contrats", "conges", "paie", "pointage"],
@@ -58,6 +61,7 @@ const MODULE_LABELS = {
   immobilier: "Immobilier / Hôtel", automobile: "Automobile", education: "Éducation",
   laboratoire: "Laboratoire", finance: "Finance / Gestion", administration: "Administration",
   ia: "IA / Communication", logistique: "Logistique / Entrepôt", rh: "Ressources humaines",
+  cameras: "Caméras & Sécurité", marketing: "Marketing & Réseaux sociaux",
 };
 
 /** Toutes les clés (modules + sous-modules) connues. */
@@ -132,7 +136,13 @@ function defaultPermissionsForRole(role, moduleKey) {
 
   const scope = ROLE_SCOPES[r];
   if (scope) {
-    const inScope = scope.some((k) => k === moduleKey || moduleKey.startsWith(`${k}.`) || k.startsWith(`${moduleKey}.`));
+    /* Le périmètre d'un rôle est exprimé en clés courtes (pos, stocks…) alors
+       que le registre est hiérarchique (commerce.pos, commerce.stocks…). Sans
+       comparer aussi la partie enfant, un caissier n'avait même pas « Créer »
+       sur commerce.pos par défaut. */
+    const enfant = moduleKey.includes(".") ? moduleKey.split(".")[1] : null;
+    const inScope = scope.some((k) => k === moduleKey || k === enfant
+      || moduleKey.startsWith(`${k}.`) || k.startsWith(`${moduleKey}.`));
     return inScope ? grant("write") : grant(false); // hors périmètre -> lecture seule
   }
   // Rôle standard / inconnu : lecture + création/édition, pas de suppression.

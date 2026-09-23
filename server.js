@@ -1332,8 +1332,13 @@ const COMPANY_MODULE_KEYS = [
   "social"
 ];
 
+/* Modules effectivement actifs pour une société (niveau société seul :
+   profil métier, plan, company_modules, dérogations super-admin). Sert à la
+   réponse de connexion et au cookie lu par le middleware du frontend.
+   Ancienne règle « pas de ligne = actif » : c'est elle qui ouvrait toutes les
+   verticales. La décision passe désormais par access-control.js. */
 async function getCompanyModules(companyId) {
-  const moduleKeys = COMPANY_MODULE_KEYS;
+  const moduleKeys = [...new Set([...COMPANY_MODULE_KEYS, ...access.MODULE_CATALOG.map((m) => m.key)])];
 
   if (!companyId) {
     return moduleKeys.reduce((acc, key) => {
@@ -1342,60 +1347,29 @@ async function getCompanyModules(companyId) {
     }, {});
   }
 
-  let result = { rows: [] };
-
-  try {
-    result = await pool.query(
-      `SELECT module_key, is_enabled
-       FROM company_modules
-       WHERE company_id=$1`,
-      [companyId]
-    );
-  } catch (error) {
-    console.error("Erreur lecture modules entreprise :", error.message || error);
-  }
-
+  const ctx = await access.loadAccessContext(pool, { companyId });
   return moduleKeys.reduce((acc, key) => {
-    const configured = result.rows.find((item) => item.module_key === key);
-    acc[key] = configured ? configured.is_enabled === true : true;
+    acc[key] = access.companyModuleState(ctx, key).enabled;
     return acc;
   }, {});
 }
 
 /* ============================================================
-   RBAC — APPLICATION BACKEND (modules, sous-modules, permissions)
+   CONTRÔLE D'ACCÈS — application backend
    ------------------------------------------------------------
-   Sécurité réelle côté serveur. Règle d'or : DÉFAUT = AUTORISÉ
-   (aucune ligne = actif) → aucune régression ; on ne renvoie 403
-   que sur une désactivation ou un refus EXPLICITE.
-   Priorité (PHASE 8) : module entreprise > sous-module > permission
-   utilisateur ; un refus utilisateur explicite gagne sur le rôle.
+   Toute la décision vit dans access-control.js : module de la
+   société, plan, dérogation super-admin, permission utilisateur,
+   défaut du rôle. Ce bloc ne fait que l'appliquer aux requêtes.
+
+   Deux changements de fond par rapport à l'ancienne version :
+   - les droits posés dans « Droits & permissions » (clés
+     commerce.stocks…) sont enfin lus par les gardes et le menu
+     (clés stock…), qui ne les rencontraient jamais ;
+   - en cas d'erreur, la garde REFUSE (503) au lieu de laisser
+     passer : une panne ne doit pas ouvrir les modules fermés.
    ============================================================ */
 const rbac = require("./rbac");
-
-// Clés (module/sous-module) explicitement désactivées parmi celles demandées.
-async function getDisabledKeysFor(companyId, keys) {
-  if (!companyId || !keys.length) return new Set();
-  try {
-    const { rows } = await pool.query(
-      `SELECT module_key FROM company_modules
-        WHERE company_id=$1 AND module_key = ANY($2)
-          AND COALESCE(is_enabled, enabled, TRUE) = FALSE`,
-      [companyId, keys]
-    );
-    return new Set(rows.map((r) => r.module_key));
-  } catch (error) {
-    console.error("getDisabledKeysFor:", error.message || error);
-    return new Set();
-  }
-}
-
-// Compat : un module simple est-il actif pour l'entreprise ?
-async function isCompanyModuleEnabled(companyId, moduleKey) {
-  if (!companyId || !moduleKey) return true;
-  const disabled = await getDisabledKeysFor(companyId, [moduleKey]);
-  return !disabled.has(moduleKey);
-}
+const access = require("./access-control");
 
 // Décode le jeton si présent (routes publiques → renvoie null, auth gérée ailleurs).
 function resolveRequestUser(req) {
@@ -1406,66 +1380,96 @@ function resolveRequestUser(req) {
   try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
 }
 
-// Ligne user_permissions pour la clé complète, sinon repli sur le module parent.
-async function getUserPermissionRow(userId, fullKey) {
+/* Contexte d'accès de la requête, chargé une seule fois et partagé par
+   toutes les gardes qu'elle traverse. */
+async function accessContextFor(req, user) {
+  if (req._accessCtx) return req._accessCtx;
+  req._accessCtx = await access.loadAccessContext(pool, {
+    companyId: user.company_id || getEffectiveCompanyId(req),
+    userId: user.id,
+    role: normalizeRole(user.role),
+    isSuperAdmin: isSuperAdminUser(user),
+  });
+  return req._accessCtx;
+}
+
+function refusAcces(res, verdict, key, action) {
+  const societe = verdict.level === "societe";
+  return res.status(403).json({
+    error: societe
+      ? `Module « ${key} » non disponible pour votre entreprise.`
+      : `Action « ${action} » non autorisée sur « ${key} ».`,
+    code: societe ? "MODULE_DISABLED" : "PERMISSION_DENIED",
+    module: key,
+    action,
+    reason: verdict.reason,
+  });
+}
+
+function echecControle(res, where, error) {
+  console.error(`${where}:`, error.message || error);
+  return res.status(503).json({
+    error: "Contrôle d'accès momentanément indisponible. Réessayez.",
+    code: "ACCESS_CHECK_FAILED",
+  });
+}
+
+/* Garde globale : chaque route API rattachée à un module (voir
+   access.API_ROUTE_RULES) exige l'accès effectif pour l'action déduite
+   de la méthode HTTP. Les routes publiques (sans jeton) passent : leur
+   propre authenticateToken décide. */
+async function moduleAccessGuard(req, res, next) {
+  const rule = access.ruleForPath(req.path);
+  if (!rule) return next();
+  const user = resolveRequestUser(req);
+  if (!user) return next();
+  if (isSuperAdminUser(user)) return next();
+  if (normalizeRole(user.role) === "customer") return next();
   try {
-    const { moduleKey } = rbac.splitKey(fullKey);
-    const { rows } = await pool.query(
-      `SELECT * FROM user_permissions
-        WHERE user_id=$1 AND module_key = ANY($2)
-        ORDER BY (module_key=$3) DESC LIMIT 1`,
-      [userId, [fullKey, moduleKey], fullKey]
-    );
-    return rows[0] || null;
+    const ctx = await accessContextFor(req, user);
+    if (!ctx.companyId) return next();
+    const action = access.actionForRequest(req.method, req.path);
+    let verdict = access.effectiveAccess(ctx, rule.module, action);
+    // Données de référence : un écran voisin peut les LIRE.
+    if (!verdict.allowed && action === "view" && Array.isArray(rule.readAlso)) {
+      const voisin = rule.readAlso.find((k) => access.effectiveAccess(ctx, k, "view").allowed);
+      if (voisin) verdict = { allowed: true, reason: `lecture_via_${voisin}` };
+    }
+    if (!verdict.allowed) return refusAcces(res, verdict, rule.module, action);
+    return next();
   } catch (error) {
-    console.error("getUserPermissionRow:", error.message || error);
-    return null;
+    return echecControle(res, "moduleAccessGuard", error);
   }
 }
+app.use(moduleAccessGuard);
 
 const METHOD_ACTION = {
   GET: "view", HEAD: "view", OPTIONS: "view",
   POST: "create", PUT: "update", PATCH: "update", DELETE: "delete",
 };
 
-/* Garde combinée : accès module + sous-module + permission employé
-   (action déduite de la méthode HTTP). Défaut = autorisé. */
+/* Garde d'un module ou sous-module précis (restaurant.cuisine…) ; l'action
+   est déduite de la méthode HTTP. */
 function requireModuleGuard(fullKey, opts = {}) {
-  const { moduleKey, subKey } = rbac.splitKey(fullKey);
   const checkPermission = opts.checkPermission !== false;
   return async (req, res, next) => {
+    const user = resolveRequestUser(req);
+    if (!user) return next();                    // route publique
+    if (isSuperAdminUser(user)) return next();   // super admin : accès total
     try {
-      const user = resolveRequestUser(req);
-      if (!user) return next();                    // route publique
-      if (isSuperAdminUser(user)) return next();   // super admin : accès total
-      const companyId = user.company_id || getEffectiveCompanyId(req);
-      if (!companyId) return next();
-
-      const keysToCheck = subKey ? [moduleKey, fullKey] : [moduleKey];
-      const disabled = await getDisabledKeysFor(companyId, keysToCheck);
-      const access = rbac.evaluateModuleAccess(disabled, moduleKey, subKey);
-      if (!access.allowed) {
-        return res.status(403).json({
-          error: `Module « ${access.key} » désactivé pour votre entreprise.`,
-          code: access.code, module: access.key,
-        });
+      const ctx = await accessContextFor(req, user);
+      if (!ctx.companyId) return next();
+      const action = METHOD_ACTION[req.method] || "view";
+      if (!checkPermission) {
+        const etat = access.companyModuleState(ctx, fullKey);
+        if (!etat.enabled) return refusAcces(res, { level: "societe", reason: etat.reason }, fullKey, action);
+        return next();
       }
-
-      if (checkPermission) {
-        const action = METHOD_ACTION[req.method] || "view";
-        const row = await getUserPermissionRow(user.id, fullKey);
-        const verdict = rbac.evaluateUserPermission(row, action);
-        if (!verdict.allowed) {
-          return res.status(403).json({
-            error: `Action « ${action} » non autorisée sur « ${fullKey} ».`,
-            code: "PERMISSION_DENIED", module: fullKey, action,
-          });
-        }
-      }
+      const verdict = access.effectiveAccess(ctx, fullKey, action);
+      if (!verdict.allowed) return refusAcces(res, verdict, fullKey, action);
       return next();
     } catch (error) {
-      console.error("requireModuleGuard:", error.message || error);
-      return next(); // ne jamais bloquer sur erreur de garde
+      return echecControle(res, "requireModuleGuard", error);
     }
   };
 }
@@ -1477,39 +1481,28 @@ function requireCompanyModule(moduleKey) {
 
 // Middleware explicite réutilisable : requirePermission("produits", "create").
 function requirePermission(fullKey, action) {
-  const { moduleKey, subKey } = rbac.splitKey(fullKey);
   return async (req, res, next) => {
+    const user = req.user || resolveRequestUser(req);
+    if (!user) return next();
+    if (isSuperAdminUser(user)) return next();
     try {
-      const user = req.user || resolveRequestUser(req);
-      if (!user) return next();
-      if (isSuperAdminUser(user)) return next();
-      const companyId = user.company_id || getEffectiveCompanyId(req);
-      if (!companyId) return next();
-      const disabled = await getDisabledKeysFor(companyId, subKey ? [moduleKey, fullKey] : [moduleKey]);
-      const access = rbac.evaluateModuleAccess(disabled, moduleKey, subKey);
-      if (!access.allowed) return res.status(403).json({ error: "Module désactivé.", code: access.code, module: access.key });
-      const row = await getUserPermissionRow(user.id, fullKey);
-      const verdict = rbac.evaluateUserPermission(row, action);
-      if (!verdict.allowed) return res.status(403).json({ error: `Action « ${action} » non autorisée.`, code: "PERMISSION_DENIED", module: fullKey, action });
+      const ctx = await accessContextFor(req, user);
+      if (!ctx.companyId) return next();
+      const verdict = access.effectiveAccess(ctx, fullKey, action);
+      if (!verdict.allowed) return refusAcces(res, verdict, fullKey, action);
       return next();
     } catch (error) {
-      console.error("requirePermission:", error.message || error);
-      return next();
+      return echecControle(res, "requirePermission", error);
     }
   };
 }
 
-// Gardes MODULES par préfixe (accès module seul — les handlers gèrent leurs rôles).
-const MODULE_ROUTE_GUARDS = [
-  ["/pos", "pos"], ["/produits", "produits"], ["/stocks", "stock"],
-  ["/inventaires", "inventaire"], ["/scanner", "scanner"], ["/entrepots", "entrepots"],
-  ["/emplacements", "emplacements"], ["/marketplace", "marketplace"], ["/partenaires", "partenaires"],
-  ["/comptabilite", "comptabilite"], ["/rapports", "rapports"], ["/activites", "activites"],
-  ["/parametres-pointage", "parametres_pointage"], ["/badges", "badges"],
-  ["/restaurant", "restaurant"], ["/immobilier", "immobilier"],
-  ["/automobile", "automobile"], ["/laboratoire", "laboratoire"],
-];
-for (const [prefix, key] of MODULE_ROUTE_GUARDS) app.use(prefix, requireCompanyModule(key));
+// Compat : un module simple est-il actif pour l'entreprise ?
+async function isCompanyModuleEnabled(companyId, moduleKey) {
+  if (!companyId || !moduleKey) return true;
+  const ctx = await access.loadAccessContext(pool, { companyId });
+  return access.companyModuleState(ctx, moduleKey).enabled;
+}
 
 // Gardes SOUS-MODULES sur chemins CRUD précis (accès + permission par méthode).
 const SUBMODULE_ROUTE_GUARDS = [
@@ -1538,7 +1531,9 @@ const SUBMODULE_ROUTE_GUARDS = [
   ["/automobile/sales", "automobile.ventes"],
   // Voyage
   ["/travel/partner", "voyage.partenaire"],
-  ["/travel/bookings", "voyage.reservations"],
+  // /travel/bookings n'est plus gardé par le module : ce sont les billets du
+  // VOYAGEUR (réserver, payer, annuler), un service de plateforme ouvert à
+  // tous. Le garder aurait interdit à l'employé d'une boutique de réserver.
 ];
 for (const [prefix, key] of SUBMODULE_ROUTE_GUARDS) app.use(prefix, requireModuleGuard(key));
 
@@ -1557,19 +1552,29 @@ app.get("/rbac/registry", authenticateToken, (req, res) => {
 // Droits effectifs de l'utilisateur courant.
 app.get("/rbac/me", authenticateToken, async (req, res) => {
   try {
-    const companyId = getEffectiveCompanyId(req) || req.user.company_id;
-    const modules = await getCompanyModules(companyId);
-    const disabled = await pool.query(
-      `SELECT module_key FROM company_modules WHERE company_id=$1 AND COALESCE(is_enabled,enabled,TRUE)=FALSE`,
-      [companyId]
-    );
+    const ctx = await accessContextFor(req, req.user);
+    const keys = access.exposedKeys();
+    const effective = access.effectiveMap(ctx, keys);
+    const modules = {};
+    const disabled = [];
+    for (const key of keys) {
+      const actif = ctx.isSuperAdmin || access.companyModuleState(ctx, key).enabled;
+      if (!key.includes(".")) modules[key] = actif;
+      if (!actif) disabled.push(key);
+    }
     const perms = await pool.query(`SELECT * FROM user_permissions WHERE user_id=$1`, [req.user.id]);
     res.json({
       role: req.user.role,
       is_super_admin: isSuperAdminUser(req.user),
+      business_profile: ctx.profileKey,
+      // Sans société (client marketplace…), aucune garde de module ne s'applique.
+      has_company: Boolean(ctx.companyId),
       modules,
-      disabled_keys: disabled.rows.map((r) => r.module_key),
+      disabled_keys: disabled,
       permissions: perms.rows,
+      // Verdict final, calculé par le même moteur que les gardes API.
+      effective,
+      page_routes: access.PAGE_ROUTE_RULES,
     });
   } catch (error) {
     console.error("rbac/me:", error);
@@ -1582,14 +1587,48 @@ app.get("/company/users/:id/permissions", authenticateToken, async (req, res) =>
   try {
     if (!isAdminLikeUser(req.user)) return res.status(403).json({ error: "Réservé à l'administration de l'entreprise." });
     const companyId = getEffectiveCompanyId(req) || req.user.company_id;
-    const target = (await pool.query(`SELECT id, fullname, role, company_id FROM users WHERE id=$1`, [req.params.id])).rows[0];
+    const target = (await pool.query(`SELECT id, fullname, role, company_id, is_super_admin FROM users WHERE id=$1`, [req.params.id])).rows[0];
     if (!target) return res.status(404).json({ error: "Employé introuvable" });
     if (!isSuperAdminUser(req.user) && Number(target.company_id) !== Number(companyId)) {
       return res.status(403).json({ error: "Employé d'une autre entreprise." });
     }
     const perms = (await pool.query(`SELECT * FROM user_permissions WHERE user_id=$1`, [target.id])).rows;
     const modules = await getCompanyModules(target.company_id);
-    res.json({ user: { id: target.id, fullname: target.fullname, role: target.role }, modules, permissions: perms });
+
+    /* L'ancien écran affichait « décoché » pour toute case sans ligne
+       enregistrée, alors que l'accès réel était « autorisé ». Il reçoit
+       désormais, pour chaque clé du registre, la valeur qui s'applique
+       VRAIMENT (ligne explicite, sinon défaut du rôle) et le défaut du rôle
+       seul, pour le bouton « Réinitialiser selon le rôle ». */
+    const ctx = await access.loadAccessContext(pool, {
+      companyId: target.company_id, userId: target.id,
+      role: normalizeRole(target.role), isSuperAdmin: false,
+    });
+    const effective = {};
+    const roleDefaults = {};
+    const explicit = {};
+    const registre = rbac.allModuleKeys();
+    const lignes = new Map(perms.map((p) => [p.module_key, p]));
+    for (const key of registre) {
+      effective[key] = {};
+      explicit[key] = {};
+      roleDefaults[key] = rbac.defaultPermissionsForRole(normalizeRole(target.role), key);
+      const ligne = lignes.get(key);
+      for (const action of rbac.ACTIONS) {
+        const valeur = ligne ? ligne[rbac.ACTION_COLUMN[action]] : null;
+        explicit[key][action] = valeur === true || valeur === false;
+        effective[key][action] = explicit[key][action] ? valeur === true : roleDefaults[key][action] === true;
+      }
+    }
+    // Modules fermés au niveau de la société : non attribuables ici.
+    const indisponibles = registre.filter((k) => !access.companyModuleState(ctx, k).enabled);
+
+    res.json({
+      user: { id: target.id, fullname: target.fullname, role: target.role },
+      modules, permissions: perms,
+      effective, role_defaults: roleDefaults, explicit,
+      unavailable_keys: indisponibles,
+    });
   } catch (error) {
     console.error("company/users/permissions GET:", error);
     res.status(500).json({ error: "Erreur droits employé" });
@@ -1648,12 +1687,14 @@ app.put("/company/modules", authenticateToken, async (req, res) => {
     let count = 0;
     for (const [key, val] of Object.entries(modules)) {
       if (!isSuperAdminUser(req.user) && !key.includes(".")) continue; // règle 16
+      const source = isSuperAdminUser(req.user) ? "super_admin" : "societe";
       await pool.query(
-        `INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, updated_by)
-         VALUES ($1,$2,$3,$3,$4)
+        `INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, updated_by, source)
+         VALUES ($1,$2,$3,$3,$4,$5)
          ON CONFLICT (company_id, module_key) DO UPDATE SET
-           is_enabled=EXCLUDED.is_enabled, enabled=EXCLUDED.enabled, updated_by=EXCLUDED.updated_by, updated_at=NOW()`,
-        [companyId, key, val === true, req.user.id]
+           is_enabled=EXCLUDED.is_enabled, enabled=EXCLUDED.enabled, updated_by=EXCLUDED.updated_by,
+           source=EXCLUDED.source, updated_at=NOW()`,
+        [companyId, key, val === true, req.user.id, source]
       );
       count++;
     }
@@ -8870,20 +8911,10 @@ app.get("/super-admin/modules", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès super admin requis." });
     }
 
-    const moduleKeys = [
-      "pos",
-      "ventes",
-      "achats",
-      "pointage",
-      "inventaire",
-      "ia",
-      "reunions",
-      "comptabilite",
-      "documents",
-      "rapports",
-      "transport",
-      "crm"
-    ];
+    // Tout le catalogue, verticales comprises : l'ancienne liste n'en
+    // contenait que 12 et le super-admin ne pouvait retirer ni Restaurant ni
+    // Éducation à une société.
+    const moduleKeys = access.MODULE_CATALOG.filter((m) => !m.core).map((m) => m.key);
 
     const companiesResult = await pool.query(
       "SELECT id, name FROM companies ORDER BY id ASC"
@@ -8900,7 +8931,7 @@ app.get("/super-admin/modules", authenticateToken, async (req, res) => {
           const configured = modulesResult.rows.find(
             (item) => Number(item.company_id) === Number(company.id) && item.module_key === key
           );
-          acc[key] = configured ? configured.is_enabled === true : true;
+          acc[key] = configured ? configured.is_enabled === true : null;
           return acc;
         }, {})
       }))
@@ -8923,15 +8954,17 @@ app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req
     for (const [moduleKey, isEnabled] of Object.entries(modules)) {
       const result = await pool.query(
         `INSERT INTO company_modules
-         (company_id, module_key, is_enabled, updated_by)
-         VALUES ($1,$2,$3,$4)
+         (company_id, module_key, is_enabled, enabled, updated_by, source)
+         VALUES ($1,$2,$3,$3,$4,'super_admin')
          ON CONFLICT (company_id, module_key)
          DO UPDATE SET
            is_enabled=EXCLUDED.is_enabled,
+           enabled=EXCLUDED.enabled,
            updated_by=EXCLUDED.updated_by,
+           source='super_admin',
            updated_at=CURRENT_TIMESTAMP
          RETURNING *`,
-        [req.params.companyId, moduleKey, isEnabled === true, req.user.id]
+        [req.params.companyId, access.normalizeKey(moduleKey), isEnabled === true, req.user.id]
       );
 
       saved.push(result.rows[0]);
@@ -8941,6 +8974,93 @@ app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req
   } catch (error) {
     console.error("ERREUR UPDATE MODULES :", error);
     res.status(500).json({ error: "Erreur modification modules" });
+  }
+});
+
+/* Modules d'UNE société, vus par le super-admin : pour chaque module, la
+   décision enregistrée, sa provenance, le verdict effectif et sa raison
+   (profil métier, plan, dérogation). */
+app.get("/super-admin/companies/:id/modules", authenticateToken, async (req, res) => {
+  try {
+    if (!isSuperAdminUser(req.user)) return res.status(403).json({ error: "Accès super admin requis." });
+    const societe = (await pool.query(
+      `SELECT c.id, c.name, c.business_type, c.tenant_id, p.id AS plan_id,
+              p.name AS plan_name, p.excluded_modules
+         FROM companies c
+         LEFT JOIN subscription_plans p ON p.id = COALESCE(
+           (SELECT s.plan_id FROM subscriptions s
+             WHERE s.company_id = c.id AND s.plan_id IS NOT NULL
+             ORDER BY s.id DESC LIMIT 1),
+           c.plan_id)
+        WHERE c.id = $1`, [req.params.id])).rows[0];
+    if (!societe) return res.status(404).json({ error: "Société introuvable." });
+
+    const ctx = await access.loadAccessContext(pool, { companyId: societe.id });
+    const profil = access.profileModules(ctx.profileKey);
+    const groupes = Object.entries(access.GROUP_LABELS).map(([cle, libelle]) => ({
+      key: cle,
+      label: libelle,
+      modules: access.MODULE_CATALOG.filter((m) => m.group === cle && !m.core).map((m) => {
+        const ligne = ctx.companyRows.get(m.key) || null;
+        const etat = access.companyModuleState(ctx, m.key);
+        return {
+          key: m.key,
+          label: m.label,
+          vertical: Boolean(m.vertical),
+          stored: ligne,
+          effective: etat.enabled,
+          reason: etat.reason,
+          in_profile: profil.has(m.key),
+          plan_allows: access.planAllows(ctx.plan, m.key),
+        };
+      }),
+    })).filter((g) => g.modules.length > 0);
+
+    res.json({
+      company: {
+        id: societe.id, name: societe.name, business_type: societe.business_type,
+        business_profile: ctx.profileKey,
+        business_profile_label: access.BUSINESS_PROFILES[ctx.profileKey]?.label || "",
+        tenant_id: societe.tenant_id, plan_id: societe.plan_id, plan_name: societe.plan_name,
+        plan_excluded_modules: societe.excluded_modules || [],
+      },
+      groups: groupes,
+    });
+  } catch (error) {
+    console.error("super-admin companies modules GET:", error);
+    res.status(500).json({ error: "Erreur lecture des modules de la société." });
+  }
+});
+
+/* Enregistre des décisions du super-admin pour une société. Elles priment sur
+   le plan et ne sont jamais recalculées automatiquement. Aucune donnée métier
+   n'est supprimée : désactiver = masquer et interdire l'usage. */
+app.put("/super-admin/companies/:id/modules", authenticateToken, async (req, res) => {
+  try {
+    if (!isSuperAdminUser(req.user)) return res.status(403).json({ error: "Accès super admin requis." });
+    const societe = (await pool.query(`SELECT id FROM companies WHERE id = $1`, [req.params.id])).rows[0];
+    if (!societe) return res.status(404).json({ error: "Société introuvable." });
+
+    const demandes = (req.body && typeof req.body.modules === "object" && req.body.modules) || {};
+    const inconnus = [];
+    const enregistres = [];
+    for (const [cleBrute, valeur] of Object.entries(demandes)) {
+      const cle = access.normalizeKey(cleBrute);
+      const entree = access.CATALOG_BY_KEY.get(cle);
+      if (!entree || entree.core) { inconnus.push(cleBrute); continue; }
+      await pool.query(
+        `INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, updated_by, source)
+         VALUES ($1,$2,$3,$3,$4,'super_admin')
+         ON CONFLICT (company_id, module_key) DO UPDATE SET
+           is_enabled=EXCLUDED.is_enabled, enabled=EXCLUDED.enabled,
+           updated_by=EXCLUDED.updated_by, source='super_admin', updated_at=CURRENT_TIMESTAMP`,
+        [societe.id, cle, valeur === true, req.user.id]);
+      enregistres.push({ key: cle, enabled: valeur === true });
+    }
+    res.json({ ok: true, saved: enregistres, ignored: inconnus });
+  } catch (error) {
+    console.error("super-admin companies modules PUT:", error);
+    res.status(500).json({ error: "Erreur enregistrement des modules." });
   }
 });
 
