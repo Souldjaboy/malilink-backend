@@ -2206,12 +2206,42 @@ app.post("/register-saas", async (req, res) => {
         : selected_modules && typeof selected_modules === "object"
           ? selected_modules
           : {};
-    const enabledModuleCount = Object.values(requestedModules).filter((value) => value === true).length;
+    /* Sélection finale des modules — type d'activité + plan + choix.
+       Avant : tout module absent de la requête était ACTIVÉ, et le formulaire
+       cochait tout par défaut ; une boutique recevait Restaurant, Éducation,
+       Laboratoire… La règle est désormais :
+         - le profil métier fournit la sélection de départ ;
+         - l'offre retire ce qu'elle n'inclut pas ;
+         - une verticale hors profil ne s'ajoute pas à l'inscription (seul le
+           super-admin peut l'accorder ensuite) ;
+         - la limite du plan compte les modules AJOUTÉS au-delà du profil.  */
+    const profilMetier = access.normalizeBusinessType(business_type);
+    const modulesDuProfil = access.profileModules(profilMetier);
+    const exclusParLOffre = new Set(Array.isArray(plan.excluded_modules) ? plan.excluded_modules : []);
+    const demandes = new Set(
+      Object.entries(requestedModules)
+        .filter(([, value]) => value === true)
+        .map(([key]) => access.normalizeKey(key))
+    );
+    const selectionDemandee = demandes.size > 0 ? demandes : modulesDuProfil;
+    const modulesFinaux = {};
+    for (const entry of access.MODULE_CATALOG) {
+      if (entry.core) { modulesFinaux[entry.key] = true; continue; }
+      let actif = selectionDemandee.has(entry.key);
+      if (exclusParLOffre.has(entry.key)) actif = false;
+      const optionOuverte = entry.group === "options";
+      if (entry.vertical && !optionOuverte && !modulesDuProfil.has(entry.key)) actif = false;
+      modulesFinaux[entry.key] = actif;
+    }
+    const ajouts = Object.keys(modulesFinaux).filter((k) => modulesFinaux[k] && !modulesDuProfil.has(k));
     const maxModulesAllowed = Number(plan.max_modules_allowed || 0);
 
-    if (maxModulesAllowed > 0 && maxModulesAllowed < 999 && enabledModuleCount > maxModulesAllowed) {
+    if (maxModulesAllowed > 0 && maxModulesAllowed < 999 && ajouts.length > maxModulesAllowed) {
       return res.status(400).json({
-        error: `Le plan ${plan.name} autorise ${maxModulesAllowed} modules maximum.`
+        error: `L'offre ${plan.name} permet d'ajouter ${maxModulesAllowed} module(s) au-delà de votre activité ; vous en avez ajouté ${ajouts.length}.`,
+        code: "MODULE_LIMIT",
+        added_modules: ajouts,
+        limit: maxModulesAllowed,
       });
     }
 
@@ -2382,25 +2412,19 @@ app.post("/register-saas", async (req, res) => {
       });
     }
 
-    for (const moduleKey of COMPANY_MODULE_KEYS) {
-      const requestedKey =
-        moduleKey === "crm" &&
-        Object.prototype.hasOwnProperty.call(requestedModules, "partenaires")
-          ? "partenaires"
-          : moduleKey;
-      const isEnabled =
-        Object.prototype.hasOwnProperty.call(requestedModules, requestedKey)
-          ? requestedModules[requestedKey] === true
-          : true;
-
+    /* Une ligne EXPLICITE par module du catalogue, activé ou non : plus
+       aucun module ne dépend d'un « pas de ligne = actif ». */
+    for (const [moduleKey, isEnabled] of Object.entries(modulesFinaux)) {
       await pool.query(
         `INSERT INTO company_modules
-         (company_id, module_key, is_enabled, updated_by)
-         VALUES ($1,$2,$3,$4)
+         (company_id, module_key, is_enabled, enabled, updated_by, source)
+         VALUES ($1,$2,$3,$3,$4,'inscription')
          ON CONFLICT (company_id, module_key)
          DO UPDATE SET
            is_enabled=EXCLUDED.is_enabled,
+           enabled=EXCLUDED.enabled,
            updated_by=EXCLUDED.updated_by,
+           source=EXCLUDED.source,
            updated_at=CURRENT_TIMESTAMP`,
         [company.id, moduleKey, isEnabled, user.id]
       );
@@ -17040,6 +17064,21 @@ app.delete("/partners/:id", authenticateToken, async (req, res) => {
 });
 
 /* PLANS PUBLICS POUR INSCRIPTION */
+/* Profils métier et catalogue des modules, publics : la page d'inscription
+   pré-sélectionne à partir de la MÊME source que celle qu'applique le
+   backend, au lieu d'une liste codée en dur dans le frontend. */
+app.get("/public/business-profiles", (req, res) => {
+  res.json({
+    profiles: Object.entries(access.BUSINESS_PROFILES).map(([key, p]) => ({
+      key, label: p.label, modules: p.modules,
+    })),
+    catalog: access.MODULE_CATALOG.map((m) => ({
+      key: m.key, label: m.label, group: m.group, core: Boolean(m.core), vertical: Boolean(m.vertical),
+    })),
+    groups: access.GROUP_LABELS,
+  });
+});
+
 app.get("/public/plans", async (req, res) => {
   try {
     await ensureDefaultSubscriptionPlans();
@@ -17081,6 +17120,7 @@ app.get("/public/plans", async (req, res) => {
         COALESCE(max_sales_per_month, 0) AS max_sales_per_month,
         COALESCE(max_stock_movements_per_month, max_movements_monthly, 0) AS max_stock_movements_per_month,
         COALESCE(max_modules_allowed, 0) AS max_modules_allowed,
+        COALESCE(excluded_modules, '{}') AS excluded_modules,
         COALESCE(billing_cycle, 'monthly') AS billing_cycle,
         COALESCE(is_active, true) AS is_active,
         can_use_reports,
