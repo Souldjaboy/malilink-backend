@@ -2197,6 +2197,15 @@ app.post("/register-saas", async (req, res) => {
     }
 
     const plan = planResult.rows[0];
+    /* Seules les offres publiques et actives sont souscrivables ici. Les
+       anciennes offres (Standard, Premium) restent en place pour leurs
+       abonnés, mais ne se choisissent plus à l'inscription. */
+    if (plan.is_public !== true || plan.is_active === false) {
+      return res.status(400).json({
+        error: "Cette offre n'est plus proposée à l'inscription. Choisissez Starter, Business ou Pro.",
+        code: "PLAN_NOT_OFFERED",
+      });
+    }
     const requestedModules =
       Array.isArray(selected_modules)
         ? selected_modules.reduce((acc, key) => {
@@ -2379,16 +2388,20 @@ app.post("/register-saas", async (req, res) => {
         start_date,
         end_date,
         status,
-        payment_status
+        payment_status,
+        installation_fee
       )
-      VALUES ($1,$2,NOW(),NOW() + ($3 || ' days')::interval,$4,$5)
+      VALUES ($1,$2,NOW(),NOW() + ($3 || ' days')::interval,$4,$5,$6)
       `,
       [
         company.id,
         plan.id,
         Number(plan.trial_days || 15),
         "trial",
-        "free_trial"
+        "free_trial",
+        // Montant annoncé au client, figé : un changement de tarif ultérieur
+        // ne réécrit pas ce qui a été convenu.
+        Number(plan.installation_fee || 0)
       ]
     );
 
@@ -17123,6 +17136,11 @@ app.get("/public/plans", async (req, res) => {
         COALESCE(excluded_modules, '{}') AS excluded_modules,
         COALESCE(billing_cycle, 'monthly') AS billing_cycle,
         COALESCE(is_active, true) AS is_active,
+        COALESCE(NULLIF(commercial_name, ''), name) AS display_name,
+        commercial_code,
+        COALESCE(installation_fee, 0) AS installation_fee,
+        COALESCE(is_recommended, FALSE) AS is_recommended,
+        COALESCE(highlights, '[]'::jsonb) AS highlights,
         can_use_reports,
         can_use_qr,
         can_use_advanced_inventory,
@@ -17130,9 +17148,11 @@ app.get("/public/plans", async (req, res) => {
         can_use_chat,
         can_use_ai
       FROM subscription_plans
-      WHERE name IN ('Essentiel', 'Starter', 'Standard', 'Premium')
-        AND COALESCE(is_active, true)=true
-      ORDER BY price_monthly ASC
+      -- Les offres proposées à l'inscription. Avant : une liste de noms en
+      -- dur, où un plan « Business » ou « Pro » n'aurait jamais figuré.
+      WHERE COALESCE(is_public, FALSE) = TRUE
+        AND COALESCE(is_active, true) = true
+      ORDER BY display_order ASC, price_monthly ASC
     `);
 
     res.json(result.rows);
@@ -17222,8 +17242,29 @@ function normalizePlanPayload(body = {}) {
     can_use_advanced_inventory: body.can_use_advanced_inventory !== false,
     can_use_documents: body.can_use_documents !== false,
     can_use_chat: body.can_use_chat !== false,
-    can_use_ai: body.can_use_ai !== false
+    can_use_ai: body.can_use_ai !== false,
+    /* Champs commerciaux (076). null = non fourni : la valeur en base est
+       conservée — un écran qui ne les envoie pas ne les efface pas. */
+    installation_fee: body.installation_fee === undefined || body.installation_fee === ""
+      ? null : Math.max(0, Number(body.installation_fee) || 0),
+    commercial_name: body.commercial_name === undefined ? null : String(body.commercial_name || "").trim().slice(0, 120),
+    is_public: typeof body.is_public === "boolean" ? body.is_public : null,
+    is_recommended: typeof body.is_recommended === "boolean" ? body.is_recommended : null,
+    excluded_modules: body.excluded_modules === undefined ? null : listeDeCles(body.excluded_modules),
+    highlights: body.highlights === undefined ? null : listeDArguments(body.highlights),
   };
+}
+
+// « cameras, marketing » ou ["cameras","marketing"] → clés normalisées du catalogue.
+function listeDeCles(valeur) {
+  const brut = Array.isArray(valeur) ? valeur : String(valeur || "").split(/[,;\n]/);
+  return [...new Set(brut.map((k) => access.normalizeKey(k)).filter((k) => access.CATALOG_BY_KEY.has(k)))];
+}
+
+// Une ligne par argument commercial, ou un tableau.
+function listeDArguments(valeur) {
+  const brut = Array.isArray(valeur) ? valeur : String(valeur || "").split("\n");
+  return brut.map((t) => String(t || "").trim()).filter(Boolean).slice(0, 12);
 }
 
 async function updateSubscriptionPlan(planId, payload) {
@@ -17254,7 +17295,13 @@ async function updateSubscriptionPlan(planId, payload) {
       can_use_advanced_inventory=$22,
       can_use_documents=$23,
       can_use_chat=$24,
-      can_use_ai=$25
+      can_use_ai=$25,
+      installation_fee=COALESCE($27, installation_fee),
+      commercial_name=COALESCE($28, commercial_name),
+      is_public=COALESCE($29, is_public),
+      is_recommended=COALESCE($30, is_recommended),
+      excluded_modules=COALESCE($31::text[], excluded_modules),
+      highlights=COALESCE($32::jsonb, highlights)
      WHERE id=$26
      RETURNING *`,
     [
@@ -17283,7 +17330,13 @@ async function updateSubscriptionPlan(planId, payload) {
       payload.can_use_documents,
       payload.can_use_chat,
       payload.can_use_ai,
-      planId
+      planId,
+      payload.installation_fee,
+      payload.commercial_name,
+      payload.is_public,
+      payload.is_recommended,
+      payload.excluded_modules,
+      payload.highlights === null ? null : JSON.stringify(payload.highlights)
     ]
   );
 }
@@ -17785,9 +17838,17 @@ app.post("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"),
         can_use_advanced_inventory,
         can_use_documents,
         can_use_chat,
-        can_use_ai
+        can_use_ai,
+        installation_fee,
+        commercial_name,
+        is_public,
+        is_recommended,
+        excluded_modules,
+        highlights
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,
+              COALESCE($26, 0), COALESCE($27, ''), COALESCE($28, FALSE), COALESCE($29, FALSE),
+              COALESCE($30::text[], '{}'), COALESCE($31::jsonb, '[]'::jsonb))
       RETURNING *
       `,
       [
@@ -17815,7 +17876,13 @@ app.post("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"),
         payload.can_use_advanced_inventory,
         payload.can_use_documents,
         payload.can_use_chat,
-        payload.can_use_ai
+        payload.can_use_ai,
+        payload.installation_fee,
+        payload.commercial_name,
+        payload.is_public,
+        payload.is_recommended,
+        payload.excluded_modules,
+        payload.highlights === null ? null : JSON.stringify(payload.highlights)
       ]
     );
 

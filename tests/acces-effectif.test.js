@@ -64,6 +64,8 @@ async function phase1() {
   // company_modules à TRUE pour tout, verticales comprises.
   const standard = (await q(`SELECT id FROM subscription_plans WHERE LOWER(name)='standard'`))[0];
   const essentiel = (await q(`SELECT id FROM subscription_plans WHERE LOWER(name)='essentiel'`))[0];
+  // Offre publique qui succède à Standard pour les nouvelles inscriptions.
+  const business = (await q(`SELECT id FROM subscription_plans WHERE commercial_code='business'`))[0];
   const ada = (await q(
     `INSERT INTO companies (name, business_type, status, subscription_status, plan_id, tenant_id)
      VALUES ('ADA SERVICE', 'commerce', 'active', 'active', $1, 'malilink') RETURNING id`, [standard.id]))[0];
@@ -277,7 +279,7 @@ async function phase1() {
     "rapports", "pointage", "ia", "marketplace", "commandes_recues", "restaurant", "automobile", "immobilier",
     "laboratoire", "alertes", "activites", "utilisateurs", "parametres"].map((k) => [k, true]));
   {
-    const com = await inscrire("Company Commerce", "commerce", standard.id, {});
+    const com = await inscrire("Company Commerce", "commerce", business.id, {});
     verifier("inscription Commerce acceptée", com.status === 201, `statut ${com.status} ${com.data?.error || ""}`);
     const lc = await lignesDe(com.data.company.id);
     verifier("Commerce : stock, POS, comptabilité activés", lc.stock?.is_enabled && lc.pos?.is_enabled && lc.comptabilite?.is_enabled);
@@ -294,8 +296,8 @@ async function phase1() {
 
     // L'ANCIEN formulaire cochait tout. Sur une offre qui laisse de la place :
     // les verticales d'autres métiers sont ignorées malgré la case cochée.
-    const ancienStandard = await inscrire("Company Restaurant B", "restaurant", standard.id, ancienFormulaire);
-    verifier("ancien formulaire, offre Standard : accepté", ancienStandard.status === 201,
+    const ancienStandard = await inscrire("Company Restaurant B", "restaurant", business.id, ancienFormulaire);
+    verifier("ancien formulaire, offre Business : accepté", ancienStandard.status === 201,
       `statut ${ancienStandard.status} ${ancienStandard.data?.error || ""}`);
     const lb = await lignesDe(ancienStandard.data.company.id);
     verifier("… mais automobile, immobilier, laboratoire refusés malgré la case cochée",
@@ -310,7 +312,7 @@ async function phase1() {
       Array.isArray(ancienEssentiel.data?.added_modules) && ancienEssentiel.data.added_modules.length === 6,
       JSON.stringify(ancienEssentiel.data?.added_modules));
 
-    const ecole = await inscrire("Company School", "ecole", standard.id, {});
+    const ecole = await inscrire("Company School", "ecole", business.id, {});
     const le = await lignesDe(ecole.data.company.id);
     verifier("École : éducation activée", le.education?.is_enabled === true);
     verifier("École : POS, stock, restaurant, marketplace désactivés",
