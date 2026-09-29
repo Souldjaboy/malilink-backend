@@ -1,14691 +1,1657 @@
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
-const QRCode = require("qrcode");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
-const crypto = require("crypto");
-const nodemailer = require("nodemailer");
-/* Contrat public du catalogue : liste blanche des champs indexables. */
-const publicCatalog = require("./services/public-catalog");
-require("dotenv").config();
-
-let webPush = null;
-try {
-  webPush = require("web-push");
-} catch (error) {
-  webPush = null;
-}
-
-const app = express();
-
-const allowedOrigins = [
-  process.env.FRONTEND_URL,
-  process.env.PUBLIC_BASE_URL,
-  "https://trianglewmspro.com",
-  "https://www.trianglewmspro.com",
-  "https://malilinkglobal.com",
-  "https://www.malilinkglobal.com",
-  "https://hafiyalab.com",
-  "https://www.hafiyalab.com",
-  "http://localhost:3030",
-  "http://127.0.0.1:3030",
-  "https://afia.trianglewmspro.com",
-  "https://malilink.trianglewmspro.com",
-  "http://localhost:3000"
-].filter(Boolean);
-
-app.disable("x-powered-by");
-
-app.use((req, res, next) => {
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
-  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-  res.setHeader("Permissions-Policy", "camera=(self), microphone=(self), geolocation=(self)");
-  if (process.env.NODE_ENV === "production") {
-    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-  }
-  next();
-});
-
-app.use(
-  cors({
-    origin(origin, callback) {
-      // RequÃªtes sans en-tÃªte Origin (proxy Next.js, serveur-Ã -serveur, apps mobiles) : autorisÃ©es.
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      // Origines localhost en dÃ©veloppement (ports variables : 3000, 3020, 3030...)
-      if (process.env.NODE_ENV !== "production" && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
-        return callback(null, true);
-      }
-      // Origine inconnue : pas d'en-tÃªtes CORS (le navigateur bloquera), sans erreur serveur.
-      return callback(null, false);
-    },
-    credentials: true
-  })
-)
-
-app.use(express.json({ limit: "1mb" }));
-
-app.use((req, res, next) => {
-  if (req.url.startsWith("/api/")) {
-    req.url = req.url.slice(4);
-  }
-
-  next();
-});
-
-const { sensitiveRoutesRateLimit } = require("./middleware/rateLimit");
-app.use(sensitiveRoutesRateLimit);
-
-app.use(requireTenant);
-
-if (!fs.existsSync("uploads")) {
-  fs.mkdirSync("uploads");
-}
-
-const productUploadDir = path.join(__dirname, "uploads", "products");
-const laboratoryUploadDir = path.join(__dirname, "uploads", "laboratory");
-
-if (!fs.existsSync(productUploadDir)) {
-  fs.mkdirSync(productUploadDir, { recursive: true });
-}
-
-if (!fs.existsSync(laboratoryUploadDir)) {
-  fs.mkdirSync(laboratoryUploadDir, { recursive: true });
-}
-
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, "uploads/");
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname || "").toLowerCase();
-    const baseName = path
-      .basename(file.originalname || "upload", ext)
-      .replace(/\s+/g, "-")
-      .replace(/[^a-zA-Z0-9-_]/g, "");
-    const uniqueName = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}-${baseName || "upload"}${ext}`;
-    cb(null, uniqueName);
-  }
-});
-
-const allowedUploadMimeTypes = new Set([
-  "image/jpeg",
-  "image/jpg",
-  "image/png",
-  "image/webp",
-  "application/pdf",
-  "audio/mpeg",
-  "audio/mp3",
-  "audio/mp4",
-  "audio/wav",
-  "audio/webm",
-  "audio/ogg"
-]);
-
-const blockedUploadExtensions = new Set([
-  ".php",
-  ".exe",
-  ".js",
-  ".mjs",
-  ".cjs",
-  ".sh",
-  ".bat",
-  ".cmd",
-  ".ps1",
-  ".html",
-  ".htm",
-  ".svg"
-]);
-
-function secureUploadFileFilter(req, file, cb) {
-  const ext = path.extname(file.originalname || "").toLowerCase();
-
-  if (blockedUploadExtensions.has(ext)) {
-    return cb(new Error("Type de fichier interdit pour des raisons de sÃ©curitÃ©."));
-  }
-
-  if (!allowedUploadMimeTypes.has(file.mimetype)) {
-    return cb(new Error("Format de fichier non autorisÃ©."));
-  }
-
-  cb(null, true);
-}
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: secureUploadFileFilter
-});
-
-const productImageStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, productUploadDir);
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname || "").toLowerCase();
-    const baseName = path
-      .basename(file.originalname || "product", ext)
-      .replace(/\s+/g, "-")
-      .replace(/[^a-zA-Z0-9-_]/g, "");
-    cb(null, `${Date.now()}-${baseName || "product"}${ext}`);
-  }
-});
-
-const uploadProductImage = multer({
-  storage: productImageStorage,
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: function (req, file, cb) {
-    const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
-    if (!allowed.has(file.mimetype)) {
-      return cb(new Error("Format image non autorisÃ©. Utilisez jpg, jpeg, png ou webp."));
-    }
-
-    cb(null, true);
-  }
-});
-
-const laboratoryResultStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, laboratoryUploadDir);
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname || "").toLowerCase();
-    const baseName = path
-      .basename(file.originalname || "resultat-laboratoire", ext)
-      .replace(/\s+/g, "-")
-      .replace(/[^a-zA-Z0-9-_]/g, "");
-    cb(null, `${Date.now()}-${crypto.randomBytes(6).toString("hex")}-${baseName || "resultat"}${ext}`);
-  }
-});
-
-const uploadLaboratoryResult = multer({
-  storage: laboratoryResultStorage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: function (req, file, cb) {
-    const allowed = new Set(["application/pdf", "image/jpeg", "image/jpg", "image/png", "image/webp"]);
-    if (!allowed.has(file.mimetype)) {
-      return cb(new Error("Format rÃ©sultat non autorisÃ©. Utilisez PDF, JPG, PNG ou WEBP."));
-    }
-
-    cb(null, true);
-  }
-});
-
-// Pool PostgreSQL â€” paramÃ¨tres EXPLICITES (Phase 0, durcissement montÃ©e en charge).
-// Valeurs surchargeables par variables d'environnement :
-//   PG_POOL_MAX (dÃ©faut 20)                 â€” connexions simultanÃ©es max par instance.
-//     Choisi pour tenir ~100k utilisateurs sur une instance ; avec PgBouncer et
-//     plusieurs instances (500k+), garder max Ã— nb_instances < max_connections PG.
-//   PG_IDLE_TIMEOUT_MS (dÃ©faut 30000)       â€” ferme une connexion inactive aprÃ¨s 30 s.
-//   PG_CONNECTION_TIMEOUT_MS (dÃ©faut 5000)  â€” Ã©chec si aucune connexion en 5 s
-//     (Ã©vite les requÃªtes qui pendent quand la base est saturÃ©e).
-const poolTuning = {
-  max: Number(process.env.PG_POOL_MAX || 20),
-  idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30000),
-  connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT_MS || 5000)
-};
-const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ...poolTuning })
-  : new Pool({
-      user: "souleymanediallo",
-      host: "localhost",
-      database: "triangle_wms_db",
-      password: "",
-      port: 5432,
-      ...poolTuning
-    });
-// Une erreur sur un client inactif ne doit pas planter le process.
-pool.on("error", (err) => console.error("âš ï¸  [pg pool] erreur client inactif :", err.message));
-
-if (!process.env.JWT_SECRET && process.env.NODE_ENV === "production") {
-  console.error(
-    "ERREUR SECURITE FATALE: JWT_SECRET absent du fichier .env. " +
-      "Le serveur refuse de dÃ©marrer en production sans secret JWT. " +
-      "Ajoutez JWT_SECRET=<valeur alÃ©atoire forte> dans backend/.env puis redÃ©marrez."
-  );
-  process.exit(1);
-}
-
-const JWT_SECRET = process.env.JWT_SECRET || "triangle_wms_secret_key";
-const BCRYPT_ROUNDS = 12;
-
-// VÃ©rification des secrets sensibles au dÃ©marrage (Phase 0) : avertit en dev,
-// bloque le dÃ©marrage en production si un secret critique est absent/faible.
-require("./config/env-guard").enforceEnv();
-
-const SUPER_ADMIN_EMAILS = new Set([
-  "diallogcif@gmail.com"
-]);
-
-const VALID_TENANTS = new Set(["triangle", "malilink", "hafiya"]);
-
-function normalizeTenantId(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]/g, "");
-  return VALID_TENANTS.has(normalized) ? normalized : "";
-}
-
-function getTenantFromRequest(req) {
-  const rawHeaderTenant =
-    req?.headers?.["x-tenant-id"] ||
-    req?.headers?.["x-app-product"] ||
-    req?.headers?.["x-product-id"] ||
-    req?.query?.tenant_id;
-  const headerTenant = normalizeTenantId(rawHeaderTenant);
-
-  if (headerTenant) return headerTenant;
-  if (rawHeaderTenant) return "__invalid__";
-
-  const host = String(
-    req?.headers?.host ||
-      req?.headers?.["x-forwarded-host"] ||
-      req?.hostname ||
-      ""
-  )
-    .split(",")[0]
-    .split(":")[0]
-    .toLowerCase();
-
-  if (host.includes("malilinkglobal.com") || host.includes("malilink.trianglewmspro.com")) {
-    return "malilink";
-  }
-  if (host.includes("hafiyalab.com") || host.includes("afia.trianglewmspro.com")) {
-    return "hafiya";
-  }
-  return normalizeTenantId(process.env.DEFAULT_TENANT_ID) || "triangle";
-}
-
-function requireTenant(req, res, next) {
-  const tenantId = getTenantFromRequest(req);
-  if (!VALID_TENANTS.has(tenantId)) {
-    return res.status(400).json({ error: "Tenant invalide." });
-  }
-
-  req.tenant_id = tenantId;
-  res.locals.tenant_id = tenantId;
-  next();
-}
-
-function parseCookieHeader(req) {
-  return String(req?.headers?.cookie || "")
-    .split(";")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .reduce((cookies, part) => {
-      const separatorIndex = part.indexOf("=");
-      if (separatorIndex === -1) return cookies;
-      const key = decodeURIComponent(part.slice(0, separatorIndex).trim());
-      const value = decodeURIComponent(part.slice(separatorIndex + 1).trim());
-      cookies[key] = value;
-      return cookies;
-    }, {});
-}
-
-function getAuthTokenFromRequest(req) {
-  const authHeader = req?.headers?.authorization || "";
-  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : "";
-  if (bearerToken) return bearerToken;
-
-  const cookies = parseCookieHeader(req);
-  return cookies.auth_token || cookies.triangle_auth_token || "";
-}
-
-function setSecureAuthCookies(req, res, token, tenantId) {
-  const secure =
-    req?.secure === true ||
-    String(req?.headers?.["x-forwarded-proto"] || "").includes("https") ||
-    process.env.NODE_ENV === "production";
-  const options = {
-    httpOnly: true,
-    secure,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 24 * 60 * 60 * 1000
-  };
-
-  res.cookie("auth_token", token, options);
-  res.cookie("tenant_id", tenantId, options);
-}
-
-async function companyBelongsToTenant(companyId, tenantId) {
-  if (!companyId || !tenantId) return true;
-  if (!(await columnExists("companies", "tenant_id"))) return true;
-
-  const result = await pool.query(
-    "SELECT tenant_id FROM companies WHERE id=$1 LIMIT 1",
-    [companyId]
-  );
-  const companyTenant = normalizeTenantId(result.rows[0]?.tenant_id) || "triangle";
-  return companyTenant === tenantId;
-}
-
-function getCompanyFilter(req) {
-  const userIsSuperAdmin =
-    req.user?.is_super_admin === true ||
-    normalizeRole(req.user?.role) === "super_admin";
-  const companyId = userIsSuperAdmin
-    ? getEffectiveCompanyId(req)
-    : req.user?.company_id || null;
-
-  return {
-    companyId,
-    isSuperAdmin: userIsSuperAdmin,
-    shouldFilterByCompany: !userIsSuperAdmin || Boolean(companyId)
-  };
-}
-
-function isSuperAdminUser(user) {
-  return user?.is_super_admin === true || normalizeRole(user?.role) === "super_admin";
-}
-
-function getRequestedActiveCompanyId(req) {
-  const raw =
-    req?.headers?.["x-active-company-id"] ||
-    req?.headers?.["x-company-id"] ||
-    req?.body?.company_id ||
-    req?.body?.active_company_id ||
-    req?.query?.active_company_id;
-  const numeric = Number(raw);
-  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
-}
-
-function getEffectiveCompanyId(req, fallback = null) {
-  if (isSuperAdminUser(req.user)) {
-    return getRequestedActiveCompanyId(req) || Number(req.user?.company_id || 0) || fallback || null;
-  }
-  return Number(req.user?.company_id || 0) || fallback || null;
-}
-
-async function getCompanySettingsForCompany(clientOrPool, companyId) {
-  const result = await clientOrPool.query(
-    `SELECT *
-     FROM company_settings
-     WHERE ($1::int IS NULL OR company_id=$1)
-     ORDER BY CASE WHEN company_id=$1 THEN 0 ELSE 1 END, id ASC
-     LIMIT 1`,
-    [companyId || null]
-  );
-
-  return result.rows[0] || null;
-}
-
-function normalizeRole(role) {
-  return String(role || "").toLowerCase();
-}
-
-function isAdminUser(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true || role === "admin" || role === "super_admin"
-  );
-}
-
-function canAccessAdminSettings(user) {
-  const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
-}
-
-function canAccessDirectionModule(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    canAccessAdminSettings(user) ||
-    role === "directeur" ||
-    role === "direction"
-  );
-}
-
-function canValidateStockMovement(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "admin" ||
-    role === "super_admin" ||
-    role === "chef_entrepot" ||
-    role === "chef d'entrepÃ´t" ||
-    role === "chef d'entrepot"
-  );
-}
-
-function isReadOnlyRole(user) {
-  const role = normalizeRole(user?.role);
-  return role === "direction" || role === "client";
-}
-
-function canViewAllSalaries(user) {
-  const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "direction";
-}
-
-function canCreateMeeting(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "responsable_entrepot" ||
-    role === "chef_entrepot" ||
-    role === "direction"
-  );
-}
-
-function canUsePos(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "caissier" ||
-    role === "vendeur"
-  );
-}
-
-function canManageCaisses(user) {
-  const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
-}
-
-function canViewAccounting(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "comptable" ||
-    role === "direction" ||
-    role === "directeur"
-  );
-}
-
-function canManageAccounting(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "comptable"
-  );
-}
-
-function canApproveAccounting(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "direction" ||
-    role === "directeur"
-  );
-}
-
-function canAdjustPosPrice(user) {
-  const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
-}
-
-function getEffectivePosPrice(product) {
-  const candidates = [
-    product.sale_price,
-    product.pharmacy_price,
-    product.wholesale_price,
-    product.price
-  ];
-
-  for (const candidate of candidates) {
-    const value = Number(candidate || 0);
-    if (value > 0) return value;
-  }
-
-  return 0;
-}
-
-function normalizeProductLookupCode(value) {
-  return String(value || "")
-    .trim()
-    .replace(/^https?:\/\/[^/]+\/scan\/product\//i, "")
-    .replace(/^Ref\s*[-_]*\s*/i, "")
-    .replace(/[^a-zA-Z0-9]/g, "")
-    .toLowerCase();
-}
-
-function optionalNumber(value) {
-  if (value === "" || value === null || value === undefined) return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function isBcryptHash(value) {
-  return /^\$2[aby]\$\d{2}\$/.test(String(value || ""));
-}
-
-function validatePasswordStrength(password) {
-  const value = String(password || "");
-  if (value.length < 8) {
-    return "Le mot de passe doit contenir au moins 8 caractÃ¨res.";
-  }
-
-  if (!/[A-Za-z]/.test(value) || !/[0-9]/.test(value)) {
-    return "Le mot de passe doit contenir au moins une lettre et un chiffre.";
-  }
-
-  return "";
-}
-
-async function hashPassword(password) {
-  return bcrypt.hash(String(password), BCRYPT_ROUNDS);
-}
-
-async function verifyPassword(inputPassword, storedPassword) {
-  if (isBcryptHash(storedPassword)) {
-    return bcrypt.compare(String(inputPassword || ""), storedPassword);
-  }
-
-  return String(inputPassword || "") === String(storedPassword || "");
-}
-
-function paymentCryptoKey() {
-  return crypto
-    .createHash("sha256")
-    .update(process.env.PAYMENT_SETTINGS_SECRET || process.env.JWT_SECRET || "triangle-wms-payment-secret")
-    .digest();
-}
-
-function encryptPaymentSecret(value) {
-  if (!value) return "";
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", paymentCryptoKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `${iv.toString("hex")}:${tag.toString("hex")}:${encrypted.toString("hex")}`;
-}
-
-function decryptPaymentSecret(value) {
-  if (!value || !String(value).includes(":")) return "";
-  try {
-    const [ivHex, tagHex, encryptedHex] = String(value).split(":");
-    const decipher = crypto.createDecipheriv(
-      "aes-256-gcm",
-      paymentCryptoKey(),
-      Buffer.from(ivHex, "hex")
-    );
-    decipher.setAuthTag(Buffer.from(tagHex, "hex"));
-    return Buffer.concat([
-      decipher.update(Buffer.from(encryptedHex, "hex")),
-      decipher.final()
-    ]).toString("utf8");
-  } catch {
-    return "";
-  }
-}
-
-function maskSecret(value) {
-  if (!value) return "";
-  return "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢";
-}
-
-function socialTokenCryptoKey() {
-  return crypto
-    .createHash("sha256")
-    .update(process.env.SOCIAL_AUTH_SECRET || process.env.JWT_SECRET || "triangle-wms-social-secret")
-    .digest();
-}
-
-function encryptSocialToken(value) {
-  if (!value) return "";
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", socialTokenCryptoKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `${iv.toString("hex")}:${tag.toString("hex")}:${encrypted.toString("hex")}`;
-}
-
-function socialProviderConfig(provider) {
-  const appUrl = publicAppUrl();
-  const callbackUrl = `${appUrl}/api/auth/social/${provider}/callback`;
-  const configs = {
-    google: {
-      label: "Google",
-      clientId: process.env.GOOGLE_CLIENT_ID,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
-      tokenUrl: "https://oauth2.googleapis.com/token",
-      userInfoUrl: "https://openidconnect.googleapis.com/v1/userinfo",
-      scope: "profile email",
-      callbackUrl
-    },
-    facebook: {
-      label: "Facebook",
-      clientId: process.env.FACEBOOK_CLIENT_ID,
-      clientSecret: process.env.FACEBOOK_CLIENT_SECRET,
-      authUrl: "https://www.facebook.com/v19.0/dialog/oauth",
-      tokenUrl: "https://graph.facebook.com/v19.0/oauth/access_token",
-      userInfoUrl: "https://graph.facebook.com/me?fields=id,first_name,last_name,name,email,picture",
-      scope: "public_profile email",
-      callbackUrl
-    },
-    instagram: {
-      label: "Instagram",
-      clientId: process.env.INSTAGRAM_CLIENT_ID,
-      clientSecret: process.env.INSTAGRAM_CLIENT_SECRET,
-      authUrl: process.env.INSTAGRAM_AUTH_URL || "",
-      tokenUrl: process.env.INSTAGRAM_TOKEN_URL || "",
-      userInfoUrl: process.env.INSTAGRAM_USERINFO_URL || "",
-      scope: "user_profile",
-      callbackUrl
-    },
-    tiktok: {
-      label: "TikTok",
-      clientId: process.env.TIKTOK_CLIENT_ID,
-      clientSecret: process.env.TIKTOK_CLIENT_SECRET,
-      authUrl: process.env.TIKTOK_AUTH_URL || "",
-      tokenUrl: process.env.TIKTOK_TOKEN_URL || "",
-      userInfoUrl: process.env.TIKTOK_USERINFO_URL || "",
-      scope: "user.info.basic",
-      callbackUrl
-    }
-  };
-
-  return configs[provider] || null;
-}
-
-function socialProviderEnabled(provider) {
-  const config = socialProviderConfig(provider);
-  return Boolean(config?.clientId && config?.clientSecret && config?.authUrl && config?.tokenUrl && config?.userInfoUrl);
-}
-
-function normalizeSocialProfile(provider, rawProfile) {
-  if (provider === "google") {
-    return {
-      provider_user_id: String(rawProfile.sub || ""),
-      email: rawProfile.email || "",
-      email_verified: rawProfile.email_verified === true,
-      name: rawProfile.name || [rawProfile.given_name, rawProfile.family_name].filter(Boolean).join(" "),
-      first_name: rawProfile.given_name || "",
-      last_name: rawProfile.family_name || "",
-      avatar_url: rawProfile.picture || ""
-    };
-  }
-
-  if (provider === "facebook") {
-    return {
-      provider_user_id: String(rawProfile.id || ""),
-      email: rawProfile.email || "",
-      email_verified: Boolean(rawProfile.email),
-      name: rawProfile.name || [rawProfile.first_name, rawProfile.last_name].filter(Boolean).join(" "),
-      first_name: rawProfile.first_name || "",
-      last_name: rawProfile.last_name || "",
-      avatar_url: rawProfile.picture?.data?.url || ""
-    };
-  }
-
-  return {
-    provider_user_id: String(rawProfile.id || rawProfile.sub || rawProfile.open_id || rawProfile.union_id || ""),
-    email: rawProfile.email || "",
-    email_verified: Boolean(rawProfile.email_verified || rawProfile.email),
-    name: rawProfile.name || rawProfile.display_name || rawProfile.username || "",
-    first_name: rawProfile.first_name || "",
-    last_name: rawProfile.last_name || "",
-    avatar_url: rawProfile.picture || rawProfile.avatar_url || ""
-  };
-}
-
-async function buildLoginResponseForUser(userId) {
-  const result = await pool.query(
-    `SELECT u.*,
-            c.name AS company_name,
-            c.status AS company_status,
-            c.subscription_status AS company_subscription_status,
-            c.subscription_expires_at AS company_subscription_expires_at,
-            c.trial_end_date AS company_trial_end_date,
-            s.status AS subscription_status,
-            s.end_date AS subscription_end_date,
-            sp.name AS plan_name
-     FROM users u
-     LEFT JOIN companies c ON u.company_id=c.id
-     LEFT JOIN subscriptions s ON c.id=s.company_id
-     LEFT JOIN subscription_plans sp ON s.plan_id=sp.id
-     WHERE u.id=$1
-     ORDER BY s.id DESC
-     LIMIT 1`,
-    [userId]
-  );
-  const user = result.rows[0];
-  if (!user) return null;
-
-  const normalizedEmail = String(user.email || "").trim().toLowerCase();
-  const isSuperAdmin =
-    user.is_super_admin === true ||
-    normalizeRole(user.role) === "super_admin" ||
-    SUPER_ADMIN_EMAILS.has(normalizedEmail);
-
-  const subscriptionStatus =
-    user.subscription_status || user.company_subscription_status || "";
-
-  const token = jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-      role: isSuperAdmin ? "super_admin" : user.role,
-      company_id: user.company_id,
-      is_super_admin: isSuperAdmin,
-      subscription_status: subscriptionStatus
-    },
-    JWT_SECRET,
-    { expiresIn: "1d" }
-  );
-
-  const companyModules = isSuperAdmin
-    ? await getCompanyModules(null)
-    : await getCompanyModules(user.company_id);
-
-  return {
-    token,
-    user: {
-      id: user.id,
-      fullname: user.fullname,
-      email: user.email,
-      role: isSuperAdmin ? "super_admin" : user.role,
-      company_id: user.company_id,
-      company_name: user.company_name || "",
-      company_status: user.company_status || "",
-      is_super_admin: isSuperAdmin,
-      subscription_status: subscriptionStatus,
-      subscription_end_date: user.subscription_end_date || "",
-      trial_end_date: user.company_trial_end_date || "",
-      subscription_expires_at: user.company_subscription_expires_at || "",
-      plan_name: user.plan_name || "",
-      profile_image_url: user.profile_image_url || "",
-      force_password_change: user.force_password_change === true,
-      modules: companyModules
-    }
-  };
-}
-
-function isExternalPaymentMethod(method) {
-  return ["Carte bancaire", "Orange Money", "Moov Money", "Wave", "Virement"].includes(String(method || ""));
-}
-
-function toBooleanFlag(value, defaultValue = false) {
-  if (value === true || value === false) return value;
-  const normalized = String(value ?? "").trim().toLowerCase();
-  if (["oui", "true", "1", "yes", "actif", "active"].includes(normalized)) return true;
-  if (["non", "false", "0", "no", "inactif", "inactive"].includes(normalized)) return false;
-  return defaultValue;
-}
-
-function providerKeyFromMethod(method) {
-  const normalized = String(method || "").toLowerCase();
-  if (normalized.includes("carte")) return "card";
-  if (normalized.includes("orange")) return "orange_money";
-  if (normalized.includes("moov")) return "moov_money";
-  if (normalized.includes("wave")) return "wave";
-  if (normalized.includes("virement")) return "bank_transfer";
-  if (normalized.includes("chÃ¨que") || normalized.includes("cheque")) return "check";
-  if (normalized.includes("mixte")) return "mixed";
-  if (normalized.includes("crÃ©dit") || normalized.includes("credit")) return "customer_credit";
-  return "cash";
-}
-
-function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
-  const toRad = (value) => (Number(value) * Math.PI) / 180;
-  const earthRadiusMeters = 6371000;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return earthRadiusMeters * c;
-}
-
-function canManageAttendanceSites(user) {
-  const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
-}
-
-function normalizeAttendanceGpsStatus(value) {
-  const status = String(value || "").toLowerCase();
-  if (status === "mobile") return "mobile";
-  if (status.includes("hors")) return "hors_zone";
-  if (status.includes("refus")) return "refusÃ©";
-  if (status.includes("autor")) return "hors_zone_autorisÃ©";
-  return status || "acceptÃ©";
-}
-
-async function getAllowedAttendanceSitesForUser(user) {
-  const companyId = user.company_id || null;
-  const assignedResult = await pool.query(
-    `SELECT s.*
-     FROM attendance_sites s
-     INNER JOIN employee_attendance_sites eas
-       ON eas.attendance_site_id=s.id
-     WHERE eas.user_id=$1
-       AND s.actif=true
-       AND ($2::int IS NULL OR s.company_id=$2 OR s.company_id IS NULL)
-     ORDER BY s.nom_du_site ASC`,
-    [user.id, companyId]
-  );
-
-  if (assignedResult.rows.length > 0) return assignedResult.rows;
-
-  if (user.primary_attendance_site_id) {
-    const primaryResult = await pool.query(
-      `SELECT *
-       FROM attendance_sites
-       WHERE id=$1
-         AND actif=true
-         AND ($2::int IS NULL OR company_id=$2 OR company_id IS NULL)
-       LIMIT 1`,
-      [user.primary_attendance_site_id, companyId]
-    );
-    if (primaryResult.rows.length > 0) return primaryResult.rows;
-  }
-
-  return [];
-}
-
-function productQrUrl(req, product) {
-  const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
-  const host = req.get("host");
-  const baseUrl =
-    process.env.FRONTEND_PUBLIC_URL ||
-    process.env.NEXT_PUBLIC_FRONTEND_URL ||
-    process.env.PUBLIC_BASE_URL ||
-    `${host?.includes("trianglewmspro.com") ? "https" : forwardedProto}://${host}`;
-  const code = encodeURIComponent(product.reference || product.barcode || product.id);
-  return `${baseUrl.replace(/\/$/, "")}/scan/product/${code}`;
-}
-
-function stripSalaryFields(row, requester) {
-  const canSeeSalary =
-    canViewAllSalaries(requester) || Number(row.id || row.user_id) === Number(requester?.id);
-
-  if (canSeeSalary) return row;
-
-  const sanitized = { ...row };
-  delete sanitized.hourly_rate;
-  delete sanitized.daily_rate;
-  delete sanitized.daily_salary;
-  delete sanitized.setting_daily_salary;
-  delete sanitized.monthly_salary;
-  delete sanitized.salary;
-  delete sanitized.salary_amount;
-  delete sanitized.calculated_salary;
-  sanitized.salary_type = sanitized.salary_type ? "masquÃ©" : sanitized.salary_type;
-  return sanitized;
-}
-
-function publicUploadUrl(req, filename) {
-  const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
-  const host = req.get("host");
-  const baseUrl =
-    process.env.PUBLIC_BASE_URL ||
-    `${host?.includes("trianglewmspro.com") ? "https" : forwardedProto}://${host}`;
-
-  return `${baseUrl.replace(/\/$/, "")}/api/uploads/${filename}`;
-}
-
-function authorizeRoles(...roles) {
-  return (req, res, next) => {
-    const allowed = roles.map(normalizeRole);
-    const userRole = normalizeRole(req.user?.role);
-
-    if (req.user?.is_super_admin === true || allowed.includes(userRole)) {
-      return next();
-    }
-
-    return res.status(403).json({
-      error: "AccÃ¨s refusÃ© : vous n'avez pas l'autorisation."
-    });
-  };
-}
-
-function getUserCompanyId(req) {
-  return req.user?.company_id || null;
-}
-
-async function authenticateToken(req, res, next) {
-  const token = getAuthTokenFromRequest(req);
-  if (!token) {
-    return res.status(401).json({
-      error: "Token manquant"
-    });
-  }
-
-  try {
-    const user = jwt.verify(token, JWT_SECRET);
-    const requestTenant = getTenantFromRequest(req);
-    const tokenTenant = normalizeTenantId(user.tenant_id);
-
-    if (tokenTenant && tokenTenant !== requestTenant) {
-      return res.status(403).json({
-        error: "AccÃ¨s refusÃ© : ce compte nâ€™appartient pas Ã  cette version."
-      });
-    }
-
-    if (!(await companyBelongsToTenant(user.company_id, requestTenant))) {
-      return res.status(403).json({
-        error: "AccÃ¨s refusÃ© : entreprise non autorisÃ©e pour ce tenant."
-      });
-    }
-
-    req.user = {
-      ...user,
-      tenant_id: tokenTenant || requestTenant
-    };
-    req.tenant_id = requestTenant;
-
-    next();
-  } catch (err) {
-    return res.status(403).json({
-      error: "Token invalide"
-    });
-  }
-}
-
-async function getCompanyPlanLimits(companyId) {
-  const result = await pool.query(
-    `SELECT 
-      sp.*
-     FROM subscriptions s
-     LEFT JOIN subscription_plans sp 
-     ON s.plan_id = sp.id
-     WHERE s.company_id = $1
-     ORDER BY s.id DESC
-     LIMIT 1`,
-    [companyId]
-  );
-
-  return result.rows[0] || null;
-}
-
-async function logActivity(user_name, user_role, action, module, details) {
-  try {
-    await pool.query(
-      `INSERT INTO user_activities
-      (user_name, user_role, action, module, details)
-      VALUES ($1, $2, $3, $4, $5)`,
-      [
-        user_name || "SystÃ¨me",
-        user_role || "Non dÃ©fini",
-        action,
-        module,
-        details || ""
-      ]
-    );
-  } catch (error) {
-    console.error("Erreur activitÃ© :", error);
-  }
-}
-
-async function logAudit(req, action, entityType = "", entityId = null, details = {}) {
-  try {
-    const user = req?.user || {};
-    await pool.query(
-      `INSERT INTO audit_logs
-       (user_id, user_email, user_role, company_id, action, entity_type, entity_id, ip_address, user_agent, details)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [
-        user.id || null,
-        user.email || "",
-        user.role || "",
-        getEffectiveCompanyId(req || {}) || user.company_id || null,
-        action,
-        entityType,
-        entityId,
-        req?.ip || req?.headers?.["x-forwarded-for"] || "",
-        typeof req?.get === "function" ? req.get("user-agent") || "" : req?.headers?.["user-agent"] || "",
-        JSON.stringify(details || {})
-      ]
-    );
-  } catch (error) {
-    console.error("Erreur audit log :", error.message || error);
-  }
-}
-
-function generateOtpCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-function hashVerificationSecret(value) {
-  return crypto
-    .createHash("sha256")
-    .update(`${String(value || "")}:${process.env.JWT_SECRET || JWT_SECRET}`)
-    .digest("hex");
-}
-
-function supportWhatsAppUrl() {
-  const number = String(process.env.SUPPORT_WHATSAPP_NUMBER || "").replace(/[^0-9]/g, "");
-  if (!number) return "";
-  const text = encodeURIComponent("Bonjour Triangle WMS Pro, j'ai besoin d'aide");
-  return `https://wa.me/${number}?text=${text}`;
-}
-
-function publicAppUrl() {
-  return String(process.env.APP_URL || process.env.PUBLIC_BASE_URL || process.env.FRONTEND_URL || "https://trianglewmspro.com").replace(/\/$/, "");
-}
-
-async function createVerificationCode({ companyId, userId, targetType, targetValue }) {
-  const code = generateOtpCode();
-  const token = crypto.randomBytes(24).toString("hex");
-  const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
-  const tokenHash = hashVerificationSecret(token);
-
-  await pool.query(
-    `UPDATE verification_codes
-     SET used_at=NOW()
-     WHERE used_at IS NULL
-       AND ($1::int IS NULL OR user_id=$1)
-       AND target_type=$2
-       AND LOWER(target_value)=LOWER($3)`,
-    [userId || null, targetType, targetValue]
-  );
-
-  await pool.query(
-    `INSERT INTO verification_codes
-     (company_id, user_id, target_type, target_value, code_hash, token_hash, expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6,NOW() + INTERVAL '10 minutes')`,
-    [companyId || null, userId || null, targetType, targetValue, codeHash, tokenHash]
-  );
-
-  return {
-    code,
-    token,
-    verify_url: `${publicAppUrl()}/verify-${targetType}?token=${token}`
-  };
-}
-
-async function sendVerificationMessage({ targetType, targetValue, code, verifyUrl }) {
-  if (targetType === "email") {
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return {
-        sent: false,
-        provider: "smtp",
-        message: "SMTP non configurÃ©. Configurez SMTP pour envoyer le code OTP rÃ©el."
-      };
-    }
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: targetValue,
-      subject: "Code de vÃ©rification Triangle WMS Pro",
-      text: `Votre code de vÃ©rification Triangle WMS Pro est : ${code}. Il expire dans 10 minutes.\n\nLien sÃ©curisÃ© : ${verifyUrl}`,
-      html: `
-        <div style="font-family:Arial,sans-serif;color:#111">
-          <h2>VÃ©rification Triangle WMS Pro</h2>
-          <p>Votre code de vÃ©rification est :</p>
-          <p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p>
-          <p>Ce code expire dans 10 minutes.</p>
-          <p><a href="${escapeHtml(verifyUrl)}">Valider directement mon compte</a></p>
-        </div>
-      `
-    });
-
-    return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code OTP envoyÃ© par email." };
-  }
-
-  if ((process.env.SMS_PROVIDER || "sandbox") === "sandbox" || !process.env.SMS_API_KEY) {
-    return {
-      sent: false,
-      provider: process.env.SMS_PROVIDER || "sms",
-      message: "Provider SMS non configurÃ©. Configurez Twilio, Africa's Talking, Orange API ou MTN API."
-    };
-  }
-
-  console.log("SMS OTP prÃªt Ã  envoyer :", { targetValue });
-  return { sent: false, provider: process.env.SMS_PROVIDER, message: "Provider SMS prÃ©parÃ©." };
-}
-
-async function sendPasswordResetMessage({ targetType, targetValue, code, resetUrl }) {
-  if (targetType === "email") {
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return {
-        sent: false,
-        provider: "smtp",
-        message: "SMTP non configurÃ©. Configurez SMTP pour envoyer le code de rÃ©initialisation."
-      };
-    }
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: targetValue,
-      subject: "RÃ©initialisation mot de passe Triangle WMS Pro",
-      text: `Votre code de rÃ©initialisation Triangle WMS Pro est : ${code}. Il expire dans 15 minutes.\n\nLien sÃ©curisÃ© : ${resetUrl}`,
-      html: `
-        <div style="font-family:Arial,sans-serif;color:#111">
-          <h2>RÃ©initialisation mot de passe</h2>
-          <p>Votre code de rÃ©initialisation est :</p>
-          <p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p>
-          <p>Ce code expire dans 15 minutes.</p>
-          <p><a href="${escapeHtml(resetUrl)}">CrÃ©er un nouveau mot de passe</a></p>
-        </div>
-      `
-    });
-
-    return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code envoyÃ© par email." };
-  }
-
-  return {
-    sent: false,
-    provider: process.env.SMS_PROVIDER || "sms",
-    message: "SMS/WhatsApp non configurÃ©. Utilisez un email ou configurez un provider SMS."
-  };
-}
-
-async function activateVerifiedAccount({ companyId, userId, targetType }) {
-  const userColumn = targetType === "phone" ? "phone_verified" : "email_verified";
-  const companyColumn = targetType === "phone" ? "phone_verified" : "email_verified";
-  const usersHasVerificationStatus = await columnExists("users", "verification_status");
-  const companiesHasVerificationStatus = await columnExists("companies", "verification_status");
-  const usersHasVerifiedAt = await columnExists("users", "verified_at");
-  const companiesHasVerifiedAt = await columnExists("companies", "verified_at");
-
-  await pool.query(
-    `UPDATE users
-     SET ${userColumn}=true,
-         account_status='active',
-         verification_required=false,
-         ${usersHasVerificationStatus ? "verification_status='verified'," : ""}
-         ${usersHasVerifiedAt ? "verified_at=COALESCE(verified_at, CURRENT_TIMESTAMP)," : ""}
-         invitation_status=CASE WHEN invitation_status='pending_verification' THEN 'active' ELSE invitation_status END,
-         updated_at=CURRENT_TIMESTAMP
-     WHERE id=$1`,
-    [userId]
-  );
-
-  await pool.query(
-    `UPDATE companies
-     SET ${companyColumn}=true,
-         account_status='active',
-         ${companiesHasVerificationStatus ? "verification_status='verified'," : ""}
-         ${companiesHasVerifiedAt ? "verified_at=COALESCE(verified_at, CURRENT_TIMESTAMP)," : ""}
-         subscription_status=COALESCE(NULLIF(subscription_status,''), 'trial'),
-         updated_at=CURRENT_TIMESTAMP
-     WHERE id=$1`,
-    [companyId]
-  );
-}
-
-async function createNotification({
-  user_id,
-  title,
-  message,
-  type,
-  company_id,
-  status = "unread",
-  priority = "normal",
-  related_entity_type = "",
-  related_entity_id = null,
-  action_url = "",
-  created_by = null,
-  assigned_to = null,
-  warehouse_id = null
-}) {
-  await pool.query(
-    `INSERT INTO notifications
-     (user_id, title, message, type, company_id, status, priority,
-      related_entity_type, related_entity_id, action_url, created_by,
-      assigned_to, warehouse_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-    [
-      user_id,
-      title,
-      message,
-      type,
-      company_id,
-      status,
-      priority,
-      related_entity_type,
-      related_entity_id,
-      action_url,
-      created_by,
-      assigned_to,
-      warehouse_id
-    ]
-  );
-}
-
-const COMPANY_MODULE_KEYS = [
-  "dashboard",
-  "recherche",
-  "assistant_ia",
-  "super_admin",
-  "chat",
-  "notifications",
-  "produits",
-  "partenaires",
-  "stock",
-  "mouvements",
-  "entrepots",
-  "emplacements",
-  "scanner",
-  "pos",
-  "marketplace",
-  "commandes_recues",
-  "ventes",
-  "paiements",
-  "recus",
-  "achats",
-  "fournisseurs",
-  "clients",
-  "pointage",
-  "pointage_qr",
-  "parametres_pointage",
-  "inventaire",
-  "ia",
-  "reunions",
-  "comptabilite",
-  "documents",
-  "rapports",
-  "alertes",
-  "activites",
-  "utilisateurs",
-  "badges",
-  "parametres",
-  "transport",
-  "crm",
-  "automobile",
-  "immobilier",
-  "hotel",
-  "restaurant",
-  "laboratoire",
-  "electronique",
-  "telephones",
-  "informatique",
-  "beaute",
-  "maison_meubles",
-  "services",
-  "education",
-  "wallet",
-  "voyage",
-  "social"
-];
-
-/* Modules effectivement actifs pour une sociÃ©tÃ© (niveau sociÃ©tÃ© seul :
-   profil mÃ©tier, plan, company_modules, dÃ©rogations super-admin). Sert Ã  la
-   rÃ©ponse de connexion et au cookie lu par le middleware du frontend.
-   Ancienne rÃ¨gle Â« pas de ligne = actif Â» : c'est elle qui ouvrait toutes les
-   verticales. La dÃ©cision passe dÃ©sormais par access-control.js. */
-async function getCompanyModules(companyId) {
-  const moduleKeys = [...new Set([...COMPANY_MODULE_KEYS, ...access.MODULE_CATALOG.map((m) => m.key)])];
-
-  if (!companyId) {
-    return moduleKeys.reduce((acc, key) => {
-      acc[key] = true;
-      return acc;
-    }, {});
-  }
-
-  const ctx = await access.loadAccessContext(pool, { companyId });
-  return moduleKeys.reduce((acc, key) => {
-    acc[key] = access.companyModuleState(ctx, key).enabled;
-    return acc;
-  }, {});
-}
-
-/* ============================================================
-   CONTRÃ”LE D'ACCÃˆS â€” application backend
-   ------------------------------------------------------------
-   Toute la dÃ©cision vit dans access-control.js : module de la
-   sociÃ©tÃ©, plan, dÃ©rogation super-admin, permission utilisateur,
-   dÃ©faut du rÃ´le. Ce bloc ne fait que l'appliquer aux requÃªtes.
-
-   Deux changements de fond par rapport Ã  l'ancienne version :
-   - les droits posÃ©s dans Â« Droits & permissions Â» (clÃ©s
-     commerce.stocksâ€¦) sont enfin lus par les gardes et le menu
-     (clÃ©s stockâ€¦), qui ne les rencontraient jamais ;
-   - en cas d'erreur, la garde REFUSE (503) au lieu de laisser
-     passer : une panne ne doit pas ouvrir les modules fermÃ©s.
-   ============================================================ */
-const rbac = require("./rbac");
-const access = require("./access-control");
-
-// DÃ©code le jeton si prÃ©sent (routes publiques â†’ renvoie null, auth gÃ©rÃ©e ailleurs).
-function resolveRequestUser(req) {
-  if (req.user) return req.user;
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!token) return null;
-  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
-}
-
-/* Contexte d'accÃ¨s de la requÃªte, chargÃ© une seule fois et partagÃ© par
-   toutes les gardes qu'elle traverse. */
-async function accessContextFor(req, user) {
-  if (req._accessCtx) return req._accessCtx;
-  req._accessCtx = await access.loadAccessContext(pool, {
-    companyId: user.company_id || getEffectiveCompanyId(req),
-    userId: user.id,
-    role: normalizeRole(user.role),
-    isSuperAdmin: isSuperAdminUser(user),
-  });
-  return req._accessCtx;
-}
-
-function refusAcces(res, verdict, key, action) {
-  const societe = verdict.level === "societe";
-  return res.status(403).json({
-    error: societe
-      ? `Module Â« ${key} Â» non disponible pour votre entreprise.`
-      : `Action Â« ${action} Â» non autorisÃ©e sur Â« ${key} Â».`,
-    code: societe ? "MODULE_DISABLED" : "PERMISSION_DENIED",
-    module: key,
-    action,
-    reason: verdict.reason,
-  });
-}
-
-function echecControle(res, where, error) {
-  console.error(`${where}:`, error.message || error);
-  return res.status(503).json({
-    error: "ContrÃ´le d'accÃ¨s momentanÃ©ment indisponible. RÃ©essayez.",
-    code: "ACCESS_CHECK_FAILED",
-  });
-}
-
-/* Garde globale : chaque route API rattachÃ©e Ã  un module (voir
-   access.API_ROUTE_RULES) exige l'accÃ¨s effectif pour l'action dÃ©duite
-   de la mÃ©thode HTTP. Les routes publiques (sans jeton) passent : leur
-   propre authenticateToken dÃ©cide. */
-async function moduleAccessGuard(req, res, next) {
-  const rule = access.ruleForPath(req.path);
-  if (!rule) return next();
-  const user = resolveRequestUser(req);
-  if (!user) return next();
-  if (isSuperAdminUser(user)) return next();
-  if (normalizeRole(user.role) === "customer") return next();
-  try {
-    const ctx = await accessContextFor(req, user);
-    if (!ctx.companyId) return next();
-    const action = access.actionForRequest(req.method, req.path);
-    let verdict = access.effectiveAccess(ctx, rule.module, action);
-    // DonnÃ©es de rÃ©fÃ©rence : un Ã©cran voisin peut les LIRE.
-    if (!verdict.allowed && action === "view" && Array.isArray(rule.readAlso)) {
-      const voisin = rule.readAlso.find((k) => access.effectiveAccess(ctx, k, "view").allowed);
-      if (voisin) verdict = { allowed: true, reason: `lecture_via_${voisin}` };
-    }
-    if (!verdict.allowed) return refusAcces(res, verdict, rule.module, action);
-    return next();
-  } catch (error) {
-    return echecControle(res, "moduleAccessGuard", error);
-  }
-}
-app.use(moduleAccessGuard);
-
-const METHOD_ACTION = {
-  GET: "view", HEAD: "view", OPTIONS: "view",
-  POST: "create", PUT: "update", PATCH: "update", DELETE: "delete",
-};
-
-/* Garde d'un module ou sous-module prÃ©cis (restaurant.cuisineâ€¦) ; l'action
-   est dÃ©duite de la mÃ©thode HTTP. */
-function requireModuleGuard(fullKey, opts = {}) {
-  const checkPermission = opts.checkPermission !== false;
-  return async (req, res, next) => {
-    const user = resolveRequestUser(req);
-    if (!user) return next();                    // route publique
-    if (isSuperAdminUser(user)) return next();   // super admin : accÃ¨s total
-    try {
-      const ctx = await accessContextFor(req, user);
-      if (!ctx.companyId) return next();
-      const action = METHOD_ACTION[req.method] || "view";
-      if (!checkPermission) {
-        const etat = access.companyModuleState(ctx, fullKey);
-        if (!etat.enabled) return refusAcces(res, { level: "societe", reason: etat.reason }, fullKey, action);
-        return next();
-      }
-      const verdict = access.effectiveAccess(ctx, fullKey, action);
-      if (!verdict.allowed) return refusAcces(res, verdict, fullKey, action);
-      return next();
-    } catch (error) {
-      return echecControle(res, "requireModuleGuard", error);
-    }
-  };
-}
-
-// Garde module simple (sans permission) pour les routers Ã  rÃ´les internes.
-function requireCompanyModule(moduleKey) {
-  return requireModuleGuard(moduleKey, { checkPermission: false });
-}
-
-// Middleware explicite rÃ©utilisable : requirePermission("produits", "create").
-function requirePermission(fullKey, action) {
-  return async (req, res, next) => {
-    const user = req.user || resolveRequestUser(req);
-    if (!user) return next();
-    if (isSuperAdminUser(user)) return next();
-    try {
-      const ctx = await accessContextFor(req, user);
-      if (!ctx.companyId) return next();
-      const verdict = access.effectiveAccess(ctx, fullKey, action);
-      if (!verdict.allowed) return refusAcces(res, verdict, fullKey, action);
-      return next();
-    } catch (error) {
-      return echecControle(res, "requirePermission", error);
-    }
-  };
-}
-
-// Compat : un module simple est-il actif pour l'entreprise ?
-async function isCompanyModuleEnabled(companyId, moduleKey) {
-  if (!companyId || !moduleKey) return true;
-  const ctx = await access.loadAccessContext(pool, { companyId });
-  return access.companyModuleState(ctx, moduleKey).enabled;
-}
-
-// Gardes SOUS-MODULES sur chemins CRUD prÃ©cis (accÃ¨s + permission par mÃ©thode).
-const SUBMODULE_ROUTE_GUARDS = [
-  // Restaurant
-  ["/restaurant/orders", "restaurant.commandes"],
-  ["/restaurant/menu-items", "restaurant.menu"],
-  ["/restaurant/tables", "restaurant.tables"],
-  // Ã‰ducation
-  ["/education/students", "education.eleves"],
-  ["/education/enrollments", "education.inscriptions"],
-  ["/education/exams", "education.notes"],
-  ["/education/grades", "education.notes"],
-  ["/education/teachers", "education.professeurs"],
-  ["/education/classes", "education.classes"],
-  ["/education/schedules", "education.emploi_du_temps"],
-  ["/education/attendance", "education.presences"],
-  ["/education/fee-plans", "education.mensualites"],
-  // Immobilier
-  ["/immobilier/properties", "immobilier.biens"],
-  ["/immobilier/rentals", "immobilier.locations"],
-  ["/immobilier/sales", "immobilier.ventes"],
-  ["/immobilier/hotel", "immobilier.hotel"],
-  // Automobile
-  ["/automobile/vehicles", "automobile.vehicules"],
-  ["/automobile/rentals", "automobile.locations"],
-  ["/automobile/sales", "automobile.ventes"],
-  // Voyage
-  ["/travel/partner", "voyage.partenaire"],
-  // /travel/bookings n'est plus gardÃ© par le module : ce sont les billets du
-  // VOYAGEUR (rÃ©server, payer, annuler), un service de plateforme ouvert Ã 
-  // tous. Le garder aurait interdit Ã  l'employÃ© d'une boutique de rÃ©server.
-];
-for (const [prefix, key] of SUBMODULE_ROUTE_GUARDS) app.use(prefix, requireModuleGuard(key));
-
-// ---------- RBAC : endpoints registre + droits employÃ©s ----------
-function isAdminLikeUser(user) {
-  const r = normalizeRole(user.role);
-  return isSuperAdminUser(user) || ["admin", "administrateur", "administrateur_entreprise", "direction", "directeur", "manager", "gerant"].includes(r);
-}
-const permBool = (v) => (v === true ? true : v === false ? false : null);
-
-// Registre RBAC (pour l'UI).
-app.get("/rbac/registry", authenticateToken, (req, res) => {
-  res.json({ actions: rbac.ACTIONS, submodules: rbac.SUBMODULES, labels: rbac.MODULE_LABELS });
-});
-
-// Droits effectifs de l'utilisateur courant.
-app.get("/rbac/me", authenticateToken, async (req, res) => {
-  try {
-    const ctx = await accessContextFor(req, req.user);
-    const keys = access.exposedKeys();
-    const effective = access.effectiveMap(ctx, keys);
-    const modules = {};
-    const disabled = [];
-    for (const key of keys) {
-      const actif = ctx.isSuperAdmin || access.companyModuleState(ctx, key).enabled;
-      if (!key.includes(".")) modules[key] = actif;
-      if (!actif) disabled.push(key);
-    }
-    const perms = await pool.query(`SELECT * FROM user_permissions WHERE user_id=$1`, [req.user.id]);
-    res.json({
-      role: req.user.role,
-      is_super_admin: isSuperAdminUser(req.user),
-      business_profile: ctx.profileKey,
-      // Sans sociÃ©tÃ© (client marketplaceâ€¦), aucune garde de module ne s'applique.
-      has_company: Boolean(ctx.companyId),
-      modules,
-      disabled_keys: disabled,
-      permissions: perms.rows,
-      // Verdict final, calculÃ© par le mÃªme moteur que les gardes API.
-      effective,
-      page_routes: access.PAGE_ROUTE_RULES,
-    });
-  } catch (error) {
-    console.error("rbac/me:", error);
-    res.status(500).json({ error: "Erreur RBAC" });
-  }
-});
-
-// Droits d'un employÃ© (admin entreprise) â€” scoping strict via le token (PHASE 9).
-app.get("/company/users/:id/permissions", authenticateToken, async (req, res) => {
-  try {
-    if (!isAdminLikeUser(req.user)) return res.status(403).json({ error: "RÃ©servÃ© Ã  l'administration de l'entreprise." });
-    const companyId = getEffectiveCompanyId(req) || req.user.company_id;
-    const target = (await pool.query(`SELECT id, fullname, role, company_id, is_super_admin FROM users WHERE id=$1`, [req.params.id])).rows[0];
-    if (!target) return res.status(404).json({ error: "EmployÃ© introuvable" });
-    if (!isSuperAdminUser(req.user) && Number(target.company_id) !== Number(companyId)) {
-      return res.status(403).json({ error: "EmployÃ© d'une autre entreprise." });
-    }
-    const perms = (await pool.query(`SELECT * FROM user_permissions WHERE user_id=$1`, [target.id])).rows;
-    const modules = await getCompanyModules(target.company_id);
-
-    /* L'ancien Ã©cran affichait Â« dÃ©cochÃ© Â» pour toute case sans ligne
-       enregistrÃ©e, alors que l'accÃ¨s rÃ©el Ã©tait Â« autorisÃ© Â». Il reÃ§oit
-       dÃ©sormais, pour chaque clÃ© du registre, la valeur qui s'applique
-       VRAIMENT (ligne explicite, sinon dÃ©faut du rÃ´le) et le dÃ©faut du rÃ´le
-       seul, pour le bouton Â« RÃ©initialiser selon le rÃ´le Â». */
-    const ctx = await access.loadAccessContext(pool, {
-      companyId: target.company_id, userId: target.id,
-      role: normalizeRole(target.role), isSuperAdmin: false,
-    });
-    const effective = {};
-    const roleDefaults = {};
-    const explicit = {};
-    const registre = rbac.allModuleKeys();
-    const lignes = new Map(perms.map((p) => [p.module_key, p]));
-    for (const key of registre) {
-      effective[key] = {};
-      explicit[key] = {};
-      roleDefaults[key] = rbac.defaultPermissionsForRole(normalizeRole(target.role), key);
-      const ligne = lignes.get(key);
-      for (const action of rbac.ACTIONS) {
-        const valeur = ligne ? ligne[rbac.ACTION_COLUMN[action]] : null;
-        explicit[key][action] = valeur === true || valeur === false;
-        effective[key][action] = explicit[key][action] ? valeur === true : roleDefaults[key][action] === true;
-      }
-    }
-    // Modules fermÃ©s au niveau de la sociÃ©tÃ© : non attribuables ici.
-    const indisponibles = registre.filter((k) => !access.companyModuleState(ctx, k).enabled);
-
-    res.json({
-      user: { id: target.id, fullname: target.fullname, role: target.role },
-      modules, permissions: perms,
-      effective, role_defaults: roleDefaults, explicit,
-      unavailable_keys: indisponibles,
-    });
-  } catch (error) {
-    console.error("company/users/permissions GET:", error);
-    res.status(500).json({ error: "Erreur droits employÃ©" });
-  }
-});
-
-// Enregistre les droits d'un employÃ© (PHASE 5-6-8). RÃ¨gle 5 : jamais de droit
-// sur un module dÃ©sactivÃ© pour l'entreprise.
-app.put("/company/users/:id/permissions", authenticateToken, async (req, res) => {
-  try {
-    if (!isAdminLikeUser(req.user)) return res.status(403).json({ error: "RÃ©servÃ© Ã  l'administration de l'entreprise." });
-    const companyId = getEffectiveCompanyId(req) || req.user.company_id;
-    const target = (await pool.query(`SELECT id, company_id FROM users WHERE id=$1`, [req.params.id])).rows[0];
-    if (!target) return res.status(404).json({ error: "EmployÃ© introuvable" });
-    if (!isSuperAdminUser(req.user) && Number(target.company_id) !== Number(companyId)) {
-      return res.status(403).json({ error: "EmployÃ© d'une autre entreprise." });
-    }
-    const items = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
-    const companyModules = await getCompanyModules(target.company_id);
-    let count = 0;
-    for (const it of items) {
-      const key = String(it.module_key || "").trim();
-      if (!key) continue;
-      const { moduleKey } = rbac.splitKey(key);
-      if (companyModules[moduleKey] === false) continue; // rÃ¨gle 5
-      await pool.query(
-        `INSERT INTO user_permissions
-           (user_id, module_key, can_view, can_create, can_edit, can_delete, can_validate,
-            can_import, can_export, can_print, can_cancel, can_share, updated_by, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
-         ON CONFLICT (user_id, module_key) DO UPDATE SET
-           can_view=EXCLUDED.can_view, can_create=EXCLUDED.can_create, can_edit=EXCLUDED.can_edit,
-           can_delete=EXCLUDED.can_delete, can_validate=EXCLUDED.can_validate, can_import=EXCLUDED.can_import,
-           can_export=EXCLUDED.can_export, can_print=EXCLUDED.can_print, can_cancel=EXCLUDED.can_cancel,
-           can_share=EXCLUDED.can_share, updated_by=EXCLUDED.updated_by, updated_at=NOW()`,
-        [target.id, key, permBool(it.view), permBool(it.create), permBool(it.update), permBool(it.delete),
-         permBool(it.validate), permBool(it.import), permBool(it.export), permBool(it.print),
-         permBool(it.cancel), permBool(it.share), req.user.id]
-      );
-      count++;
-    }
-    res.json({ ok: true, count });
-  } catch (error) {
-    console.error("company/users/permissions PUT:", error);
-    res.status(500).json({ error: "Erreur mise Ã  jour droits" });
-  }
-});
-
-// Toggle des SOUS-MODULES pour sa propre entreprise (admin). RÃ¨gle 16 : les
-// modules principaux restent rÃ©servÃ©s au Super Admin (clÃ© sans point refusÃ©e).
-app.put("/company/modules", authenticateToken, async (req, res) => {
-  try {
-    if (!isAdminLikeUser(req.user)) return res.status(403).json({ error: "RÃ©servÃ© Ã  l'administration de l'entreprise." });
-    const companyId = getEffectiveCompanyId(req) || req.user.company_id;
-    const modules = (req.body && req.body.modules) || {};
-    let count = 0;
-    for (const [key, val] of Object.entries(modules)) {
-      if (!isSuperAdminUser(req.user) && !key.includes(".")) continue; // rÃ¨gle 16
-      const source = isSuperAdminUser(req.user) ? "super_admin" : "societe";
-      await pool.query(
-        `INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, updated_by, source)
-         VALUES ($1,$2,$3,$3,$4,$5)
-         ON CONFLICT (company_id, module_key) DO UPDATE SET
-           is_enabled=EXCLUDED.is_enabled, enabled=EXCLUDED.enabled, updated_by=EXCLUDED.updated_by,
-           source=EXCLUDED.source, updated_at=NOW()`,
-        [companyId, key, val === true, req.user.id, source]
-      );
-      count++;
-    }
-    res.json({ ok: true, count });
-  } catch (error) {
-    console.error("company/modules PUT:", error);
-    res.status(500).json({ error: "Erreur modules entreprise" });
-  }
-});
-
-async function tableExists(tableName) {
-  const result = await pool.query("SELECT to_regclass($1) AS table_name", [
-    `public.${tableName}`
-  ]);
-  return Boolean(result.rows[0]?.table_name);
-}
-
-async function columnExists(tableName, columnName) {
-  const result = await pool.query(
-    `SELECT 1
-     FROM information_schema.columns
-     WHERE table_schema='public'
-       AND table_name=$1
-       AND column_name=$2
-     LIMIT 1`,
-    [tableName, columnName]
-  );
-  return result.rows.length > 0;
-}
-
-async function ensureDefaultSubscriptionPlans() {
-  const defaultPlans = [
-    {
-      name: "Essentiel",
-      price_monthly: 5000,
-      max_users: 3,
-      max_warehouses: 1,
-      max_products: 200,
-      max_movements_monthly: 500,
-      trial_days: 15
-    },
-    {
-      name: "Standard",
-      price_monthly: 10000,
-      max_users: 10,
-      max_warehouses: 3,
-      max_products: 2000,
-      max_movements_monthly: 3000,
-      trial_days: 15
-    },
-    {
-      name: "Premium",
-      price_monthly: 15000,
-      max_users: 30,
-      max_warehouses: 10,
-      max_products: 10000,
-      max_movements_monthly: 20000,
-      trial_days: 15
-    }
-  ];
-
-  for (const plan of defaultPlans) {
-    await pool.query(
-      `INSERT INTO subscription_plans
-       (
-         name,
-         price_monthly,
-         max_users,
-         max_warehouses,
-         max_products,
-         max_movements_monthly,
-         trial_days,
-         modules,
-         can_use_reports,
-         can_use_qr,
-         can_use_advanced_inventory,
-         can_use_documents,
-         can_use_chat,
-         can_use_ai
-       )
-       SELECT
-         $1::varchar,
-         $2::numeric,
-         $3::integer,
-         $4::integer,
-         $5::integer,
-         $6::integer,
-         $7::integer,
-         $8::text,
-         true,
-         true,
-         true,
-         true,
-         true,
-         true
-       WHERE NOT EXISTS (
-         SELECT 1 FROM subscription_plans WHERE name=$1::varchar
-       )`,
-      [
-        plan.name,
-        plan.price_monthly,
-        plan.max_users,
-        plan.max_warehouses,
-        plan.max_products,
-        plan.max_movements_monthly,
-        plan.trial_days,
-        "all"
-      ]
-    );
-  }
-
-  await pool.query(`
-    UPDATE subscription_plans
-    SET
-      max_users = CASE
-        WHEN LOWER(name)='premium' AND COALESCE(max_users,0) <= 0 THEN 30
-        WHEN LOWER(name)='standard' AND COALESCE(max_users,0) <= 0 THEN 10
-        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_users,0) <= 0 THEN 3
-        ELSE max_users
-      END,
-      max_warehouses = CASE
-        WHEN LOWER(name)='premium' AND COALESCE(max_warehouses,0) <= 0 THEN 10
-        WHEN LOWER(name)='standard' AND COALESCE(max_warehouses,0) <= 0 THEN 3
-        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_warehouses,0) <= 0 THEN 1
-        ELSE max_warehouses
-      END,
-      max_products = CASE
-        WHEN LOWER(name)='premium' AND COALESCE(max_products,0) <= 0 THEN 10000
-        WHEN LOWER(name)='standard' AND COALESCE(max_products,0) < 2000 THEN 2000
-        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_products,0) < 300 THEN 300
-        ELSE max_products
-      END,
-      max_movements_monthly = CASE
-        WHEN LOWER(name)='premium' AND COALESCE(max_movements_monthly,0) <= 0 THEN 20000
-        WHEN LOWER(name)='standard' AND COALESCE(max_movements_monthly,0) <= 0 THEN 3000
-        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_movements_monthly,0) <= 0 THEN 500
-        ELSE max_movements_monthly
-      END,
-      max_modules_allowed = CASE
-        WHEN LOWER(name)='premium' AND COALESCE(max_modules_allowed,0) <= 0 THEN 999
-        WHEN LOWER(name)='standard' AND COALESCE(max_modules_allowed,0) <= 0 THEN 12
-        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_modules_allowed,0) <= 0 THEN 5
-        ELSE max_modules_allowed
-      END
-    WHERE LOWER(name) IN ('essentiel','starter','standard','premium')
-  `);
-}
-
-app.get("/", (req, res) => {
-  res.send("Triangle WMS Backend sÃ©curisÃ© OK");
-});
-
-/* UPLOAD LOGO */
-app.post(
-  "/upload-logo",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  upload.single("logo"),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "Aucun fichier reÃ§u" });
-      }
-
-      const logoUrl = publicUploadUrl(req, req.file.filename);
-
-      res.json({
-        message: "Logo uploadÃ© avec succÃ¨s",
-        logo_url: logoUrl
-      });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: "Erreur upload logo" });
-    }
-  }
-);
-
-/* UPLOAD PHOTO UTILISATEUR */
-app.post("/upload-user-photo", authenticateToken, upload.single("photo"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "Aucune photo reÃ§ue" });
-    }
-
-    const photoUrl = publicUploadUrl(req, req.file.filename);
-
-    res.json({
-      message: "Photo utilisateur uploadÃ©e avec succÃ¨s",
-      profile_image_url: photoUrl
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur upload photo utilisateur" });
-  }
-});
-
-app.post(
-  "/upload-product-image",
-  authenticateToken,
-  uploadProductImage.single("image"),
-  async (req, res) => {
-    try {
-      if (isReadOnlyRole(req.user)) {
-        return res.status(403).json({ error: "AccÃ¨s lecture seule." });
-      }
-
-      if (!req.file) {
-        return res.status(400).json({ error: "Aucune image reÃ§ue" });
-      }
-
-      const imageUrl = publicUploadUrl(req, `products/${req.file.filename}`);
-
-      res.status(201).json({
-        message: "Image produit uploadÃ©e avec succÃ¨s",
-        image_url: imageUrl
-      });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: error.message || "Erreur upload image produit" });
-    }
-  }
-);
-
-/* PARAMÃˆTRES ENTREPRISE */
-app.get("/company-settings", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
-    );
-
-    res.json(result.rows[0] || null);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture paramÃ¨tres entreprise" });
-  }
-});
-
-app.get("/company-settings/current", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-
-    if (!companyId && isSuperAdminUser(req.user)) {
-      return res.json({
-        company_name: "Plateforme globale",
-        logo_url: "",
-        plan_name: "Administrateur systÃ¨me",
-        subscription_status: "IllimitÃ©",
-        is_platform: true
-      });
-    }
-
-    const settingsResult = await pool.query(
-      `SELECT cs.*, c.name AS registered_company_name
-       FROM company_settings cs
-       LEFT JOIN companies c ON c.id=cs.company_id
-       WHERE cs.company_id=$1 OR cs.company_id IS NULL
-       ORDER BY CASE WHEN cs.company_id=$1 THEN 0 ELSE 1 END, cs.id ASC
-       LIMIT 1`,
-      [companyId]
-    );
-    const companyResult = await pool.query(
-      `SELECT c.*, s.status AS subscription_status, sp.name AS plan_name
-       FROM companies c
-       LEFT JOIN subscriptions s ON s.company_id=c.id
-       LEFT JOIN subscription_plans sp ON sp.id=s.plan_id
-       WHERE c.id=$1
-       ORDER BY s.id DESC
-       LIMIT 1`,
-      [companyId]
-    );
-    const settings = settingsResult.rows[0] || {};
-    const company = companyResult.rows[0] || {};
-
-    res.json({
-      ...settings,
-      company_id: companyId,
-      company_name: settings.company_name || company.name || "Triangle WMS Pro",
-      logo_url: settings.logo_url || "",
-      plan_name: company.plan_name || "",
-      subscription_status: company.subscription_status || "",
-      business_type: company.business_type || ""
-    });
-  } catch (error) {
-    console.error("ERREUR COMPANY SETTINGS CURRENT :", error);
-    res.status(500).json({ error: "Erreur identitÃ© entreprise" });
-  }
-});
-
-app.put(
-  "/company-settings",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-  try {
-    if (isReadOnlyRole(req.user)) {
-      return res.status(403).json({ error: "Vous avez un accÃ¨s lecture seule." });
-    }
-
-    const {
-      company_name,
-      address,
-      phone,
-      email,
-      website,
-      logo_url,
-      slogan,
-      city,
-      country,
-      description,
-      business_sector,
-      currency,
-      language,
-      opening_hours,
-      facebook_url,
-      whatsapp_number,
-      instagram_url,
-      is_public,
-      business_type
-    } = req.body;
-    const companyId = getEffectiveCompanyId(req);
-
-    // Colonnes Ã©tendues (migration 046) : on ne les Ã©crit que si elles
-    // existent, pour ne pas casser une base non migrÃ©e.
-    const hasExtendedColumns = await columnExists("company_settings", "city");
-
-    const existing = await pool.query(
-      `SELECT id FROM company_settings
-       WHERE company_id=$1 OR ($1::int IS NULL AND company_id IS NULL)
-       ORDER BY id ASC LIMIT 1`,
-      [companyId]
-    );
-
-    let saved;
-    if (existing.rows.length === 0) {
-      saved = await pool.query(
-        `INSERT INTO company_settings
-        (company_id, company_name, address, phone, email, website, logo_url, slogan)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        RETURNING *`,
-        [companyId, company_name, address, phone, email, website, logo_url, slogan]
-      );
-    } else {
-      saved = await pool.query(
-        `UPDATE company_settings
-         SET company_name=$1,
-             address=$2,
-             phone=$3,
-             email=$4,
-             website=$5,
-             logo_url=$6,
-             slogan=$7,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$8
-         RETURNING *`,
-        [company_name, address, phone, email, website, logo_url, slogan, existing.rows[0].id]
-      );
-    }
-
-    const settingsId = saved.rows[0].id;
-
-    if (hasExtendedColumns) {
-      saved = await pool.query(
-        `UPDATE company_settings
-         SET city=COALESCE($1, city),
-             country=COALESCE($2, country),
-             description=COALESCE($3, description),
-             business_sector=COALESCE($4, business_sector),
-             currency=COALESCE($5, currency),
-             language=COALESCE($6, language),
-             opening_hours=COALESCE($7, opening_hours),
-             facebook_url=COALESCE($8, facebook_url),
-             whatsapp_number=COALESCE($9, whatsapp_number),
-             instagram_url=COALESCE($10, instagram_url),
-             is_public=COALESCE($11, is_public),
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$12
-         RETURNING *`,
-        [
-          city ?? null,
-          country ?? null,
-          description ?? null,
-          business_sector ?? null,
-          currency ?? null,
-          language ?? null,
-          opening_hours ?? null,
-          facebook_url ?? null,
-          whatsapp_number ?? null,
-          instagram_url ?? null,
-          typeof is_public === "boolean" ? is_public : null,
-          settingsId
-        ]
-      );
-    }
-
-    // Le type d'activitÃ© vit sur companies : il pilote le dashboard adaptatif.
-    if (business_type !== undefined && companyId) {
-      await pool.query(
-        `UPDATE companies SET business_type=$1 WHERE id=$2`,
-        [String(business_type || ""), companyId]
-      );
-    }
-
-    const updated = saved;
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Modification paramÃ¨tres entreprise",
-      "ParamÃ¨tres",
-      `ParamÃ¨tres entreprise modifiÃ©s : ${company_name}`
-    );
-
-    res.json(updated.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res
-      .status(500)
-      .json({ error: "Erreur modification paramÃ¨tres entreprise" });
-  }
-});
-
-/* REGISTER SAAS - AVEC PLAN CHOISI */
-app.post("/register-saas", async (req, res) => {
-  try {
-    const {
-      company_name,
-      business_type,
-      responsible_name,
-      email,
-      phone,
-      address,
-      password,
-      plan_id,
-      plan_name,
-      plan_price,
-      selected_modules = {}
-    } = req.body;
-
-    const cleanEmail = String(email || "").trim().toLowerCase();
-    const cleanPhone = normalizeMaliPhone(phone);
-
-    if (!company_name || !responsible_name || !password || (!cleanEmail && !cleanPhone)) {
-      return res.status(400).json({
-        error: "Nom entreprise, responsable, mot de passe et au moins un contact email ou tÃ©lÃ©phone sont obligatoires."
-      });
-    }
-
-    const passwordError = validatePasswordStrength(password);
-    if (passwordError) {
-      return res.status(400).json({ error: passwordError });
-    }
-
-    await ensureDefaultSubscriptionPlans();
-
-    let planResult;
-
-    if (Number.isInteger(Number(plan_id))) {
-      planResult = await pool.query(
-        `
-        SELECT *
-        FROM subscription_plans
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [Number(plan_id)]
-      );
-    } else {
-      planResult = { rows: [] };
-    }
-
-    if (planResult.rows.length === 0 && plan_name) {
-      planResult = await pool.query(
-        `
-        SELECT *
-        FROM subscription_plans
-        WHERE LOWER(name) = LOWER($1)
-        LIMIT 1
-        `,
-        [plan_name]
-      );
-    }
-
-    if (planResult.rows.length === 0 && plan_price) {
-      planResult = await pool.query(
-        `
-        SELECT *
-        FROM subscription_plans
-        WHERE price_monthly = $1
-        ORDER BY id ASC
-        LIMIT 1
-        `,
-        [Number(plan_price)]
-      );
-    }
-
-    if (planResult.rows.length === 0) {
-      return res.status(404).json({
-        error: "Plan introuvable"
-      });
-    }
-
-    const plan = planResult.rows[0];
-    /* Seules les offres publiques et actives sont souscrivables ici. Les
-       anciennes offres (Standard, Premium) restent en place pour leurs
-       abonnÃ©s, mais ne se choisissent plus Ã  l'inscription. */
-    if (plan.is_public !== true || plan.is_active === false) {
-      return res.status(400).json({
-        error: "Cette offre n'est plus proposÃ©e Ã  l'inscription. Choisissez Starter, Business ou Pro.",
-        code: "PLAN_NOT_OFFERED",
-      });
-    }
-    const requestedModules =
-      Array.isArray(selected_modules)
-        ? selected_modules.reduce((acc, key) => {
-            acc[key] = true;
-            return acc;
-          }, {})
-        : selected_modules && typeof selected_modules === "object"
-          ? selected_modules
-          : {};
-    /* SÃ©lection finale des modules â€” type d'activitÃ© + plan + choix.
-       Avant : tout module absent de la requÃªte Ã©tait ACTIVÃ‰, et le formulaire
-       cochait tout par dÃ©faut ; une boutique recevait Restaurant, Ã‰ducation,
-       Laboratoireâ€¦ La rÃ¨gle est dÃ©sormais :
-         - le profil mÃ©tier fournit la sÃ©lection de dÃ©part ;
-         - l'offre retire ce qu'elle n'inclut pas ;
-         - une verticale hors profil ne s'ajoute pas Ã  l'inscription (seul le
-           super-admin peut l'accorder ensuite) ;
-         - la limite du plan compte les modules AJOUTÃ‰S au-delÃ  du profil.  */
-    const profilMetier = access.normalizeBusinessType(business_type);
-    const modulesDuProfil = access.profileModules(profilMetier);
-    const exclusParLOffre = new Set(Array.isArray(plan.excluded_modules) ? plan.excluded_modules : []);
-    const demandes = new Set(
-      Object.entries(requestedModules)
-        .filter(([, value]) => value === true)
-        .map(([key]) => access.normalizeKey(key))
-    );
-    const selectionDemandee = demandes.size > 0 ? demandes : modulesDuProfil;
-    const modulesFinaux = {};
-    for (const entry of access.MODULE_CATALOG) {
-      if (entry.core) { modulesFinaux[entry.key] = true; continue; }
-      let actif = selectionDemandee.has(entry.key);
-      if (exclusParLOffre.has(entry.key)) actif = false;
-      const optionOuverte = entry.group === "options";
-      if (entry.vertical && !optionOuverte && !modulesDuProfil.has(entry.key)) actif = false;
-      modulesFinaux[entry.key] = actif;
-    }
-    const ajouts = Object.keys(modulesFinaux).filter((k) => modulesFinaux[k] && !modulesDuProfil.has(k));
-    const maxModulesAllowed = Number(plan.max_modules_allowed || 0);
-
-    if (maxModulesAllowed > 0 && maxModulesAllowed < 999 && ajouts.length > maxModulesAllowed) {
-      return res.status(400).json({
-        error: `L'offre ${plan.name} permet d'ajouter ${maxModulesAllowed} module(s) au-delÃ  de votre activitÃ© ; vous en avez ajoutÃ© ${ajouts.length}.`,
-        code: "MODULE_LIMIT",
-        added_modules: ajouts,
-        limit: maxModulesAllowed,
-      });
-    }
-
-    if (cleanPhone) {
-      const phoneDigits = maliPhoneVariants(cleanPhone).map((variant) => variant.replace(/[^0-9]/g, ""));
-      const existingPhone = await pool.query(
-        `SELECT id FROM users
-         WHERE regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = ANY($1)
-         LIMIT 1`,
-        [phoneDigits]
-      );
-      if (existingPhone.rows.length > 0) {
-        return res.status(400).json({
-          error: "NumÃ©ro de tÃ©lÃ©phone dÃ©jÃ  utilisÃ©. Connectez-vous avec votre numÃ©ro de tÃ©lÃ©phone."
-        });
-      }
-    }
-
-    const existingUser = await pool.query(
-      `SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
-      [cleanEmail || `phone-${cleanPhone}@pending.trianglewmspro.local`]
-    );
-
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({
-        error: "Cet email existe dÃ©jÃ ."
-      });
-    }
-
-    const trialDays = Number(plan.trial_days || 15);
-    const generatedEmail = cleanEmail || `phone-${crypto.randomBytes(8).toString("hex")}@pending.trianglewmspro.local`;
-    /* Inscription par tÃ©lÃ©phone seul : pas de vÃ©rification SMS pour l'instant
-       (aucun provider SMS branchÃ©) â€” compte actif immÃ©diatement.
-       Avec email : le flux de vÃ©rification existant est conservÃ©. */
-    const phoneOnlyRegistration = !cleanEmail;
-    /* Tenant de l'inscription : sans lui, la colonne prend le dÃ©faut
-       'triangle' et l'entreprise ne peut jamais se connecter depuis
-       malilinkglobal.com ("compte n'appartient pas Ã  cette version"). */
-    const registrationTenant = getTenantFromRequest(req);
-
-    const companyResult = await pool.query(
-      `
-      INSERT INTO companies
-      (
-        name,
-        business_type,
-        responsible_name,
-        email,
-        phone,
-        address,
-        plan_id,
-        subscription_status,
-        trial_ends_at,
-        email_verified,
-        phone_verified,
-        account_status,
-        trial_start_date,
-        trial_end_date,
-        subscription_plan,
-        subscription_expires_at,
-        tenant_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + ($9 || ' days')::interval,$10,$11,$12,NOW(),NOW() + ($9 || ' days')::interval,$13,NOW() + ($9 || ' days')::interval,$14)
-      RETURNING *
-      `,
-      [
-        company_name,
-        business_type || "",
-        responsible_name,
-        cleanEmail,
-        cleanPhone,
-        address || "",
-        plan.id,
-        "trial",
-        trialDays,
-        false,
-        phoneOnlyRegistration,
-        phoneOnlyRegistration ? "active" : "pending_verification",
-        plan.name || plan_name || "",
-        registrationTenant
-      ]
-    );
-
-    const company = companyResult.rows[0];
-    const hashedPassword = await hashPassword(password);
-
-    const userResult = await pool.query(
-      `
-      INSERT INTO users
-      (
-        fullname,
-        email,
-        password,
-        role,
-        company_id,
-        is_super_admin,
-        badge_code,
-        phone,
-        email_verified,
-        phone_verified,
-        account_status,
-        invitation_status,
-        verification_required,
-        tenant_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      RETURNING *
-      `,
-      [
-        responsible_name,
-        generatedEmail,
-        hashedPassword,
-        "admin",
-        company.id,
-        false,
-        `TRIANGLE-EMP-${company.id}-${Date.now()}`,
-        cleanPhone,
-        false,
-        phoneOnlyRegistration,
-        phoneOnlyRegistration ? "active" : "pending_verification",
-        phoneOnlyRegistration ? "active" : "pending_verification",
-        !phoneOnlyRegistration,
-        registrationTenant
-      ]
-    );
-
-    const user = userResult.rows[0];
-
-    await pool.query(
-      `
-      INSERT INTO subscriptions
-      (
-        company_id,
-        plan_id,
-        start_date,
-        end_date,
-        status,
-        payment_status,
-        installation_fee
-      )
-      VALUES ($1,$2,NOW(),NOW() + ($3 || ' days')::interval,$4,$5,$6)
-      `,
-      [
-        company.id,
-        plan.id,
-        Number(plan.trial_days || 15),
-        "trial",
-        "free_trial",
-        // Montant annoncÃ© au client, figÃ© : un changement de tarif ultÃ©rieur
-        // ne rÃ©Ã©crit pas ce qui a Ã©tÃ© convenu.
-        Number(plan.installation_fee || 0)
-      ]
-    );
-
-    let verification = null;
-    let delivery = null;
-    const targetType = cleanEmail ? "email" : "phone";
-    const targetValue = cleanEmail || cleanPhone;
-
-    if (!phoneOnlyRegistration) {
-      verification = await createVerificationCode({
-        companyId: company.id,
-        userId: user.id,
-        targetType,
-        targetValue
-      });
-      delivery = await sendVerificationMessage({
-        targetType,
-        targetValue,
-        code: verification.code,
-        verifyUrl: verification.verify_url
-      });
-    }
-
-    /* Une ligne EXPLICITE par module du catalogue, activÃ© ou non : plus
-       aucun module ne dÃ©pend d'un Â« pas de ligne = actif Â». */
-    for (const [moduleKey, isEnabled] of Object.entries(modulesFinaux)) {
-      await pool.query(
-        `INSERT INTO company_modules
-         (company_id, module_key, is_enabled, enabled, updated_by, source)
-         VALUES ($1,$2,$3,$3,$4,'inscription')
-         ON CONFLICT (company_id, module_key)
-         DO UPDATE SET
-           is_enabled=EXCLUDED.is_enabled,
-           enabled=EXCLUDED.enabled,
-           updated_by=EXCLUDED.updated_by,
-           source=EXCLUDED.source,
-           updated_at=CURRENT_TIMESTAMP`,
-        [company.id, moduleKey, isEnabled, user.id]
-      );
-    }
-
-    res.status(201).json({
-      success: true,
-      message: phoneOnlyRegistration
-        ? "Compte crÃ©Ã© avec succÃ¨s. Connectez-vous avec votre numÃ©ro de tÃ©lÃ©phone."
-        : "Entreprise crÃ©Ã©e. VÃ©rification obligatoire avant accÃ¨s complet.",
-      company,
-      user,
-      plan,
-      verification: phoneOnlyRegistration
-        ? { required: false }
-        : {
-            required: true,
-            target_type: targetType,
-            target_value: targetValue,
-            delivery,
-            verify_url: verification.verify_url
-          }
-    });
-  } catch (error) {
-    console.error("ERREUR REGISTER SAAS :", error);
-
-    res.status(500).json({
-      error: error.message || "Erreur crÃ©ation entreprise SaaS",
-      code: error.code || "",
-      detail: error.detail || "",
-      table: error.table || "",
-      column: error.column || ""
-    });
-  }
-});
-
-app.post("/password-reset/request", async (req, res) => {
-  try {
-    const identifier = String(req.body?.identifier || "").trim();
-    const accountType = String(req.body?.account_type || "auto").toLowerCase();
-
-    if (!identifier) {
-      return res.status(400).json({ error: "Email ou tÃ©lÃ©phone obligatoire." });
-    }
-
-    const usersHasPhone = await columnExists("users", "phone");
-    const looksLikeEmail = identifier.includes("@");
-    const normalizedPhone = identifier.replace(/[^0-9+]/g, "");
-    const targetType = looksLikeEmail ? "email" : "phone";
-    const targetValue = looksLikeEmail ? identifier.toLowerCase() : normalizedPhone;
-
-    if (targetType === "phone" && (!usersHasPhone || normalizedPhone.length < 6)) {
-      return res.status(400).json({ error: "TÃ©lÃ©phone invalide." });
-    }
-
-    const result = await pool.query(
-      `SELECT id, email, phone, role, company_id, is_active
-       FROM users
-       WHERE ${looksLikeEmail ? "LOWER(email)=LOWER($1)" : "regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g')=$1"}
-       ORDER BY id DESC
-       LIMIT 1`,
-      [targetValue]
-    );
-    const user = result.rows[0];
-    const genericMessage = "Si ce compte existe, un code de rÃ©initialisation a Ã©tÃ© envoyÃ©.";
-
-    if (!user) {
-      return res.json({ success: true, message: genericMessage });
-    }
-
-    const role = normalizeRole(user.role);
-    if (accountType === "client" && role !== "customer") {
-      return res.json({ success: true, message: genericMessage });
-    }
-    if (accountType === "enterprise" && role === "customer") {
-      return res.json({ success: true, message: genericMessage });
-    }
-    if (user.is_active === false) {
-      return res.status(403).json({ error: "Compte dÃ©sactivÃ©. Contactez un administrateur." });
-    }
-
-    const code = generateOtpCode();
-    const token = crypto.randomBytes(24).toString("hex");
-    const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
-    const tokenHash = hashVerificationSecret(token);
-
-    await pool.query(
-      `UPDATE password_reset_codes
-       SET used_at=NOW()
-       WHERE used_at IS NULL AND user_id=$1`,
-      [user.id]
-    );
-
-    const created = await pool.query(
-      `INSERT INTO password_reset_codes
-       (user_id, company_id, target_type, target_value, code_hash, token_hash, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW() + INTERVAL '15 minutes')
-       RETURNING id`,
-      [user.id, user.company_id || null, targetType, targetValue, codeHash, tokenHash]
-    );
-
-    const resetUrl = `${publicAppUrl()}/mot-de-passe-oublie?token=${token}`;
-    const delivery = await sendPasswordResetMessage({
-      targetType,
-      targetValue,
-      code,
-      resetUrl
-    });
-
-    if (!delivery.sent) {
-      return res.status(503).json({
-        error: delivery.message,
-        provider: delivery.provider
-      });
-    }
-
-    await logAudit(
-      { ...req, user: { id: user.id, company_id: user.company_id, role: user.role, email: user.email } },
-      "password_reset_requested",
-      "password_reset_code",
-      created.rows[0].id,
-      { target_type: targetType, provider: delivery.provider }
-    );
-
-    res.json({
-      success: true,
-      message: delivery.message || genericMessage,
-      target_type: targetType,
-      target_value: targetValue,
-      token_hint: token ? "" : undefined
-    });
-  } catch (error) {
-    console.error("ERREUR PASSWORD RESET REQUEST :", error);
-    res.status(500).json({ error: "Erreur demande rÃ©initialisation mot de passe" });
-  }
-});
-
-app.post("/password-reset/confirm", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const {
-      token = "",
-      code = "",
-      identifier = "",
-      new_password = "",
-      confirm_password = ""
-    } = req.body || {};
-
-    if (!token && !code) {
-      return res.status(400).json({ error: "Code ou lien sÃ©curisÃ© obligatoire." });
-    }
-    if (String(new_password) !== String(confirm_password)) {
-      return res.status(400).json({ error: "Les deux mots de passe ne correspondent pas." });
-    }
-    const passwordError = validatePasswordStrength(new_password);
-    if (passwordError) return res.status(400).json({ error: passwordError });
-
-    const values = [];
-    let filter = "used_at IS NULL AND expires_at > NOW()";
-
-    if (token) {
-      values.push(hashVerificationSecret(token));
-      filter += ` AND token_hash=$${values.length}`;
-    } else {
-      const normalizedIdentifier = String(identifier || "").trim();
-      if (!normalizedIdentifier) {
-        return res.status(400).json({ error: "Email ou tÃ©lÃ©phone obligatoire avec le code." });
-      }
-      const targetValue = normalizedIdentifier.includes("@")
-        ? normalizedIdentifier.toLowerCase()
-        : normalizedIdentifier.replace(/[^0-9+]/g, "");
-      values.push(targetValue);
-      filter += ` AND LOWER(target_value)=LOWER($${values.length})`;
-    }
-
-    const result = await client.query(
-      `SELECT pr.*, u.email, u.role
-       FROM password_reset_codes pr
-       JOIN users u ON u.id=pr.user_id
-       WHERE ${filter}
-       ORDER BY pr.id DESC
-       LIMIT 1`,
-      values
-    );
-    const reset = result.rows[0];
-
-    if (!reset) {
-      return res.status(400).json({ error: "Code expirÃ© ou introuvable." });
-    }
-
-    if (Number(reset.attempts || 0) >= 5) {
-      return res.status(429).json({ error: "Trop de tentatives. Demandez un nouveau code." });
-    }
-
-    if (code) {
-      const validCode = await bcrypt.compare(String(code || ""), reset.code_hash);
-      if (!validCode) {
-        await client.query("UPDATE password_reset_codes SET attempts=attempts+1 WHERE id=$1", [reset.id]);
-        return res.status(400).json({ error: "Code incorrect." });
-      }
-    }
-
-    await client.query("BEGIN");
-    await client.query("UPDATE users SET password=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2", [
-      await hashPassword(new_password),
-      reset.user_id
-    ]);
-    await client.query("UPDATE password_reset_codes SET used_at=NOW() WHERE id=$1", [reset.id]);
-    await client.query(
-      "UPDATE password_reset_codes SET used_at=NOW() WHERE used_at IS NULL AND user_id=$1 AND id<>$2",
-      [reset.user_id, reset.id]
-    );
-    await client.query("COMMIT");
-
-    await logAudit(
-      { ...req, user: { id: reset.user_id, company_id: reset.company_id, role: reset.role, email: reset.email } },
-      "password_reset_confirmed",
-      "user",
-      reset.user_id,
-      { target_type: reset.target_type }
-    );
-
-    res.json({
-      success: true,
-      message: "Mot de passe rÃ©initialisÃ©. Vous pouvez vous connecter."
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("ERREUR PASSWORD RESET CONFIRM :", error);
-    res.status(500).json({ error: "Erreur confirmation rÃ©initialisation mot de passe" });
-  } finally {
-    client.release();
-  }
-});
-
-/* ---------- TÃ©lÃ©phone : normalisation Mali (+223 par dÃ©faut) ----------
-   Le numÃ©ro de tÃ©lÃ©phone est un identifiant de connexion : on stocke la
-   forme canonique +223XXXXXXXX et on compare toutes les variantes
-   (74329225, 223 74 32 92 25, +22374329225, 0022374329225). */
-function normalizeMaliPhone(raw) {
-  const cleaned = String(raw || "").replace(/[^0-9+]/g, "");
-  if (!cleaned) return "";
-  let digits = cleaned.startsWith("+") ? cleaned.slice(1) : cleaned;
-  if (digits.startsWith("00")) digits = digits.slice(2);
-  if (digits.length === 8) return `+223${digits}`;
-  if (digits.startsWith("223") && digits.length === 11) return `+${digits}`;
-  return `+${digits}`;
-}
-
-function maliPhoneVariants(raw) {
-  const canonical = normalizeMaliPhone(raw);
-  if (!canonical) return [];
-  const digits = canonical.slice(1); // sans le +
-  const variants = new Set([canonical, digits, `00${digits}`]);
-  if (digits.startsWith("223")) {
-    variants.add(digits.slice(3)); // numÃ©ro local Ã  8 chiffres
-  }
-  return Array.from(variants);
-}
-
-/* LOGIN SAAS */
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const loginIdentifier = String(email || "").trim();
-    const normalizedEmail = loginIdentifier.toLowerCase();
-
-    if (!loginIdentifier || !password) {
-      return res.status(400).json({ error: "Identifiant et mot de passe obligatoires" });
-    }
-
-    const usersHasPhone = await columnExists("users", "phone");
-    const looksLikeEmail = loginIdentifier.includes("@");
-    const phoneVariants = maliPhoneVariants(loginIdentifier);
-    const canSearchPhone = usersHasPhone && !looksLikeEmail && phoneVariants.length > 0 &&
-      loginIdentifier.replace(/[^0-9]/g, "").length >= 6;
-
-    const result = await pool.query(
-      `SELECT
-        u.*,
-        c.name AS company_name,
-        c.status AS company_status,
-        c.account_status AS company_account_status,
-        c.email_verified AS company_email_verified,
-        c.phone_verified AS company_phone_verified,
-        c.trial_end_date AS company_trial_end_date,
-        c.subscription_expires_at AS company_subscription_expires_at,
-        s.status AS subscription_status,
-        s.end_date AS subscription_end_date,
-        sp.name AS plan_name
-       FROM users u
-       LEFT JOIN companies c ON u.company_id = c.id
-       LEFT JOIN subscriptions s ON c.id = s.company_id
-       LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
-       WHERE LOWER(u.email) = LOWER($1)
-          ${canSearchPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9]', '', 'g') = ANY($2)" : ""}
-       ORDER BY s.id DESC
-       LIMIT 1`,
-      canSearchPhone
-        ? [loginIdentifier, phoneVariants.map((variant) => variant.replace(/[^0-9]/g, ""))]
-        : [loginIdentifier]
-    );
-
-    const user = result.rows[0];
-
-    if (!user) return res.status(401).json({ error: "Identifiant incorrect" });
-
-    const tenantId = getTenantFromRequest(req);
-
-    if (!(await companyBelongsToTenant(user.company_id, tenantId))) {
-      return res.status(403).json({
-        error: "AccÃ¨s refusÃ© : ce compte nâ€™appartient pas Ã  cette version."
-      });
-    }
-
-    if (user.is_active === false) {
-      return res.status(403).json({ error: "Compte dÃ©sactivÃ©" });
-    }
-
-    const passwordMatches = await verifyPassword(password, user.password);
-
-    if (!passwordMatches) {
-      return res.status(401).json({ error: "Mot de passe incorrect" });
-    }
-
-    if (!isBcryptHash(user.password)) {
-      await pool.query("UPDATE users SET password=$1 WHERE id=$2", [
-        await hashPassword(password),
-        user.id
-      ]);
-    }
-
-    const isSuperAdmin =
-      user.is_super_admin === true ||
-      user.is_super_admin === "true" ||
-      user.is_super_admin === 1 ||
-      String(user.role || "").toLowerCase() === "super_admin" ||
-      SUPER_ADMIN_EMAILS.has(normalizedEmail) ||
-      SUPER_ADMIN_EMAILS.has(String(user.email || "").trim().toLowerCase());
-
-    const isCustomerAccount = normalizeRole(user.role) === "customer";
-
-    if (!isSuperAdmin) {
-      // Comptes sans entreprise (client, livreur) : pas de vÃ©rification
-      // entreprise Ã  exiger.
-      const hasNoCompany = !user.company_id;
-      const userVerified = user.email_verified === true || user.phone_verified === true;
-      const companyVerified =
-        isCustomerAccount ||
-        hasNoCompany ||
-        user.company_email_verified === true ||
-        user.company_phone_verified === true;
-      const accountPending =
-        String(user.account_status || "").toLowerCase() === "pending_verification" ||
-        (!isCustomerAccount && !hasNoCompany && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
-        user.verification_required === true;
-
-      if (!userVerified || !companyVerified || accountPending) {
-        return res.status(403).json({
-          error: "VÃ©rification obligatoire avant connexion complÃ¨te.",
-          code: "verification_required",
-          redirect: "/verification-required",
-          user_id: user.id,
-          company_id: user.company_id,
-          target_type: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? "email" : "phone",
-          target_value: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? user.email : user.phone
-        });
-      }
-
-      if (!isCustomerAccount && user.company_status === "suspended") {
-        return res.status(403).json({
-          error: "Entreprise suspendue. Veuillez contacter lâ€™administration."
-        });
-      }
-
-      const subscriptionEnd =
-        user.company_subscription_expires_at ||
-        user.company_trial_end_date ||
-        user.subscription_end_date;
-      if (!isCustomerAccount && subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
-        await pool.query(
-          "UPDATE companies SET subscription_status='expired' WHERE id=$1",
-          [user.company_id]
-        ).catch(() => {});
-        return res.status(403).json({
-          error: "Votre essai gratuit ou abonnement est terminÃ©.",
-          code: "subscription_expired",
-          redirect: "/abonnement-expire"
-        });
-      }
-
-      if (
-        !isCustomerAccount &&
-        (
-          user.subscription_status === "expired" ||
-          user.subscription_status === "suspended" ||
-          user.subscription_status === "cancelled"
-        )
-      ) {
-        return res.status(403).json({
-          error: "Abonnement inactif. Veuillez renouveler votre abonnement."
-        });
-      }
-    }
-
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        company_id: user.company_id,
-        tenant_id: tenantId,
-        is_super_admin: isSuperAdmin,
-        subscription_status: user.subscription_status || ""
-      },
-      JWT_SECRET,
-      { expiresIn: "1d" }
-    );
-
-    await logActivity(
-      user.fullname,
-      user.role,
-      "Connexion utilisateur",
-      "Authentification",
-      `${user.fullname} s'est connectÃ©`
-    );
-    await logAudit(
-      { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: user.company_id } },
-      "login",
-      "user",
-      user.id,
-      { email: user.email }
-    );
-
-    const companyModules = isSuperAdmin ? await getCompanyModules(null) : await getCompanyModules(user.company_id);
-
-    setSecureAuthCookies(req, res, token, tenantId);
-
-    res.json({
-      message: "Connexion rÃ©ussie",
-      token,
-      user: {
-        id: user.id,
-        fullname: user.fullname,
-        email: user.email,
-        role: isSuperAdmin ? "super_admin" : user.role,
-        company_id: user.company_id,
-        tenant_id: tenantId,
-        company_name: user.company_name || "",
-        company_status: user.company_status || "",
-        is_super_admin: isSuperAdmin,
-        subscription_status: user.subscription_status || "",
-        subscription_end_date: user.subscription_end_date || "",
-        trial_end_date: user.company_trial_end_date || "",
-        subscription_expires_at: user.company_subscription_expires_at || "",
-        plan_name: user.plan_name || "",
-        profile_image_url: user.profile_image_url || "",
-        force_password_change: user.force_password_change === true,
-        modules: companyModules
-      }
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur login SaaS" });
-  }
-});
-
-app.get("/support/config", async (req, res) => {
-  res.json({
-    whatsapp_url: supportWhatsAppUrl(),
-    whatsapp_enabled: Boolean(supportWhatsAppUrl())
-  });
-});
-
-app.get("/auth/social/providers", async (req, res) => {
-  const providers = ["google", "facebook", "instagram", "tiktok"].map((provider) => {
-    const config = socialProviderConfig(provider);
-    return {
-      provider,
-      label: config?.label || provider,
-      enabled: socialProviderEnabled(provider),
-      scopes: config?.scope || ""
-    };
-  });
-
-  providers.push({
-    provider: "whatsapp",
-    label: "WhatsApp",
-    enabled: true,
-    scopes: "phone_otp",
-    otp_only: true
-  });
-
-  res.json({ providers });
-});
-
-app.get("/auth/social/:provider/start", async (req, res) => {
-  try {
-    const provider = String(req.params.provider || "").toLowerCase();
-    const mode = String(req.query.mode || "login");
-
-    if (provider === "whatsapp") {
-      return res.redirect(`${publicAppUrl()}/verify-phone`);
-    }
-
-    const config = socialProviderConfig(provider);
-    if (!config || !socialProviderEnabled(provider)) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Provider OAuth non configurÃ©")}`);
-    }
-
-    const state = jwt.sign(
-      {
-        provider,
-        mode: mode === "register" ? "register" : "login",
-        nonce: crypto.randomBytes(12).toString("hex")
-      },
-      JWT_SECRET,
-      { expiresIn: "10m" }
-    );
-
-    const authUrl = new URL(config.authUrl);
-    authUrl.searchParams.set("client_id", config.clientId);
-    authUrl.searchParams.set("redirect_uri", config.callbackUrl);
-    authUrl.searchParams.set("response_type", "code");
-    authUrl.searchParams.set("scope", config.scope);
-    authUrl.searchParams.set("state", state);
-    if (provider === "google") {
-      authUrl.searchParams.set("access_type", "offline");
-      authUrl.searchParams.set("prompt", "select_account");
-    }
-
-    res.redirect(authUrl.toString());
-  } catch (error) {
-    console.error("ERREUR SOCIAL START :", error);
-    res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Erreur dÃ©marrage OAuth")}`);
-  }
-});
-
-app.get("/auth/social/:provider/callback", async (req, res) => {
-  try {
-    const provider = String(req.params.provider || "").toLowerCase();
-    const { code, state } = req.query;
-    const config = socialProviderConfig(provider);
-
-    if (!code || !state || !config || !socialProviderEnabled(provider)) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("OAuth incomplet ou non configurÃ©")}`);
-    }
-
-    let statePayload;
-    try {
-      statePayload = jwt.verify(String(state), JWT_SECRET);
-    } catch {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Session OAuth expirÃ©e")}`);
-    }
-
-    if (statePayload.provider !== provider) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Provider OAuth invalide")}`);
-    }
-
-    const tokenResponse = await fetch(config.tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        redirect_uri: config.callbackUrl,
-        grant_type: "authorization_code",
-        code: String(code)
-      })
-    });
-    const tokenPayload = await tokenResponse.json().catch(() => ({}));
-
-    if (!tokenResponse.ok || !tokenPayload.access_token) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Impossible de rÃ©cupÃ©rer le profil social")}`);
-    }
-
-    const profileUrl = new URL(config.userInfoUrl);
-    const profileHeaders = {};
-    if (provider === "facebook") {
-      profileUrl.searchParams.set("access_token", tokenPayload.access_token);
-    } else {
-      profileHeaders.Authorization = `Bearer ${tokenPayload.access_token}`;
-    }
-
-    const profileResponse = await fetch(profileUrl.toString(), { headers: profileHeaders });
-    const rawProfile = await profileResponse.json().catch(() => ({}));
-
-    if (!profileResponse.ok) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Profil social inaccessible")}`);
-    }
-
-    const profile = normalizeSocialProfile(provider, rawProfile);
-    if (!profile.provider_user_id) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Identifiant social manquant")}`);
-    }
-
-    let userId = null;
-    const existingSocial = await pool.query(
-      "SELECT user_id FROM social_accounts WHERE provider=$1 AND provider_user_id=$2 LIMIT 1",
-      [provider, profile.provider_user_id]
-    );
-
-    if (existingSocial.rows[0]) {
-      userId = existingSocial.rows[0].user_id;
-    } else if (profile.email) {
-      const existingUser = await pool.query(
-        "SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1",
-        [profile.email]
-      );
-      if (existingUser.rows[0]) userId = existingUser.rows[0].id;
-    }
-
-    if (!userId) {
-      await ensureDefaultSubscriptionPlans();
-      const planResult = await pool.query(
-        "SELECT * FROM subscription_plans ORDER BY price_monthly ASC, id ASC LIMIT 1"
-      );
-      const plan = planResult.rows[0] || {};
-      const displayName = profile.name || `${provider} utilisateur`;
-      const generatedEmail =
-        profile.email ||
-        `${provider}-${profile.provider_user_id}@social.trianglewmspro.local`;
-      const randomPassword = await hashPassword(crypto.randomBytes(24).toString("hex"));
-
-      const companyResult = await pool.query(
-        `INSERT INTO companies
-         (name, responsible_name, email, phone, plan_id, subscription_status,
-          trial_ends_at, email_verified, phone_verified, account_status,
-          trial_start_date, trial_end_date, subscription_plan, subscription_expires_at)
-         VALUES ($1,$2,$3,'',$4,'trial',NOW() + INTERVAL '15 days',$5,false,'active',
-                 NOW(),NOW() + INTERVAL '15 days',$6,NOW() + INTERVAL '15 days')
-         RETURNING *`,
-        [
-          `Entreprise de ${displayName}`,
-          displayName,
-          profile.email || "",
-          plan.id || null,
-          profile.email_verified === true,
-          plan.name || "Trial"
-        ]
-      );
-      const company = companyResult.rows[0];
-      const userResult = await pool.query(
-        `INSERT INTO users
-         (fullname, email, password, role, company_id, is_super_admin,
-          profile_image_url, email_verified, phone_verified, account_status,
-          invitation_status, verification_required, badge_code)
-         VALUES ($1,$2,$3,'admin',$4,false,$5,$6,false,'active','active',false,$7)
-         RETURNING id`,
-        [
-          displayName,
-          generatedEmail,
-          randomPassword,
-          company.id,
-          profile.avatar_url || "",
-          profile.email_verified === true,
-          `TRIANGLE-SOCIAL-${company.id}-${Date.now()}`
-        ]
-      );
-      userId = userResult.rows[0].id;
-
-      await pool.query(
-        `INSERT INTO subscriptions
-         (company_id, plan_id, start_date, end_date, status, payment_status)
-         VALUES ($1,$2,NOW(),NOW() + INTERVAL '15 days','trial','free_trial')`,
-        [company.id, plan.id || null]
-      );
-    }
-
-    await pool.query(
-      `INSERT INTO social_accounts
-       (user_id, provider, provider_user_id, email, phone, avatar_url, scopes_granted,
-        access_token_encrypted, refresh_token_encrypted)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (provider, provider_user_id)
-       DO UPDATE SET
-         user_id=EXCLUDED.user_id,
-         email=EXCLUDED.email,
-         phone=EXCLUDED.phone,
-         avatar_url=EXCLUDED.avatar_url,
-         scopes_granted=EXCLUDED.scopes_granted,
-         access_token_encrypted=EXCLUDED.access_token_encrypted,
-         refresh_token_encrypted=EXCLUDED.refresh_token_encrypted,
-         updated_at=CURRENT_TIMESTAMP`,
-      [
-        userId,
-        provider,
-        profile.provider_user_id,
-        profile.email || "",
-        "",
-        profile.avatar_url || "",
-        config.scope,
-        encryptSocialToken(tokenPayload.access_token),
-        encryptSocialToken(tokenPayload.refresh_token || "")
-      ]
-    );
-
-    if (profile.email_verified && profile.email) {
-      await pool.query(
-        `UPDATE users
-         SET email_verified=true,
-             account_status='active',
-             verification_required=false,
-             profile_image_url=COALESCE(NULLIF(profile_image_url,''), $2)
-         WHERE id=$1`,
-        [userId, profile.avatar_url || ""]
-      );
-    }
-
-    await logAudit(
-      { ...req, user: { id: userId, role: "social_auth", company_id: null } },
-      "social_login",
-      "social_account",
-      userId,
-      { provider, scopes: config.scope }
-    );
-
-    const loginPayload = await buildLoginResponseForUser(userId);
-    if (!loginPayload) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Compte Triangle introuvable")}`);
-    }
-
-    const encoded = Buffer.from(JSON.stringify(loginPayload)).toString("base64url");
-    res.redirect(`${publicAppUrl()}/social-auth?payload=${encoded}`);
-  } catch (error) {
-    console.error("ERREUR SOCIAL CALLBACK :", error);
-    res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Erreur connexion sociale")}`);
-  }
-});
-
-app.delete("/auth/social/:provider", authenticateToken, async (req, res) => {
-  try {
-    const provider = String(req.params.provider || "").toLowerCase();
-    await pool.query(
-      "DELETE FROM social_accounts WHERE user_id=$1 AND provider=$2",
-      [req.user.id, provider]
-    );
-    await logAudit(req, "unlink_social_account", "social_account", req.user.id, { provider });
-    res.json({ success: true, message: "Compte social dÃ©liÃ©." });
-  } catch (error) {
-    console.error("ERREUR UNLINK SOCIAL :", error);
-    res.status(500).json({ error: "Erreur suppression liaison sociale" });
-  }
-});
-
-app.post("/support/contact", async (req, res) => {
-  try {
-    const { name, entreprise, company_id, user_id, email, phone, message, page_actuelle, source_page } = req.body;
-
-    if (!message || String(message).trim().length < 3) {
-      return res.status(400).json({ error: "Message support obligatoire." });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO support_requests
-       (company_id, user_id, name, email, phone, message, source_page, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'nouveau')
-       RETURNING *`,
-      [
-        optionalNumber(company_id),
-        optionalNumber(user_id),
-        name || entreprise || "",
-        email || "",
-        phone || "",
-        message,
-        source_page || page_actuelle || ""
-      ]
-    );
-
-    res.status(201).json({
-      success: true,
-      request: result.rows[0],
-      whatsapp_url: supportWhatsAppUrl()
-    });
-  } catch (error) {
-    console.error("ERREUR SUPPORT CONTACT :", error);
-    res.status(500).json({ error: "Erreur demande support" });
-  }
-});
-
-app.post("/verification/verify", async (req, res) => {
-  try {
-    const { code, token, target_type, target_value, user_id } = req.body;
-
-    if (!code && !token) {
-      return res.status(400).json({ error: "Code ou token obligatoire." });
-    }
-
-    const values = [];
-    let filter = "used_at IS NULL AND expires_at > NOW()";
-
-    if (token) {
-      values.push(hashVerificationSecret(token));
-      filter += ` AND token_hash=$${values.length}`;
-    } else {
-      if (target_type) {
-        values.push(target_type);
-        filter += ` AND target_type=$${values.length}`;
-      }
-      if (target_value) {
-        values.push(target_value);
-        filter += ` AND target_value=$${values.length}`;
-      }
-      if (user_id) {
-        values.push(Number(user_id));
-        filter += ` AND user_id=$${values.length}`;
-      }
-    }
-
-    const result = await pool.query(
-      `SELECT * FROM verification_codes
-       WHERE ${filter}
-       ORDER BY id DESC
-       LIMIT 1`,
-      values
-    );
-
-    const verification = result.rows[0];
-
-    if (!verification) {
-      return res.status(400).json({ error: "Code expirÃ© ou introuvable." });
-    }
-
-    if (Number(verification.attempts || 0) >= 5) {
-      return res.status(429).json({ error: "Trop de tentatives. Demandez un nouveau code." });
-    }
-
-    if (code) {
-      const validCode = await bcrypt.compare(String(code || ""), verification.code_hash);
-      if (!validCode) {
-        await pool.query(
-          "UPDATE verification_codes SET attempts=attempts+1 WHERE id=$1",
-          [verification.id]
-        );
-        return res.status(400).json({ error: "Code incorrect." });
-      }
-    }
-
-    await pool.query(
-      "UPDATE verification_codes SET used_at=NOW() WHERE id=$1",
-      [verification.id]
-    );
-    await activateVerifiedAccount({
-      companyId: verification.company_id,
-      userId: verification.user_id,
-      targetType: verification.target_type
-    });
-
-    await logAudit(
-      { ...req, user: { id: verification.user_id, company_id: verification.company_id, role: "verification" } },
-      `verify_${verification.target_type}`,
-      "verification_code",
-      verification.id,
-      { target_type: verification.target_type }
-    );
-
-    const loginPayload = verification.user_id
-      ? await buildLoginResponseForUser(verification.user_id)
-      : null;
-    const verifiedRole = normalizeRole(loginPayload?.user?.role);
-
-    res.json({
-      success: true,
-      message: "VÃ©rification rÃ©ussie. Vous pouvez vous connecter.",
-      redirect: loginPayload?.token
-        ? (verifiedRole === "customer" ? "/client/dashboard" : "/dashboard")
-        : "/login",
-      token: loginPayload?.token,
-      user: loginPayload?.user
-    });
-  } catch (error) {
-    console.error("ERREUR VERIFICATION :", error);
-    res.status(500).json({ error: "Erreur vÃ©rification" });
-  }
-});
-
-app.post("/verification/resend", async (req, res) => {
-  try {
-    const { target_type, target_value, user_id } = req.body;
-    const targetType = target_type === "phone" ? "phone" : "email";
-    const targetValue = String(target_value || "").trim();
-
-    if (!targetValue && !user_id) {
-      return res.status(400).json({ error: "Contact ou utilisateur obligatoire." });
-    }
-
-    const userResult = await pool.query(
-      `SELECT id, company_id, email, phone
-       FROM users
-       WHERE ($1::int IS NOT NULL AND id=$1)
-          OR ($2 <> '' AND LOWER(email)=LOWER($2))
-          OR ($3 <> '' AND regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g') = regexp_replace($3, '[^0-9+]', '', 'g'))
-       LIMIT 1`,
-      [
-        optionalNumber(user_id),
-        targetType === "email" ? targetValue : "",
-        targetType === "phone" ? targetValue : ""
-      ]
-    );
-
-    const user = userResult.rows[0];
-    if (!user) return res.status(404).json({ error: "Utilisateur introuvable." });
-
-    const finalTargetValue = targetType === "phone" ? user.phone : user.email;
-    const verification = await createVerificationCode({
-      companyId: user.company_id,
-      userId: user.id,
-      targetType,
-      targetValue: finalTargetValue
-    });
-    const delivery = await sendVerificationMessage({
-      targetType,
-      targetValue: finalTargetValue,
-      code: verification.code,
-      verifyUrl: verification.verify_url
-    });
-
-    res.json({
-      success: true,
-      message: "Nouveau code gÃ©nÃ©rÃ©.",
-      target_type: targetType,
-      target_value: finalTargetValue,
-      delivery
-    });
-  } catch (error) {
-    console.error("ERREUR RESEND VERIFICATION :", error);
-    res.status(500).json({ error: "Erreur renvoi code" });
-  }
-});
-
-app.put("/me/password", authenticateToken, async (req, res) => {
-  try {
-    const { current_password, new_password } = req.body;
-
-    const passwordError = validatePasswordStrength(new_password);
-    if (passwordError) {
-      return res.status(400).json({ error: passwordError });
-    }
-
-    const userResult = await pool.query(
-      "SELECT id, password FROM users WHERE id=$1 LIMIT 1",
-      [req.user.id]
-    );
-    const user = userResult.rows[0];
-
-    if (!user) {
-      return res.status(404).json({ error: "Utilisateur introuvable" });
-    }
-
-    const passwordMatches = await verifyPassword(current_password, user.password);
-    if (!passwordMatches) {
-      return res.status(401).json({ error: "Mot de passe actuel incorrect" });
-    }
-
-    await pool.query(
-      `UPDATE users
-       SET password=$1,
-           force_password_change=false,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [await hashPassword(new_password), req.user.id]
-    );
-
-    await logAudit(req, "change_password", "user", req.user.id, {});
-
-    res.json({ message: "Mot de passe modifiÃ©" });
-  } catch (error) {
-    console.error("ERREUR ME PASSWORD :", error);
-    res.status(500).json({ error: "Erreur changement mot de passe" });
-  }
-});
-
-/* UTILISATEURS */
-app.get("/users", authenticateToken, async (req, res) => {
-  try {
-    const role = normalizeRole(req.user?.role);
-    if (role === "customer" || role === "client") {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© aux utilisateurs internes." });
-    }
-
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const values = [];
-    let companyFilter = "";
-
-    if (!isSuperAdmin) {
-      values.push(companyId);
-      companyFilter = "WHERE u.company_id = $1";
-    }
-
-    const result = await pool.query(
-      `SELECT
-         u.id AS user_id,
-        u.id,
-         u.fullname,
-         u.email,
-         u.role,
-         u.is_active,
-         u.profile_image_url,
-         u.badge_code,
-         u.created_at,
-         u.schedule_group_id,
-         COALESCE(s.schedule_group, sg.name, '') AS schedule_group,
-         COALESCE(s.salary_type, u.payment_type, '') AS salary_type,
-         COALESCE(s.hourly_rate, u.hourly_rate, 0) AS hourly_rate,
-         COALESCE(s.daily_salary, u.daily_rate, 0) AS daily_rate,
-         COALESCE(s.monthly_salary, 0) AS monthly_salary,
-         COALESCE(s.start_time, sg.start_time) AS start_time,
-         COALESCE(s.end_time, sg.end_time) AS end_time
-       FROM users u
-       LEFT JOIN attendance_settings s ON s.user_id = u.id
-       LEFT JOIN schedule_groups sg ON sg.id = u.schedule_group_id
-       ${companyFilter}
-       ORDER BY u.id DESC`,
-      values
-    );
-
-    res.json(result.rows.map((row) => stripSalaryFields(row, req.user)));
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture utilisateurs" });
-  }
-});
-
-app.get("/modules", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessAdminSettings(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const result = await pool.query(
-      `SELECT module_key, module_name, description, is_active
-       FROM modules
-       WHERE is_active=true
-       ORDER BY module_name ASC`
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR MODULES :", error);
-    res.status(500).json({ error: "Erreur lecture modules" });
-  }
-});
-
-app.get("/users/:id/permissions", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessAdminSettings(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const userResult = await pool.query("SELECT id, company_id FROM users WHERE id=$1", [req.params.id]);
-    const targetUser = userResult.rows[0];
-
-    if (!targetUser) {
-      return res.status(404).json({ error: "Utilisateur introuvable" });
-    }
-
-    if (req.user.is_super_admin !== true && Number(targetUser.company_id) !== Number(req.user.company_id)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : utilisateur hors entreprise" });
-    }
-
-    const result = await pool.query(
-      `SELECT up.*, m.module_name, m.description
-       FROM user_permissions up
-       LEFT JOIN modules m ON m.module_key=up.module_key
-       WHERE up.user_id=$1
-       ORDER BY up.module_key ASC`,
-      [req.params.id]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR USER PERMISSIONS :", error);
-    res.status(500).json({ error: "Erreur lecture permissions utilisateur" });
-  }
-});
-
-app.put("/users/:id/permissions", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessAdminSettings(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const { permissions = [] } = req.body;
-    const userResult = await pool.query("SELECT id, company_id FROM users WHERE id=$1", [req.params.id]);
-    const targetUser = userResult.rows[0];
-
-    if (!targetUser) {
-      return res.status(404).json({ error: "Utilisateur introuvable" });
-    }
-
-    if (req.user.is_super_admin !== true && Number(targetUser.company_id) !== Number(req.user.company_id)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : utilisateur hors entreprise" });
-    }
-
-    const saved = [];
-
-    for (const permission of permissions) {
-      const result = await pool.query(
-        `INSERT INTO user_permissions
-         (user_id, module_key, can_view, can_create, can_edit, can_delete, can_validate, updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT (user_id, module_key)
-         DO UPDATE SET
-           can_view=EXCLUDED.can_view,
-           can_create=EXCLUDED.can_create,
-           can_edit=EXCLUDED.can_edit,
-           can_delete=EXCLUDED.can_delete,
-           can_validate=EXCLUDED.can_validate,
-           updated_by=EXCLUDED.updated_by,
-           updated_at=CURRENT_TIMESTAMP
-         RETURNING *`,
-        [
-          req.params.id,
-          permission.module_key,
-          permission.can_view === true,
-          permission.can_create === true,
-          permission.can_edit === true,
-          permission.can_delete === true,
-          permission.can_validate === true,
-          req.user.id || null
-        ]
-      );
-
-      saved.push(result.rows[0]);
-    }
-
-    res.json(saved);
-  } catch (error) {
-    console.error("ERREUR UPDATE USER PERMISSIONS :", error);
-    res.status(500).json({ error: "Erreur sauvegarde permissions utilisateur" });
-  }
-});
-
-app.put("/users/:id/caisse", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageCaisses(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const { caisse_id } = req.body;
-    const userResult = await pool.query("SELECT id, company_id FROM users WHERE id=$1", [req.params.id]);
-    const targetUser = userResult.rows[0];
-
-    if (!targetUser) {
-      return res.status(404).json({ error: "Utilisateur introuvable" });
-    }
-
-    if (req.user.is_super_admin !== true && Number(targetUser.company_id) !== Number(req.user.company_id)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : utilisateur hors entreprise" });
-    }
-
-    if (caisse_id) {
-      const caisseResult = await pool.query(
-        `SELECT id FROM caisses
-         WHERE id=$1 AND actif=true
-         ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}`,
-        req.user.is_super_admin === true ? [caisse_id] : [caisse_id, req.user.company_id]
-      );
-
-      if (!caisseResult.rows[0]) {
-        return res.status(404).json({ error: "Caisse introuvable" });
-      }
-    }
-
-    const result = await pool.query(
-      `UPDATE users
-       SET caisse_id=$1, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2
-       RETURNING id, fullname, email, role, caisse_id`,
-      [caisse_id || null, req.params.id]
-    );
-
-    const updatedAppointment = result.rows[0];
-
-    if (["accepted", "acceptÃ©", "accepte", "validÃ©", "valide", "confirmed"].includes(String(updatedAppointment?.status || "").toLowerCase())) {
-      await createPatientFromAcceptedAppointment(updatedAppointment.id);
-    }
-
-    res.json(updatedAppointment);
-  } catch (error) {
-    console.error("ERREUR USER CAISSE :", error);
-    res.status(500).json({ error: "Erreur affectation caisse utilisateur" });
-  }
-});
-
-/* CREATE USER AVEC BADGE + PARAMÃˆTRES POINTAGE AUTOMATIQUES */
-app.post(
-  "/users",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-    try {
-      const { fullname, email, password, role, phone, company_id } = req.body;
-      const requestedRole = normalizeRole(role || "magasinier");
-
-      if (requestedRole === "super_admin" && req.user.is_super_admin !== true) {
-        return res.status(403).json({
-          error: "Action interdite : rÃ´le Super Admin rÃ©servÃ©"
-        });
-      }
-
-      const rawPassword = password || crypto.randomBytes(8).toString("base64");
-      const passwordError = validatePasswordStrength(rawPassword);
-
-      if (passwordError) {
-        return res.status(400).json({ error: passwordError });
-      }
-
-      const assignedCompanyId =
-        req.user.is_super_admin === true
-          ? company_id || req.user.company_id || null
-          : req.user.company_id;
-
-      const userResult = await pool.query(
-        `
-      INSERT INTO users
-      (
-        fullname,
-        email,
-        password,
-        role,
-        phone,
-        company_id,
-        is_super_admin
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *
-      `,
-        [
-          fullname,
-          email,
-          await hashPassword(rawPassword),
-          requestedRole || "magasinier",
-          phone || "",
-          assignedCompanyId,
-          req.user.is_super_admin === true && requestedRole === "super_admin"
-        ]
-      );
-
-      const user = userResult.rows[0];
-
-      const badgeCode = `TRIANGLE-EMP-${user.id}`;
-
-      const updatedUser = await pool.query(
-        `
-      UPDATE users
-      SET badge_code = $1
-      WHERE id = $2
-      RETURNING *
-      `,
-        [badgeCode, user.id]
-      );
-
-      await pool.query(
-        `
-      INSERT INTO attendance_settings
-      (
-        user_id,
-        schedule_group,
-        salary_type,
-        hourly_rate,
-        daily_salary,
-        monthly_salary,
-        start_time,
-        end_time
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      ON CONFLICT (user_id) DO NOTHING
-      `,
-        [user.id, "Standard", "horaire", 1000, 8000, 200000, "08:00", "17:00"]
-      );
-
-      res.status(201).json(updatedUser.rows[0]);
-    } catch (error) {
-      console.error("ERREUR CREATE USER :", error);
-      res.status(500).json({
-        error: "Erreur crÃ©ation utilisateur"
-      });
-    }
-  }
-);
-
-app.put(
-  "/users/:id",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-    try {
-      const companyId = req.user.company_id;
-      const isSuperAdmin = req.user.is_super_admin === true;
-      const { id } = req.params;
-      const { fullname, email, password, role, phone, is_active } = req.body;
-      const requestedRole = normalizeRole(role || "magasinier");
-
-      if (requestedRole === "super_admin" && !isSuperAdmin) {
-        return res.status(403).json({
-          error: "Action interdite : rÃ´le Super Admin rÃ©servÃ©"
-        });
-      }
-
-      const values = [
-        fullname,
-        email,
-        requestedRole || "magasinier",
-        phone || "",
-        is_active !== false,
-      ];
-
-      let query = `
-        UPDATE users
-        SET fullname=$1,
-            email=$2,
-            role=$3,
-            phone=$4,
-            is_active=$5,
-            is_super_admin=${isSuperAdmin ? "$6" : "is_super_admin"}
-      `;
-
-      if (isSuperAdmin) {
-        values.push(requestedRole === "super_admin");
-      }
-
-      if (password && String(password).trim() !== "") {
-        const passwordError = validatePasswordStrength(password);
-        if (passwordError) {
-          return res.status(400).json({ error: passwordError });
-        }
-
-        values.push(await hashPassword(password));
-        query += `, password=$${values.length}`;
-      }
-
-      values.push(id);
-      query += ` WHERE id=$${values.length}`;
-
-      if (!isSuperAdmin) {
-        values.push(companyId);
-        query += ` AND company_id=$${values.length}`;
-      }
-
-      query += ` RETURNING id, fullname, email, role, phone, is_active, badge_code, profile_image_url, company_id`;
-
-      const result = await pool.query(query, values);
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Utilisateur introuvable" });
-      }
-
-      res.json(result.rows[0]);
-    } catch (error) {
-      console.error("ERREUR UPDATE USER :", error);
-      res.status(500).json({
-        error: error.message || "Erreur modification utilisateur"
-      });
-    }
-  }
-);
-
-app.post(
-  "/users/:id/reset-password",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-    try {
-      if (!canAccessAdminSettings(req.user)) {
-        return res.status(403).json({ error: "AccÃ¨s administrateur requis." });
-      }
-
-      const tempPassword = `Triangle-${crypto.randomBytes(4).toString("hex")}-2026`;
-      const hashedPassword = await hashPassword(tempPassword);
-      const companyId = getEffectiveCompanyId(req, req.user.company_id);
-      const isSuperAdmin = isSuperAdminUser(req.user);
-
-      const result = await pool.query(
-        `UPDATE users
-         SET password=$1,
-             force_password_change=true,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2
-         ${isSuperAdmin ? "" : "AND company_id=$3"}
-         RETURNING id, fullname, email, role, company_id`,
-        isSuperAdmin ? [hashedPassword, req.params.id] : [hashedPassword, req.params.id, companyId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Utilisateur introuvable" });
-      }
-
-      await logAudit(
-        req,
-        "reset_password",
-        "user",
-        req.params.id,
-        { target_email: result.rows[0].email }
-      );
-
-      let email_sent = false;
-      let email_message = "SMTP non configurÃ© : communiquez le mot de passe temporaire manuellement.";
-
-      if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && result.rows[0].email) {
-        try {
-          const transporter = nodemailer.createTransport({
-            host: process.env.SMTP_HOST,
-            port: Number(process.env.SMTP_PORT || 587),
-            secure: Number(process.env.SMTP_PORT || 587) === 465,
-            auth: {
-              user: process.env.SMTP_USER,
-              pass: process.env.SMTP_PASS
-            }
-          });
-
-          await transporter.sendMail({
-            from: process.env.SMTP_FROM || process.env.SMTP_USER,
-            to: result.rows[0].email,
-            subject: "RÃ©initialisation mot de passe Triangle WMS Pro",
-            html: `
-              <p>Bonjour ${result.rows[0].fullname || ""},</p>
-              <p>Votre mot de passe temporaire Triangle WMS Pro est :</p>
-              <p style="font-size:18px;font-weight:bold">${tempPassword}</p>
-              <p>Connectez-vous puis modifiez votre mot de passe.</p>
-            `
-          });
-          email_sent = true;
-          email_message = "Email de rÃ©initialisation envoyÃ©.";
-        } catch (mailError) {
-          console.error("ERREUR EMAIL RESET PASSWORD :", mailError);
-          email_message = "SMTP configurÃ© mais lâ€™envoi email a Ã©chouÃ©.";
-        }
-      }
-
-      res.json({
-        message: email_message,
-        user: result.rows[0],
-        temporary_password: tempPassword,
-        email_sent
-      });
-    } catch (error) {
-      console.error("ERREUR RESET PASSWORD :", error);
-      res.status(500).json({ error: "Erreur rÃ©initialisation mot de passe" });
-    }
-  }
-);
-
-app.delete(
-  "/users/:id",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-    try {
-      const companyId = req.user.company_id;
-      const isSuperAdmin = req.user.is_super_admin === true;
-      const { id } = req.params;
-
-      if (Number(req.user.id) === Number(id)) {
-        return res.status(400).json({
-          error: "Vous ne pouvez pas supprimer votre propre compte."
-        });
-      }
-
-      const values = [id];
-      let filter = "WHERE id=$1";
-
-      if (!isSuperAdmin) {
-        values.push(companyId);
-        filter += " AND company_id=$2";
-      }
-
-      await pool.query(
-        `DELETE FROM attendance_settings WHERE user_id=$1`,
-        [id]
-      );
-      await pool.query(
-        `DELETE FROM attendance_records WHERE user_id=$1`,
-        [id]
-      );
-      await pool.query(
-        `DELETE FROM attendance_history WHERE user_id=$1`,
-        [id]
-      );
-
-      const result = await pool.query(
-        `DELETE FROM users ${filter} RETURNING id, fullname, email`,
-        values
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Utilisateur introuvable" });
-      }
-
-      res.json({
-        message: "Utilisateur supprimÃ©",
-        user: result.rows[0]
-      });
-    } catch (error) {
-      console.error("ERREUR DELETE USER :", error);
-      res.status(500).json({
-        error: error.message || "Erreur suppression utilisateur"
-      });
-    }
-  }
-);
-
-/* PRODUITS SAAS */
-app.get("/products", authenticateToken, async (req, res) => {
-  try {
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const companyId = isSuperAdmin ? getEffectiveCompanyId(req) : req.user.company_id;
-
-    let query = `
-      SELECT products.*, locations.emplacement_code, c.name AS company_name
-      FROM products
-      LEFT JOIN locations 
-      ON products.location_id = locations.id
-      LEFT JOIN companies c ON c.id=products.company_id
-    `;
-
-    let values = [];
-
-    if (!isSuperAdmin || companyId) {
-      query += ` WHERE products.company_id = $1 `;
-      values.push(companyId);
-    }
-
-    query += ` ORDER BY products.id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur rÃ©cupÃ©ration produits SaaS"
-    });
-  }
-});
-
-app.post("/products", authenticateToken, async (req, res) => {
-  try {
-    if (isReadOnlyRole(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s lecture seule." });
-    }
-
-    const companyId = getEffectiveCompanyId(req, req.user.company_id);
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    if (!companyId) {
-      return res.status(400).json({ error: "SÃ©lectionnez une entreprise active avant de crÃ©er un produit." });
-    }
-
-    if (!isSuperAdmin) {
-      const limits = await getCompanyPlanLimits(companyId);
-
-      const countResult = await pool.query(
-        "SELECT COUNT(*) FROM products WHERE company_id = $1",
-        [companyId]
-      );
-
-      const currentProducts = Number(countResult.rows[0].count);
-      const maxProducts = Number(limits?.max_products || 0);
-
-      if (maxProducts > 0 && currentProducts >= maxProducts) {
-        return res.status(403).json({
-          error:
-            "Limite produits atteinte pour votre formule. Veuillez passer Ã  une formule supÃ©rieure."
-        });
-      }
-    }
-
-    const {
-      reference,
-      name,
-      category,
-      stock,
-      warehouse,
-      status,
-      unit,
-      weight,
-      dimensions,
-      barcode,
-      description,
-      is_active,
-      location_id,
-      location_code,
-      minimum_stock,
-      image_url,
-      purchase_price,
-      sale_price,
-      rental_price,
-      daily_price,
-      monthly_price,
-      is_sellable,
-      is_rentable,
-      is_durable,
-      product_type,
-      user_name,
-      user_role
-    } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO products
-  (
-    reference,
-    name,
-    category,
-    stock,
-    warehouse,
-    status,
-    unit,
-    weight,
-    dimensions,
-    barcode,
-    description,
-    is_active,
-    location_id,
-    location_code,
-    minimum_stock,
-    image_url,
-    purchase_price,
-    sale_price,
-    rental_price,
-    daily_price,
-    monthly_price,
-    is_sellable,
-    is_rentable,
-    is_durable,
-    product_type,
-    company_id
-  )
-  VALUES (
-    $1,$2,$3,$4,$5,$6,$7,$8,
-    $9,$10,$11,$12,$13,$14,$15,$16,
-    $17,$18,$19,$20,$21,$22,$23,$24,$25,$26
-  )
-  RETURNING *`,
-      [
-        reference,
-        name,
-        category,
-        Number(stock || 0),
-        warehouse,
-        status || "Disponible",
-        unit || "piÃ¨ce",
-        Number(weight || 0),
-        dimensions || "",
-        barcode || "",
-        description || "",
-        is_active !== false,
-        location_id || null,
-        location_code || "",
-        Number(minimum_stock || 5),
-        image_url || "",
-        Number(purchase_price || 0),
-        Number(sale_price || 0),
-        Number(rental_price || 0),
-        Number(daily_price || 0),
-        Number(monthly_price || 0),
-        is_sellable !== false,
-        is_rentable === true,
-        is_durable === true,
-        product_type || "stock_normal",
-        companyId
-      ]
-    );
-
-    await logActivity(
-      user_name,
-      user_role,
-      "Ajout produit",
-      "Produits",
-      `Produit ajoutÃ© : ${reference} - ${name}`
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur ajout produit" });
-  }
-});
-
-app.put(
-  "/products/:id",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-  try {
-    if (isReadOnlyRole(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s lecture seule." });
-    }
-
-    const { id } = req.params;
-    const companyId = getEffectiveCompanyId(req, req.user.company_id);
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    if (!companyId) {
-      return res.status(400).json({ error: "SÃ©lectionnez une entreprise active avant de modifier un produit." });
-    }
-
-    const {
-      reference,
-      name,
-      category,
-      stock,
-      warehouse,
-      status,
-      unit,
-      weight,
-      dimensions,
-      barcode,
-      description,
-      is_active,
-      location_id,
-      location_code,
-      minimum_stock,
-      image_url,
-      purchase_price,
-      sale_price,
-      rental_price,
-      daily_price,
-      monthly_price,
-      is_sellable,
-      is_rentable,
-      is_durable,
-      product_type,
-      user_name,
-      user_role
-    } = req.body;
-
-    const values = [
-      reference,
-      name,
-      category,
-      Number(stock || 0),
-      warehouse,
-      status,
-      unit || "piÃ¨ce",
-      Number(weight || 0),
-      dimensions || "",
-      barcode || "",
-      description || "",
-      is_active !== false,
-      location_id || null,
-      location_code || "",
-      Number(minimum_stock || 5),
-      image_url || "",
-      Number(purchase_price || 0),
-      Number(sale_price || 0),
-      Number(rental_price || 0),
-      Number(daily_price || 0),
-      Number(monthly_price || 0),
-      is_sellable !== false,
-      is_rentable === true,
-      is_durable === true,
-      product_type || "stock_normal",
-      id
-    ];
-
-    let query = `
-      UPDATE products
-      SET reference=$1, name=$2, category=$3, stock=$4, warehouse=$5,
-          status=$6, unit=$7, weight=$8, dimensions=$9, barcode=$10,
-          description=$11, is_active=$12, location_id=$13, location_code=$14,
-          minimum_stock=$15, image_url=$16, purchase_price=$17,
-          sale_price=$18, rental_price=$19, daily_price=$20,
-          monthly_price=$21, is_sellable=$22, is_rentable=$23,
-          is_durable=$24, product_type=$25
-      WHERE id=$26
-    `;
-
-    if (!isSuperAdmin) {
-      values.push(companyId);
-      query += ` AND company_id=$${values.length}`;
-    }
-
-    query += ` RETURNING *`;
-
-    const result = await pool.query(
-      query,
-      values
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Produit introuvable" });
-    }
-
-    await logActivity(
-      user_name,
-      user_role,
-      "Modification produit",
-      "Produits",
-      `Produit modifiÃ© : ${reference} - ${name}`
-    );
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur modification produit" });
-  }
-});
-
-app.delete(
-  "/products/:id",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-  try {
-    if (isReadOnlyRole(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s lecture seule." });
-    }
-
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const values = [req.params.id];
-    let query = "DELETE FROM products WHERE id=$1";
-
-    if (!isSuperAdmin) {
-      values.push(companyId);
-      query += " AND company_id=$2";
-    }
-
-    query += " RETURNING id";
-
-    const result = await pool.query(query, values);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Produit introuvable" });
-    }
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Suppression produit",
-      "Produits",
-      `Produit supprimÃ© ID : ${req.params.id}`
-    );
-
-    res.json({ message: "Produit supprimÃ©" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur suppression produit" });
-  }
-});
-
-/* MOUVEMENTS STOCK SAAS */
-app.get("/stock-movements", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = `
-      SELECT * FROM stock_movements
-    `;
-
-    let values = [];
-
-    if (!isSuperAdmin) {
-      query += ` WHERE company_id = $1 `;
-      values.push(companyId);
-    }
-
-    query += ` ORDER BY id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur mouvements stock SaaS"
-    });
-  }
-});
-
-app.post("/stock-movements", authenticateToken, async (req, res) => {
-  try {
-    if (isReadOnlyRole(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s lecture seule." });
-    }
-
-    const companyId = getEffectiveCompanyId(req, req.user.company_id);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    if (!companyId) {
-      return res.status(400).json({ error: "SÃ©lectionnez une entreprise active avant de crÃ©er un mouvement stock." });
-    }
-
-    const {
-      type,
-      product_reference,
-      product_name,
-      quantity,
-      source_warehouse,
-      destination_warehouse,
-      location_code,
-      warehouse_id,
-      location_id,
-      partner_id = null,
-      partner_name = "",
-      partner_type = "",
-      apply_price = false,
-      unit_price = 0,
-      reason,
-      user_name,
-      user_role
-    } = req.body;
-
-    const productCheck = await pool.query(
-      `SELECT *
-       FROM products
-       WHERE reference=$1
-       AND company_id=$2
-       LIMIT 1`,
-      [product_reference, companyId]
-    );
-
-    if (productCheck.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: "Produit introuvable pour cette entreprise" });
-    }
-
-    const product = productCheck.rows[0];
-    const priceApplied = apply_price === true || apply_price === "true";
-    const movementUnitPrice = priceApplied ? Number(unit_price || 0) : 0;
-    const movementTotalAmount = priceApplied
-      ? Number(quantity || 0) * movementUnitPrice
-      : 0;
-
-    const result = await pool.query(
-      `INSERT INTO stock_movements
-      (type, product_reference, product_name, quantity, source_warehouse,
-       destination_warehouse, reason, status, company_id, created_by,
-       created_by_name, created_by_role, location_code, warehouse_id,
-       approval_status, original_quantity, final_quantity, product_id, location_id,
-       partner_id, partner_name, partner_type, apply_price, unit_price, total_amount)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
-      RETURNING *`,
-      [
-        type,
-        product_reference,
-        product_name || product.name,
-        Number(quantity),
-        source_warehouse || product.warehouse || "",
-        destination_warehouse,
-        reason,
-        "En attente",
-        companyId,
-        req.user.id,
-        user_name || req.user.email || "Utilisateur",
-        user_role || req.user.role || "Non dÃ©fini",
-        location_code || product.location_code || "",
-        warehouse_id || null,
-        "En attente",
-        Number(quantity),
-        Number(quantity),
-        product.id,
-        location_id || product.location_id || null,
-        partner_id || null,
-        partner_name || "",
-        partner_type || "",
-        priceApplied,
-        movementUnitPrice,
-        movementTotalAmount
-      ]
-    );
-
-    if (type === "Inventaire") {
-      const systemStock = Number(product?.stock || 0);
-      const realStock = Number(quantity || 0);
-      const difference = realStock - systemStock;
-
-      await pool.query(
-        `INSERT INTO inventory_history
-        (product_reference, product_name, system_stock, real_stock, difference,
-         warehouse, location_code, user_name, user_role, status, observation, company_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [
-          product_reference,
-          product_name || product.name,
-          systemStock,
-          realStock,
-          difference,
-          source_warehouse || product?.warehouse || "",
-          product?.location_code || "",
-          user_name || "Magasinier",
-          user_role || "magasinier",
-          "En attente",
-          reason || "",
-          companyId
-        ]
-      );
-    }
-
-    await logActivity(
-      user_name,
-      user_role,
-      "CrÃ©ation mouvement stock",
-      "Stocks",
-      `${type} crÃ©Ã©e pour ${product_reference}`
-    );
-
-    const adminUsers = await pool.query(
-      `SELECT id FROM users
-       WHERE company_id=$1
-       AND (role='admin' OR role='super_admin' OR is_super_admin=true)`,
-      [companyId]
-    );
-
-    for (const admin of adminUsers.rows) {
-      if (admin.id !== req.user.id) {
-        await createNotification({
-          user_id: admin.id,
-          title: "Mouvement stock Ã  valider",
-          message: `${
-            req.user.email || "Un utilisateur"
-          } a crÃ©Ã© une demande ${type} pour ${product_reference}.`,
-          type:
-            type === "Transfert"
-              ? "transfer_pending"
-              : type === "Inventaire"
-              ? "inventory_adjustment_pending"
-              : "stock_movement_pending",
-          company_id: companyId,
-          priority: "high",
-          related_entity_type: "stock_movement",
-          related_entity_id: result.rows[0].id,
-          action_url: `/stocks?movement=${result.rows[0].id}`,
-          created_by: req.user.id,
-          assigned_to: admin.id,
-          warehouse_id: warehouse_id || null
-        });
-      }
-    }
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur crÃ©ation mouvement" });
-  }
-});
-
-app.put(
-  "/stock-movements/:id/validate",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      if (!canValidateStockMovement(req.user)) {
-        return res.status(403).json({
-          error: "AccÃ¨s refusÃ© : vous ne pouvez pas valider ce mouvement."
-        });
-      }
-
-      const { id } = req.params;
-      const companyId = getEffectiveCompanyId(req, req.user.company_id);
-      const isSuperAdmin = req.user.is_super_admin === true;
-      if (!companyId) {
-        return res.status(400).json({ error: "SÃ©lectionnez une entreprise active avant de valider un mouvement stock." });
-      }
-      const { final_quantity, correction_note } = req.body || {};
-
-      const movementResult = await pool.query(
-        `SELECT * FROM stock_movements
-       WHERE id=$1 AND company_id=$2`,
-        [id, companyId]
-      );
-
-      const movement = movementResult.rows[0];
-
-      if (!movement)
-        return res.status(404).json({ error: "Mouvement introuvable" });
-
-      if (!isSuperAdmin && Number(movement.created_by) === Number(req.user.id)) {
-        return res.status(403).json({
-          error: "Vous ne pouvez pas valider votre propre demande."
-        });
-      }
-
-      if (movement.status !== "En attente") {
-        return res.status(400).json({ error: "Mouvement dÃ©jÃ  traitÃ©" });
-      }
-
-      const approvedQuantity =
-        final_quantity !== undefined && final_quantity !== null
-          ? Number(final_quantity)
-          : Number(movement.quantity);
-
-      if (movement.type === "EntrÃ©e") {
-        await pool.query(
-          `UPDATE products SET stock = stock + $1
-         WHERE reference = $2 AND company_id=$3`,
-          [approvedQuantity, movement.product_reference, companyId]
-        );
-      }
-
-      if (movement.type === "Sortie") {
-        await pool.query(
-          `UPDATE products SET stock = GREATEST(stock - $1, 0)
-         WHERE reference = $2 AND company_id=$3`,
-          [approvedQuantity, movement.product_reference, companyId]
-        );
-      }
-
-      if (movement.type === "Transfert") {
-        await pool.query(
-          `UPDATE products SET warehouse = $1
-         WHERE reference = $2 AND company_id=$3`,
-          [movement.destination_warehouse || "", movement.product_reference, companyId]
-        );
-      }
-
-      if (movement.type === "Inventaire") {
-        await pool.query(
-          `UPDATE products SET stock = $1
-         WHERE reference = $2 AND company_id=$3`,
-          [approvedQuantity, movement.product_reference, companyId]
-        );
-
-        await pool.query(
-          `UPDATE inventory_history
-         SET status='ValidÃ©'
-         WHERE product_reference=$1 AND status='En attente'
-         AND company_id=$2`,
-          [movement.product_reference, companyId]
-        );
-      }
-
-      const updated = await pool.query(
-        `UPDATE stock_movements
-       SET status='ValidÃ©',
-           approval_status='ValidÃ©',
-           final_quantity=$1,
-           validated_by=$2,
-           validated_at=CURRENT_TIMESTAMP,
-           modified_by=CASE WHEN $3::boolean THEN $2 ELSE modified_by END,
-           modified_at=CASE WHEN $3::boolean THEN CURRENT_TIMESTAMP ELSE modified_at END,
-           correction_note=$4
-       WHERE id=$5 AND company_id=$6
-       RETURNING *`,
-        [
-          approvedQuantity,
-          req.user.id,
-          approvedQuantity !== Number(movement.quantity),
-          correction_note || "",
-          id,
-          companyId
-        ]
-      );
-
-      await logActivity(
-        "Administrateur",
-        "admin",
-        "Validation mouvement stock",
-        "Stocks",
-        `${movement.type} validÃ© pour ${movement.product_reference}`
-      );
-
-      if (movement.created_by) {
-        await createNotification({
-          user_id: movement.created_by,
-          title: "Mouvement stock validÃ©",
-          message: `Votre demande ${movement.type} pour ${movement.product_reference} a Ã©tÃ© validÃ©e.`,
-          type: "stock_movement_validated",
-          company_id: movement.company_id || companyId,
-          priority: "normal",
-          related_entity_type: "stock_movement",
-          related_entity_id: Number(id),
-          action_url: `/stocks?movement=${id}`,
-          created_by: req.user.id,
-          assigned_to: movement.created_by,
-          warehouse_id: movement.warehouse_id || null
-        });
-      }
-
-      res.json(updated.rows[0]);
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: "Erreur validation mouvement" });
-    }
-  }
-);
-
-app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
-  try {
-    if (!canValidateStockMovement(req.user)) {
-      return res.status(403).json({
-        error: "AccÃ¨s refusÃ© : vous ne pouvez pas refuser ce mouvement."
-      });
-    }
-
-    const companyId = getEffectiveCompanyId(req, req.user.company_id);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    if (!companyId) {
-      return res.status(400).json({ error: "SÃ©lectionnez une entreprise active avant de refuser un mouvement stock." });
-    }
-    const { rejection_reason } = req.body || {};
-
-    const movementResult = await pool.query(
-      `SELECT * FROM stock_movements
-       WHERE id=$1 AND company_id=$2`,
-      [req.params.id, companyId]
-    );
-
-    const movement = movementResult.rows[0];
-
-    if (!movement)
-      return res.status(404).json({ error: "Mouvement introuvable" });
-
-    if (!isSuperAdmin && Number(movement.created_by) === Number(req.user.id)) {
-      return res.status(403).json({
-        error: "Vous ne pouvez pas refuser votre propre demande."
-      });
-    }
-
-    const updated = await pool.query(
-      `UPDATE stock_movements
-       SET status='RefusÃ©',
-           approval_status='RefusÃ©',
-           rejection_reason=$1,
-           validated_by=$2,
-           validated_at=CURRENT_TIMESTAMP
-       WHERE id=$3 AND company_id=$4
-       RETURNING *`,
-      [rejection_reason || "", req.user.id, req.params.id, companyId]
-    );
-
-    if (movement?.type === "Inventaire") {
-      await pool.query(
-        `UPDATE inventory_history
-         SET status='RefusÃ©'
-         WHERE product_reference=$1 AND status='En attente'
-         AND company_id=$2`,
-        [movement.product_reference, companyId]
-      );
-    }
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Refus mouvement stock",
-      "Stocks",
-      `Mouvement refusÃ© ID : ${req.params.id}`
-    );
-
-    if (movement?.created_by) {
-      await createNotification({
-        user_id: movement.created_by,
-        title: "Mouvement stock refusÃ©",
-        message: `Votre demande ${movement.type} pour ${movement.product_reference} a Ã©tÃ© refusÃ©e.`,
-        type: "stock_movement_rejected",
-        company_id: movement.company_id || companyId,
-        priority: "high",
-        related_entity_type: "stock_movement",
-        related_entity_id: Number(req.params.id),
-        action_url: `/stocks?movement=${req.params.id}`,
-        created_by: req.user.id,
-        assigned_to: movement.created_by,
-        warehouse_id: movement.warehouse_id || null
-      });
-    }
-
-    res.json(updated.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur refus mouvement" });
-  }
-});
-
-/* POS / CAISSE */
-app.get("/pos/products/search", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const q = String(req.query.q || "").trim();
-    const search = `%${q}%`;
-    const normalizedSearch = normalizeProductLookupCode(q);
-
-    const result = await pool.query(
-      `SELECT products.*, locations.emplacement_code, locations.rayon_code,
-              locations.case_code, locations.level_code, locations.bin_code,
-              locations.warehouse_code
-       FROM products
-       LEFT JOIN locations ON products.location_id = locations.id
-       WHERE products.is_active IS NOT FALSE
-       ${q ? `AND (
-          products.name ILIKE $1
-          OR products.reference ILIKE $1
-          OR products.barcode ILIKE $1
-          OR products.sku ILIKE $1
-          OR products.qr_code ILIKE $1
-          OR regexp_replace(lower(regexp_replace(COALESCE(products.reference,''), '^ref\\s*[-_]*\\s*', '', 'i')), '[^a-z0-9]', '', 'g') = $2
-          OR regexp_replace(lower(COALESCE(products.barcode,'')), '[^a-z0-9]', '', 'g') = $2
-          OR regexp_replace(lower(COALESCE(products.sku,'')), '[^a-z0-9]', '', 'g') = $2
-          OR regexp_replace(lower(COALESCE(products.qr_code,'')), '[^a-z0-9]', '', 'g') = $2
-       )` : ""}
-       ${isSuperAdmin ? "" : `AND products.company_id = $${q ? 3 : 1}`}
-       ORDER BY products.name ASC
-       LIMIT 40`,
-      isSuperAdmin
-        ? q
-          ? [search, normalizedSearch]
-          : []
-        : q
-          ? [search, normalizedSearch, companyId]
-          : [companyId]
-    );
-
-    res.json(
-      result.rows.map((product) => ({
-        ...product,
-        qr_url: productQrUrl(req, product),
-        effective_sale_price: getEffectivePosPrice(product)
-      }))
-    );
-  } catch (error) {
-    console.error("ERREUR POS SEARCH :", error);
-    res.status(500).json({ error: "Erreur recherche produits POS" });
-  }
-});
-
-app.get("/pos/settings", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `INSERT INTO pos_settings (company_id, default_tax_rate)
-       VALUES ($1, 18)
-       ON CONFLICT (company_id) DO UPDATE SET company_id=EXCLUDED.company_id
-       RETURNING *`,
-      [companyId || null]
-    );
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR POS SETTINGS :", error);
-    res.status(500).json({ error: "Erreur paramÃ¨tres POS" });
-  }
-});
-
-app.put(
-  "/pos/settings",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-    try {
-      const companyId = getEffectiveCompanyId(req);
-      const {
-        pos_enabled,
-        default_tax_rate,
-        currency,
-        receipt_format,
-        printer_name,
-        allowed_payment_methods,
-        max_discount_rate,
-        decimal_count
-      } = req.body;
-      const taxRate =
-        default_tax_rate === "" || default_tax_rate === null || default_tax_rate === undefined
-          ? 18
-          : Number(default_tax_rate);
-
-      const result = await pool.query(
-        `INSERT INTO pos_settings
-         (company_id, pos_enabled, default_tax_rate, currency, receipt_format,
-          printer_name, allowed_payment_methods, max_discount_rate, decimal_count)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (company_id)
-         DO UPDATE SET
-           pos_enabled=EXCLUDED.pos_enabled,
-           default_tax_rate=EXCLUDED.default_tax_rate,
-           currency=EXCLUDED.currency,
-           receipt_format=EXCLUDED.receipt_format,
-           printer_name=EXCLUDED.printer_name,
-           allowed_payment_methods=EXCLUDED.allowed_payment_methods,
-           max_discount_rate=EXCLUDED.max_discount_rate,
-           decimal_count=EXCLUDED.decimal_count,
-           updated_at=CURRENT_TIMESTAMP
-         RETURNING *`,
-        [
-          companyId || null,
-          pos_enabled !== false,
-          taxRate,
-          currency || "FCFA",
-          receipt_format || "80mm",
-          printer_name || "",
-          allowed_payment_methods || "",
-          Number(max_discount_rate || 0),
-          Number(decimal_count || 0)
-        ]
-      );
-
-      res.json(result.rows[0]);
-    } catch (error) {
-      console.error("ERREUR UPDATE POS SETTINGS :", error);
-      res.status(500).json({ error: "Erreur modification paramÃ¨tres POS" });
-    }
-  }
-);
-
-app.put(
-  "/pos/products/:id/settings",
-  authenticateToken,
-  authorizeRoles("admin", "super_admin"),
-  async (req, res) => {
-    try {
-      const companyId = getEffectiveCompanyId(req);
-      const isSuperAdmin = req.user.is_super_admin === true;
-      const {
-        purchase_price,
-        sale_price,
-        wholesale_price,
-        pharmacy_price,
-        tax_rate,
-        max_discount_rate,
-        barcode,
-        qr_code,
-        lot_number,
-        manufacture_date,
-        expiration_date,
-        supplier_id,
-        category,
-        subcategory,
-        blocked_for_sale,
-        expiration_tracking_enabled,
-        batch_tracking_enabled
-      } = req.body;
-      const valuesBase = [
-        optionalNumber(purchase_price),
-        optionalNumber(sale_price),
-        optionalNumber(wholesale_price),
-        optionalNumber(pharmacy_price),
-        optionalNumber(tax_rate),
-        optionalNumber(max_discount_rate),
-        barcode === undefined ? null : String(barcode),
-        qr_code === undefined ? null : String(qr_code),
-        lot_number === undefined ? null : String(lot_number),
-        manufacture_date || null,
-        expiration_date || null,
-        supplier_id || null,
-        category === undefined ? null : String(category),
-        subcategory === undefined ? null : String(subcategory),
-        blocked_for_sale === true,
-        expiration_tracking_enabled === true,
-        batch_tracking_enabled === true,
-        req.params.id
-      ];
-
-      const result = await pool.query(
-        `UPDATE products
-         SET purchase_price=COALESCE($1, purchase_price),
-             sale_price=COALESCE($2, sale_price),
-             wholesale_price=COALESCE($3, wholesale_price),
-             pharmacy_price=COALESCE($4, pharmacy_price),
-             margin=(COALESCE($2, sale_price) - COALESCE($1, purchase_price)),
-             tax_rate=COALESCE($5, tax_rate),
-             max_discount_rate=COALESCE($6, max_discount_rate),
-             barcode=COALESCE($7, barcode),
-             qr_code=COALESCE(NULLIF($8, ''), qr_code),
-             lot_number=COALESCE($9, lot_number),
-             manufacture_date=$10,
-             expiration_date=$11,
-             supplier_id=COALESCE($12, supplier_id),
-             category=COALESCE($13, category),
-             subcategory=COALESCE($14, subcategory),
-             blocked_for_sale=$15,
-             expiration_tracking_enabled=$16,
-             batch_tracking_enabled=$17,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$18 ${isSuperAdmin ? "" : "AND company_id=$19"}
-         RETURNING *`,
-        isSuperAdmin
-          ? valuesBase
-          : [...valuesBase, companyId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Produit introuvable" });
-      }
-
-      res.json({
-        ...result.rows[0],
-        qr_url: productQrUrl(req, result.rows[0]),
-        effective_sale_price: getEffectivePosPrice(result.rows[0])
-      });
-    } catch (error) {
-      console.error("ERREUR POS PRODUCT SETTINGS :", error);
-      res.status(500).json({ error: "Erreur paramÃ¨tres produit POS" });
-    }
-  }
-);
-
-app.get("/pos/alerts", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const values = shouldFilterByCompany ? [companyId] : [];
-    const companyClause = shouldFilterByCompany ? "AND company_id=$1" : "";
-
-    const lowStock = await pool.query(
-      `SELECT 'stock_faible' AS type, id, reference, name, stock, minimum_stock
-       FROM products
-       WHERE stock > 0 AND stock <= minimum_stock ${companyClause}`,
-      values
-    );
-    const outStock = await pool.query(
-      `SELECT 'rupture' AS type, id, reference, name, stock, minimum_stock
-       FROM products
-       WHERE stock <= 0 ${companyClause}`,
-      values
-    );
-    const noPrice = await pool.query(
-      `SELECT 'prix_non_configure' AS type, id, reference, name, sale_price
-       FROM products
-       WHERE COALESCE(sale_price,0) <= 0 ${companyClause}`,
-      values
-    );
-    const blocked = await pool.query(
-      `SELECT 'produit_bloque' AS type, id, reference, name
-       FROM products
-       WHERE blocked_for_sale = true ${companyClause}`,
-      values
-    );
-    const batches = await pool.query(
-      `SELECT CASE
-          WHEN expiration_date < CURRENT_DATE THEN 'lot_expire'
-          WHEN expiration_date <= CURRENT_DATE + INTERVAL '7 days' THEN 'expire_7_jours'
-          WHEN expiration_date <= CURRENT_DATE + INTERVAL '30 days' THEN 'expire_30_jours'
-          WHEN expiration_date <= CURRENT_DATE + INTERVAL '90 days' THEN 'expire_90_jours'
-          ELSE 'lot'
-        END AS type,
-        id, lot_number, product_id, quantity_remaining, expiration_date
-       FROM product_batches
-       WHERE expiration_date IS NOT NULL
-       AND expiration_date <= CURRENT_DATE + INTERVAL '90 days'
-       ${companyClause}`,
-      values
-    );
-
-    res.json([
-      ...lowStock.rows,
-      ...outStock.rows,
-      ...noPrice.rows,
-      ...blocked.rows,
-      ...batches.rows
-    ]);
-  } catch (error) {
-    console.error("ERREUR POS ALERTS :", error);
-    res.status(500).json({ error: "Erreur alertes POS" });
-  }
-});
-
-app.get("/pos/payment-settings", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdjustPosPrice(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s admin requis." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `SELECT id, company_id, provider_key, provider, public_key,
-              secret_key_encrypted, client_id, client_secret_encrypted,
-              merchant_id, merchant_number, merchant_account,
-              orange_money_account, moov_money_account, wave_account,
-              webhook_secret_encrypted, currency, mode, webhook_url,
-              is_active, connection_status, last_checked_at, updated_at
-       FROM payment_settings
-       WHERE company_id=$1
-       ORDER BY provider_key ASC`,
-      [companyId || null]
-    );
-
-    res.json(
-      result.rows.map((row) => ({
-        ...row,
-        secret_key: maskSecret(row.secret_key_encrypted),
-        client_secret: maskSecret(row.client_secret_encrypted),
-        webhook_secret: maskSecret(row.webhook_secret_encrypted),
-        secret_key_encrypted: undefined,
-        client_secret_encrypted: undefined,
-        webhook_secret_encrypted: undefined
-      }))
-    );
-  } catch (error) {
-    console.error("ERREUR PAYMENT SETTINGS :", error);
-    res.status(500).json({ error: "Erreur paramÃ¨tres paiement" });
-  }
-});
-
-app.put("/pos/payment-settings", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdjustPosPrice(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s admin requis." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      provider_key,
-      provider,
-      public_key,
-      secret_key,
-      client_id,
-      client_secret,
-      merchant_id,
-      merchant_number,
-      merchant_account,
-      orange_money_account,
-      moov_money_account,
-      wave_account,
-      webhook_secret,
-      currency = "FCFA",
-      mode = "test",
-      webhook_url,
-      is_active
-    } = req.body;
-
-    if (!provider_key) {
-      return res.status(400).json({ error: "Fournisseur obligatoire." });
-    }
-
-    const existing = await pool.query(
-      `SELECT secret_key_encrypted, client_secret_encrypted,
-              webhook_secret_encrypted
-       FROM payment_settings
-       WHERE company_id=$1 AND provider_key=$2
-       LIMIT 1`,
-      [companyId || null, provider_key]
-    );
-    const secretValue =
-      secret_key && secret_key !== "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢"
-        ? encryptPaymentSecret(secret_key)
-        : existing.rows[0]?.secret_key_encrypted || "";
-    const clientSecretValue =
-      client_secret && client_secret !== "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢"
-        ? encryptPaymentSecret(client_secret)
-        : existing.rows[0]?.client_secret_encrypted || "";
-    const webhookSecretValue =
-      webhook_secret && webhook_secret !== "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢"
-        ? encryptPaymentSecret(webhook_secret)
-        : existing.rows[0]?.webhook_secret_encrypted || "";
-
-    const result = await pool.query(
-      `INSERT INTO payment_settings
-       (company_id, provider_key, provider, public_key, secret_key_encrypted,
-        client_id, client_secret_encrypted, merchant_id, merchant_number,
-        merchant_account, orange_money_account, moov_money_account,
-        wave_account, webhook_secret_encrypted, currency, mode, webhook_url, is_active,
-        created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19)
-       ON CONFLICT (company_id, provider_key)
-       DO UPDATE SET
-         provider=EXCLUDED.provider,
-         public_key=EXCLUDED.public_key,
-         secret_key_encrypted=EXCLUDED.secret_key_encrypted,
-         client_id=EXCLUDED.client_id,
-         client_secret_encrypted=EXCLUDED.client_secret_encrypted,
-         merchant_id=EXCLUDED.merchant_id,
-         merchant_number=EXCLUDED.merchant_number,
-         merchant_account=EXCLUDED.merchant_account,
-         orange_money_account=EXCLUDED.orange_money_account,
-         moov_money_account=EXCLUDED.moov_money_account,
-         wave_account=EXCLUDED.wave_account,
-         webhook_secret_encrypted=EXCLUDED.webhook_secret_encrypted,
-         currency=EXCLUDED.currency,
-         mode=EXCLUDED.mode,
-         webhook_url=EXCLUDED.webhook_url,
-         is_active=EXCLUDED.is_active,
-         updated_by=EXCLUDED.updated_by,
-         updated_at=CURRENT_TIMESTAMP
-       RETURNING id, company_id, provider_key, provider, public_key,
-                 client_id, merchant_id, merchant_number, merchant_account,
-                 orange_money_account, moov_money_account, wave_account,
-                 currency, mode, webhook_url, is_active,
-                 connection_status, last_checked_at, updated_at`,
-      [
-        companyId || null,
-        provider_key,
-        provider || provider_key,
-        public_key || "",
-        secretValue,
-        client_id || "",
-        clientSecretValue,
-        merchant_id || "",
-        merchant_number || "",
-        merchant_account || "",
-        orange_money_account || "",
-        moov_money_account || "",
-        wave_account || "",
-        webhookSecretValue,
-        currency || "FCFA",
-        mode === "production" ? "production" : "test",
-        webhook_url || "",
-        is_active === true,
-        req.user.id
-      ]
-    );
-
-    res.json({ ...result.rows[0], secret_key: maskSecret(secretValue) });
-  } catch (error) {
-    console.error("ERREUR UPDATE PAYMENT SETTINGS :", error);
-    res.status(500).json({ error: "Erreur sauvegarde paramÃ¨tres paiement" });
-  }
-});
-
-app.post("/pos/payment-settings/test", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdjustPosPrice(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s admin requis." });
-    }
-
-    const { provider_key } = req.body;
-    const companyId = getEffectiveCompanyId(req);
-
-    const result = await pool.query(
-      `UPDATE payment_settings
-       SET connection_status='OK',
-           last_checked_at=CURRENT_TIMESTAMP,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE company_id=$1 AND provider_key=$2
-       RETURNING provider_key, connection_status, last_checked_at`,
-      [companyId || null, provider_key]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "ParamÃ¨tres fournisseur introuvables." });
-    }
-
-    res.json({
-      ...result.rows[0],
-      message: "Connexion sandbox OK. Les API production seront branchÃ©es avec les identifiants officiels."
-    });
-  } catch (error) {
-    console.error("ERREUR TEST PAYMENT SETTINGS :", error);
-    res.status(500).json({ error: "Erreur test connexion paiement" });
-  }
-});
-
-app.get("/products/:id/batches", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const result = await pool.query(
-      `SELECT *
-       FROM product_batches
-       WHERE product_id=$1
-       ${isSuperAdmin ? "" : "AND company_id=$2"}
-       ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LOTS PRODUIT :", error);
-    res.status(500).json({ error: "Erreur lecture lots produit" });
-  }
-});
-
-app.post("/products/:id/batches", authenticateToken, async (req, res) => {
-  try {
-    if (isReadOnlyRole(req.user)) {
-      return res.status(403).json({ error: "Vous avez un accÃ¨s lecture seule." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      lot_number,
-      supplier_id,
-      quantity_initial,
-      purchase_price,
-      sale_price,
-      expiration_date,
-      warehouse_id,
-      location_id,
-      status
-    } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO product_batches
-       (company_id, lot_number, product_id, supplier_id, quantity_initial,
-        quantity_remaining, purchase_price, sale_price, expiration_date,
-        warehouse_id, location_id, status)
-       VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8,$9,$10,$11)
-       RETURNING *`,
-      [
-        companyId,
-        lot_number,
-        req.params.id,
-        supplier_id || null,
-        Number(quantity_initial || 0),
-        Number(purchase_price || 0),
-        Number(sale_price || 0),
-        expiration_date || null,
-        warehouse_id || null,
-        location_id || null,
-        status || "active"
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR AJOUT LOT :", error);
-    res.status(500).json({ error: "Erreur ajout lot produit" });
-  }
-});
-
-async function finalizePaidPosSale(client, saleId, user = {}) {
-  const saleResult = await client.query("SELECT * FROM sales WHERE id=$1 FOR UPDATE", [saleId]);
-  const sale = saleResult.rows[0];
-
-  if (!sale) {
-    throw new Error("Vente introuvable.");
-  }
-
-  const existingFinalReceipt = await client.query(
-    "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
-    [sale.id]
-  );
-
-  if (existingFinalReceipt.rows[0]) {
-    const updatedExistingSale = await client.query(
-      `UPDATE sales
-       SET payment_status='paid',
-           status='validÃ©e',
-           amount_paid=total_amount,
-           amount_due=0,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$1
-       RETURNING *`,
-      [sale.id]
-    );
-
-    return {
-      sale: updatedExistingSale.rows[0] || sale,
-      items: [],
-      receipt: existingFinalReceipt.rows[0],
-      already_finalized: true
-    };
-  }
-
-  const itemsResult = await client.query(
-    "SELECT * FROM sale_items WHERE sale_id=$1 ORDER BY id ASC",
-    [sale.id]
-  );
-  const saleItems = [];
-  const existingMovementResult = await client.query(
-    "SELECT COUNT(*)::int AS count FROM stock_movements WHERE reason=$1 AND company_id=$2",
-    [`Vente POS ${sale.sale_number}`, sale.company_id]
-  );
-  const inventoryAlreadyFinalized = Number(existingMovementResult.rows[0]?.count || 0) > 0;
-
-  for (const item of itemsResult.rows) {
-    const publicationResult = await client.query(
-      `SELECT *
-       FROM marketplace_products
-       WHERE id=$1 AND company_id=$2
-       FOR UPDATE`,
-      [item.marketplace_product_id, order.vendor_company_id]
-    );
-    const publication = publicationResult.rows[0];
-    if (!publication) throw new Error("Publication marketplace introuvable.");
-
-    const productResult = await client.query(
-      `SELECT *
-       FROM products
-       WHERE id=$1 AND company_id=$2
-       FOR UPDATE`,
-      [item.product_id, sale.company_id]
-    );
-    const product = productResult.rows[0];
-
-    if (!product) {
-      console.log("Produit introuvable pendant finalisation POS:", {
-        sale_id: sale.id,
-        sale_number: sale.sale_number,
-        product_id: item.product_id
-      });
-      saleItems.push(item);
-      continue;
-    }
-
-    const quantity = Number(item.quantity || 0);
-
-    if (!inventoryAlreadyFinalized && Number(product.stock || 0) < quantity) {
-      console.log("Stock insuffisant pendant finalisation POS, reÃ§u conservÃ©:", {
-        sale_id: sale.id,
-        sale_number: sale.sale_number,
-        product_reference: product.reference,
-        stock: product.stock,
-        quantity
-      });
-      saleItems.push(item);
-      continue;
-    }
-
-    let batch = null;
-    if (!inventoryAlreadyFinalized && (product.batch_tracking_enabled || product.expiration_tracking_enabled)) {
-      const batchResult = await client.query(
-        `SELECT *
-         FROM product_batches
-         WHERE product_id=$1
-           AND company_id=$2
-           AND quantity_remaining >= $3
-           AND status='active'
-           AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
-         ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
-         LIMIT 1
-         FOR UPDATE`,
-        [product.id, sale.company_id, quantity]
-      );
-      batch = batchResult.rows[0] || null;
-
-      if (!batch && product.batch_tracking_enabled) {
-        console.log("Aucun lot disponible pendant finalisation POS, reÃ§u conservÃ©:", {
-          sale_id: sale.id,
-          product_reference: product.reference
-        });
-        saleItems.push(item);
-        continue;
-      }
-
-      if (batch) {
-        await client.query(
-          `UPDATE product_batches
-           SET quantity_remaining = quantity_remaining - $1,
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$2`,
-          [quantity, batch.id]
-        );
-
-        await client.query(
-          `UPDATE sale_items
-           SET batch_id=$1, lot_number=$2
-           WHERE id=$3`,
-          [batch.id, batch.lot_number || "", item.id]
-        );
-      }
-    }
-
-    if (!inventoryAlreadyFinalized) {
-      await client.query(
-        `UPDATE products
-         SET stock = stock - $1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [quantity, product.id]
-      );
-
-      await client.query(
-        `INSERT INTO stock_movements
-         (type, product_reference, product_name, quantity, source_warehouse,
-          destination_warehouse, reason, status, company_id, created_by,
-          created_by_name, created_by_role, location_code, warehouse_id,
-          approval_status, original_quantity, final_quantity, product_id, location_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'ValidÃ©',$8,$9,$10,$11,$12,$13,'ValidÃ©',$4,$4,$14,$15)`,
-        [
-          "Sortie",
-          product.reference,
-          product.name,
-          quantity,
-          product.warehouse || "",
-          "",
-          `Vente POS ${sale.sale_number}`,
-          sale.company_id,
-          user.id || sale.created_by || null,
-          user.email || sale.created_by_name || "Caissier",
-          user.role || sale.created_by_role || "caissier",
-          product.location_code || "",
-          sale.warehouse_id || product.warehouse_id || null,
-          product.id,
-          product.location_id || null
-        ]
-      );
-    }
-
-    saleItems.push({ ...item, batch_id: batch?.id || item.batch_id, lot_number: batch?.lot_number || item.lot_number });
-  }
-
-  const receiptNumber = `REC-${new Date().getFullYear()}-${String(sale.id).padStart(6, "0")}`;
-  const companySettings = await getCompanySettingsForCompany(client, sale.company_id);
-
-  const updatedSaleResult = await client.query(
-    `UPDATE sales
-     SET payment_status='paid',
-         status='validÃ©e',
-         amount_paid=total_amount,
-         amount_due=0,
-         remaining_amount=0,
-         updated_at=CURRENT_TIMESTAMP
-     WHERE id=$1
-     RETURNING *`,
-    [sale.id]
-  );
-  const updatedSale = updatedSaleResult.rows[0];
-
-  const existingReceipt = await client.query(
-    "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
-    [sale.id]
-  );
-
-  let receipt = existingReceipt.rows[0] || null;
-  if (!receipt) {
-    const receiptResult = await client.query(
-      `INSERT INTO receipts
-       (company_id, sale_id, receipt_number, receipt_data, total_amount,
-        payment_method, payment_status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'paid',$7)
-       RETURNING *`,
-      [
-        sale.company_id,
-        sale.id,
-        receiptNumber,
-        JSON.stringify({
-          sale: updatedSale,
-          items: saleItems,
-          company_settings: companySettings
-        }),
-        Number(sale.total_amount || 0),
-        sale.payment_method,
-        user.id || sale.created_by || null
-      ]
-    );
-    receipt = receiptResult.rows[0];
-
-    await client.query(
-      `INSERT INTO documents
-       (document_type, document_number, client_name, total_amount,
-        observation, created_by, company_id, related_entity_type,
-        related_entity_id, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [
-        "ReÃ§u POS",
-        receiptNumber,
-        sale.customer_name || "",
-        Number(sale.total_amount || 0),
-        `ReÃ§u gÃ©nÃ©rÃ© depuis vente POS ${sale.sale_number}`,
-        user.email || sale.created_by_name || "Caissier",
-        sale.company_id,
-        "sale",
-        sale.id,
-        "ValidÃ©"
-      ]
-    );
-  }
-
-  const paymentResult = await client.query(
-    `INSERT INTO payments
-     (company_id, amount, currency, payment_method, payment_reference,
-      status, notes, paid_at, sale_id, receipt_id, payment_status, caisse_id)
-     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6,$7,'paid',$8)
-     RETURNING *`,
-    [
-      sale.company_id,
-      Number(sale.total_amount || 0),
-      sale.payment_method,
-      sale.payment_reference || sale.sale_number,
-      `Paiement POS ${sale.sale_number}`,
-      sale.id,
-      receipt?.id || null,
-      sale.caisse_id || sale.cash_register_id || null
-    ]
-  );
-  const payment = paymentResult.rows[0];
-  await recordPosPaymentAccounting(client, {
-    sale: updatedSale,
-    payment,
-    user,
-    amount: Number(sale.total_amount || 0)
-  });
-
-  return {
-    sale: updatedSale,
-    items: saleItems,
-    receipt,
-    company_settings: companySettings
-  };
-}
-
-async function getUserCaisse(clientOrPool, userId) {
-  const result = await clientOrPool.query(
-    `SELECT u.caisse_id, c.*
-     FROM users u
-     LEFT JOIN caisses c ON c.id=u.caisse_id
-     WHERE u.id=$1
-     LIMIT 1`,
-    [userId]
-  );
-
-  return result.rows[0] || null;
-}
-
-async function resolveSaleCaisse(clientOrPool, user, requestedCaisseId) {
-  const companyId = user.company_id || null;
-  const assigned = await getUserCaisse(clientOrPool, user.id);
-  const isManager = canManageCaisses(user);
-  const preferredId = requestedCaisseId || assigned?.caisse_id || null;
-
-  if (preferredId) {
-    const values = [preferredId];
-    let query = "SELECT * FROM caisses WHERE id=$1 AND actif=true";
-
-    if (!user.is_super_admin) {
-      values.push(companyId);
-      query += " AND (company_id=$2 OR company_id IS NULL)";
-    }
-
-    const result = await clientOrPool.query(query, values);
-    const caisse = result.rows[0];
-
-    if (!caisse) throw new Error("Caisse introuvable ou inactive.");
-    if (!isManager && Number(assigned?.caisse_id || 0) !== Number(caisse.id)) {
-      throw new Error("Vous n'Ãªtes pas affectÃ© Ã  cette caisse.");
-    }
-
-    return caisse;
-  }
-
-  if (!isManager) {
-    throw new Error("Aucune caisse n'est affectÃ©e Ã  cet utilisateur.");
-  }
-
-  const result = await clientOrPool.query(
-    `SELECT * FROM caisses
-     WHERE actif=true AND ($1::int IS NULL OR company_id=$1)
-     ORDER BY id ASC
-     LIMIT 1`,
-    [companyId]
-  );
-
-  return result.rows[0] || null;
-}
-
-app.get("/pos/caisses", authenticateToken, async (req, res) => {
-  try {
-    if (!canUsePos(req.user) && !canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isManager = canManageCaisses(req.user);
-    const values = [];
-    let query = `
-      SELECT c.*, COUNT(u.id)::int AS assigned_users
-      FROM caisses c
-      LEFT JOIN users u ON u.caisse_id=c.id
-      WHERE c.actif=true
-    `;
-
-    if (!req.user.is_super_admin || companyId) {
-      values.push(companyId);
-      query += ` AND (c.company_id=$${values.length} OR c.company_id IS NULL)`;
-    }
-
-    if (!isManager && !canAccessDirectionModule(req.user)) {
-      values.push(req.user.id);
-      query += ` AND EXISTS (SELECT 1 FROM users cu WHERE cu.id=$${values.length} AND cu.caisse_id=c.id)`;
-    }
-
-    query += " GROUP BY c.id ORDER BY c.id ASC";
-
-    const result = await pool.query(query, values);
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR POS CAISSES :", error);
-    res.status(500).json({ error: "Erreur lecture caisses" });
-  }
-});
-
-app.post("/pos/caisses", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageCaisses(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const { nom_caisse, code_caisse, solde_initial = 0 } = req.body;
-    const result = await pool.query(
-      `INSERT INTO caisses
-       (company_id, nom_caisse, code_caisse, statut, solde_initial, solde_actuel)
-       VALUES ($1,$2,$3,'fermÃ©e',$4,$4)
-       RETURNING *`,
-      [
-        getEffectiveCompanyId(req),
-        nom_caisse || "Caisse principale",
-        code_caisse || `CAISSE-${Date.now()}`,
-        Number(solde_initial || 0)
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATE CAISSE :", error);
-    res.status(500).json({ error: "Erreur crÃ©ation caisse" });
-  }
-});
-
-app.put("/pos/caisses/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageCaisses(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const { nom_caisse, code_caisse, solde_initial = 0 } = req.body;
-    const values = [nom_caisse || "Caisse principale", code_caisse || "", Number(solde_initial || 0), req.params.id];
-    let query = `
-      UPDATE caisses
-      SET nom_caisse=$1, code_caisse=$2, solde_initial=$3, updated_at=CURRENT_TIMESTAMP
-      WHERE id=$4
-    `;
-
-    if (!req.user.is_super_admin) {
-      values.push(getEffectiveCompanyId(req));
-      query += " AND company_id=$5";
-    }
-
-    query += " RETURNING *";
-
-    const result = await pool.query(query, values);
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR UPDATE CAISSE :", error);
-    res.status(500).json({ error: "Erreur modification caisse" });
-  }
-});
-
-app.delete("/pos/caisses/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageCaisses(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const values = [req.params.id];
-    let query = "UPDATE caisses SET actif=false, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
-
-    if (!req.user.is_super_admin) {
-      values.push(getEffectiveCompanyId(req));
-      query += " AND company_id=$2";
-    }
-
-    await pool.query(query, values);
-    res.json({ message: "Caisse dÃ©sactivÃ©e" });
-  } catch (error) {
-    console.error("ERREUR DELETE CAISSE :", error);
-    res.status(500).json({ error: "Erreur suppression caisse" });
-  }
-});
-
-app.post("/pos/caisses/:id/open", authenticateToken, async (req, res) => {
-  try {
-    if (!canUsePos(req.user)) return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-
-    const caisse = await resolveSaleCaisse(pool, req.user, req.params.id);
-    const soldeInitial = Number(req.body.solde_initial || req.body.montant_depart || 0);
-
-    const result = await pool.query(
-      `UPDATE caisses
-       SET statut='ouverte', solde_initial=$1, solde_actuel=$1,
-           opened_by=$2, opened_at=CURRENT_TIMESTAMP,
-           closed_by=NULL, closed_at=NULL, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$3
-       RETURNING *`,
-      [soldeInitial, req.user.id || null, caisse.id]
-    );
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR OPEN CAISSE :", error);
-    res.status(500).json({ error: error.message || "Erreur ouverture caisse" });
-  }
-});
-
-app.post("/pos/caisses/:id/close", authenticateToken, async (req, res) => {
-  try {
-    if (!canUsePos(req.user)) return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-
-    const caisse = await resolveSaleCaisse(pool, req.user, req.params.id);
-    const totals = await pool.query(
-      `SELECT COALESCE(SUM(CASE WHEN lower(status) <> 'annulÃ©e' THEN amount_paid ELSE 0 END),0)::numeric AS total_encaisse
-       FROM sales
-       WHERE caisse_id=$1 AND ($2::timestamp IS NULL OR created_at >= $2)`,
-      [caisse.id, caisse.opened_at || null]
-    );
-    const soldeFinal = Number(caisse.solde_initial || 0) + Number(totals.rows[0]?.total_encaisse || 0);
-
-    const result = await pool.query(
-      `UPDATE caisses
-       SET statut='fermÃ©e', solde_actuel=$1, closed_by=$2,
-           closed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$3
-       RETURNING *`,
-      [soldeFinal, req.user.id || null, caisse.id]
-    );
-
-    res.json({ caisse: result.rows[0], solde_final: soldeFinal });
-  } catch (error) {
-    console.error("ERREUR CLOSE CAISSE :", error);
-    res.status(500).json({ error: error.message || "Erreur fermeture caisse" });
-  }
-});
-
-app.get("/pos/caisses/report", authenticateToken, async (req, res) => {
-  try {
-    if (!canUsePos(req.user) && !canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-    }
-
-    const { date_from, date_to } = req.query;
-    const companyId = getEffectiveCompanyId(req);
-    const values = [];
-    let filter = "WHERE c.actif=true";
-
-    if (!req.user.is_super_admin || companyId) {
-      values.push(companyId);
-      filter += ` AND (c.company_id=$${values.length} OR c.company_id IS NULL)`;
-    }
-
-    if (!canManageCaisses(req.user) && !canAccessDirectionModule(req.user)) {
-      values.push(req.user.id);
-      filter += ` AND EXISTS (SELECT 1 FROM users cu WHERE cu.id=$${values.length} AND cu.caisse_id=c.id)`;
-    }
-
-    let salesDateFilter = "";
-    if (date_from) {
-      values.push(date_from);
-      salesDateFilter += ` AND DATE(s.created_at) >= $${values.length}`;
-    }
-    if (date_to) {
-      values.push(date_to);
-      salesDateFilter += ` AND DATE(s.created_at) <= $${values.length}`;
-    }
-
-    const result = await pool.query(
-      `SELECT c.id, c.nom_caisse, c.code_caisse, c.statut, c.solde_initial,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' THEN s.total_amount ELSE 0 END),0)::numeric AS total_vendu,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' THEN s.amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' AND s.payment_method='EspÃ¨ces' THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_especes,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' AND s.payment_method IN ('Orange Money','Moov Money','Wave') THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_mobile_money,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' AND s.payment_method='Carte bancaire' THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_carte,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' THEN COALESCE(NULLIF(s.remaining_amount,0), s.amount_due, 0) ELSE 0 END),0)::numeric AS credits,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,''))='annulÃ©e' THEN s.total_amount ELSE 0 END),0)::numeric AS annulations,
-              (c.solde_initial + COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulÃ©e' THEN s.amount_paid ELSE 0 END),0))::numeric AS solde_final
-       FROM caisses c
-       LEFT JOIN sales s ON s.caisse_id=c.id ${salesDateFilter}
-       ${filter}
-       GROUP BY c.id
-       ORDER BY c.id ASC`,
-      values
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR RAPPORT CAISSES :", error);
-    res.status(500).json({ error: "Erreur rapport caisses" });
-  }
-});
-
-app.post("/pos/sales", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-
-  try {
-    if (!canUsePos(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    if (!companyId) {
-      return res.status(400).json({
-        error: "Entreprise active introuvable. SÃ©lectionnez une entreprise avant de vendre."
-      });
-    }
-    const {
-      customer_name,
-      customer_phone,
-      client_name,
-      client_id = null,
-      items = [],
-      discount_amount = 0,
-      tax_enabled = false,
-      payment_method = "EspÃ¨ces",
-      payment_status = "payÃ©",
-      warehouse_id = null,
-      caisse_id = null,
-      cash_register_id = null,
-      amount_received = 0,
-      change_due = 0,
-      remaining_amount = 0,
-      mixed_payments = []
-    } = req.body;
-
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: "Panier vide." });
-    }
-
-    await client.query("BEGIN");
-
-    const settingsResult = await client.query(
-      `INSERT INTO pos_settings (company_id, default_tax_rate)
-       VALUES ($1, 18)
-       ON CONFLICT (company_id) DO UPDATE SET company_id=EXCLUDED.company_id
-       RETURNING *`,
-      [companyId || null]
-    );
-    const posSettings = settingsResult.rows[0] || {};
-    const caisse = await resolveSaleCaisse(client, req.user, caisse_id || cash_register_id);
-    let saleCustomerName = customer_name || client_name || "Client comptoir";
-    let saleCustomerPhone = customer_phone || "";
-
-    if (client_id) {
-      const partnerResult = await client.query(
-        `SELECT id, name, phone, address
-         FROM partners
-         WHERE id=$1 AND ($2::boolean OR company_id=$3)
-         LIMIT 1`,
-        [client_id, req.user.is_super_admin === true, companyId]
-      );
-      const partner = partnerResult.rows[0];
-
-      if (partner) {
-        saleCustomerName = partner.name || saleCustomerName;
-        saleCustomerPhone = partner.phone || saleCustomerPhone;
-      }
-    }
-
-    let subtotal = 0;
-    let taxAmount = 0;
-    let totalProfit = 0;
-    const saleYear = new Date().getFullYear();
-    const saleCountResult = await client.query(
-      `SELECT COUNT(*)::int AS count
-       FROM sales
-       WHERE company_id=$1 AND EXTRACT(YEAR FROM created_at)=$2`,
-      [companyId, saleYear]
-    );
-    const saleNumber = `VENTE-${saleYear}-${String(Number(saleCountResult.rows[0]?.count || 0) + 1).padStart(6, "0")}`;
-
-    const isPendingPosPaymentMethod = (method) =>
-      isExternalPaymentMethod(method) || method === "Virement";
-    const isMixedPayment = payment_method === "Paiement mixte";
-    const mixedPaymentRows = Array.isArray(mixed_payments)
-      ? mixed_payments
-          .map((row) => ({
-            method: row.method || "EspÃ¨ces",
-            amount: Number(row.amount || 0),
-            reference: row.reference || "",
-          }))
-          .filter((row) => row.amount > 0)
-      : [];
-    const mixedHasPendingPayment = mixedPaymentRows.some((row) =>
-      isPendingPosPaymentMethod(row.method)
-    );
-    const providerKey = providerKeyFromMethod(payment_method);
-    const requestedPaymentStatus = isMixedPayment
-      ? mixedHasPendingPayment
-        ? "en attente"
-        : payment_status
-      : isExternalPaymentMethod(payment_method)
-      ? "en attente"
-      : payment_status;
-    const shouldFinalizeImmediately = requestedPaymentStatus === "payÃ©";
-
-    const saleResult = await client.query(
-      `INSERT INTO sales
-       (company_id, warehouse_id, cash_register_id, caisse_id, nom_caisse,
-        sale_number, customer_name, customer_phone, client_id, client_name,
-        subtotal, discount_amount, tax_amount, total_amount, payment_method,
-        payment_status, status, created_by, created_by_name, created_by_role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,0,0,$12,$13,$14,$15,$16,$17)
-       RETURNING *`,
-      [
-        companyId,
-        warehouse_id,
-        caisse?.id || null,
-        caisse?.id || null,
-        caisse?.nom_caisse || "",
-        saleNumber,
-        saleCustomerName,
-        saleCustomerPhone,
-        client_id || null,
-        saleCustomerName,
-        Number(discount_amount || 0),
-        payment_method,
-        requestedPaymentStatus,
-        requestedPaymentStatus === "payÃ©" ? "validÃ©e" : "en attente",
-        req.user.id,
-        req.user.email || "Utilisateur",
-        req.user.role || ""
-      ]
-    );
-
-    const sale = saleResult.rows[0];
-    const saleItems = [];
-
-    for (const item of items) {
-      const productResult = await client.query(
-        `SELECT *
-         FROM products
-         WHERE id=$1
-           AND (company_id=$2 OR company_id IS NULL)
-         FOR UPDATE`,
-        [item.product_id, companyId]
-      );
-
-      let product = productResult.rows[0];
-
-      if (!product) {
-        const existingProduct = await client.query(
-          `SELECT id, reference, name, company_id
-           FROM products
-           WHERE id=$1
-           LIMIT 1`,
-          [item.product_id]
-        );
-        const found = existingProduct.rows[0];
-
-        if (found) {
-          throw new Error(
-            `Produit ${
-              found.reference || found.name || found.id
-            } appartient Ã  une autre entreprise. Entreprise active : ${companyId}.`
-          );
-        }
-
-        throw new Error("Produit introuvable dans cette entreprise.");
-      }
-
-      if (!product.company_id) {
-        const assignedProduct = await client.query(
-          `UPDATE products
-           SET company_id=$1,
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$2
-           RETURNING *`,
-          [companyId, product.id]
-        );
-        product = assignedProduct.rows[0];
-      }
-
-      if (product.blocked_for_sale) {
-        throw new Error(`Produit bloquÃ© Ã  la vente : ${product.reference}.`);
-      }
-
-      const quantity = Number(item.quantity || 1);
-      const expectedPrice = getEffectivePosPrice(product);
-      const unitPrice = Number(item.unit_price ?? expectedPrice);
-      const itemDiscount = Number(item.discount_amount || 0);
-
-      if (!canAdjustPosPrice(req.user)) {
-        if (unitPrice !== expectedPrice || itemDiscount > 0) {
-          throw new Error("Vous n'avez pas le droit de modifier le prix ou la remise.");
-        }
-      }
-
-      if (Number(product.stock || 0) < quantity) {
-        throw new Error(`Stock insuffisant pour ${product.reference}.`);
-      }
-
-      if (product.expiration_date && new Date(product.expiration_date) < new Date()) {
-        throw new Error(`Produit expirÃ© : ${product.reference}.`);
-      }
-
-      let batch = null;
-
-      if (shouldFinalizeImmediately && (product.batch_tracking_enabled || product.expiration_tracking_enabled)) {
-        const batchResult = await client.query(
-          `SELECT *
-           FROM product_batches
-           WHERE product_id=$1
-             AND company_id=$2
-             AND quantity_remaining >= $3
-             AND status='active'
-             AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
-           ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
-           LIMIT 1
-           FOR UPDATE`,
-          [product.id, companyId, quantity]
-        );
-
-        batch = batchResult.rows[0] || null;
-
-        if (!batch && product.batch_tracking_enabled) {
-          throw new Error(`Aucun lot disponible pour ${product.reference}.`);
-        }
-
-        if (batch) {
-          await client.query(
-            `UPDATE product_batches
-             SET quantity_remaining = quantity_remaining - $1,
-                 updated_at=CURRENT_TIMESTAMP
-             WHERE id=$2`,
-            [quantity, batch.id]
-          );
-        }
-      }
-
-      const taxRate = Number(product.tax_rate || posSettings.default_tax_rate || 18);
-      const lineTax = tax_enabled ? (unitPrice * quantity * taxRate) / 100 : 0;
-      const lineTotal = unitPrice * quantity - itemDiscount + lineTax;
-      const purchasePrice = Number(product.purchase_price || 0);
-      const lineProfit = (unitPrice - purchasePrice) * quantity - itemDiscount;
-      subtotal += unitPrice * quantity - itemDiscount;
-      taxAmount += lineTax;
-      totalProfit += lineProfit;
-
-      if (shouldFinalizeImmediately) {
-        await client.query(
-          `UPDATE products
-           SET stock = stock - $1,
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$2`,
-          [quantity, product.id]
-        );
-      }
-
-      const itemResult = await client.query(
-        `INSERT INTO sale_items
-         (sale_id, company_id, product_id, product_reference, product_name,
-          barcode, lot_number, batch_id, quantity, unit_price, discount_amount,
-          tax_rate, total_price, warehouse_id, location_id, purchase_price,
-          sale_price, profit)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-         RETURNING *`,
-        [
-          sale.id,
-          companyId,
-          product.id,
-          product.reference,
-          product.name,
-          product.barcode || "",
-          batch?.lot_number || product.lot_number || "",
-          batch?.id || null,
-          quantity,
-          unitPrice,
-          itemDiscount,
-          taxRate,
-          lineTotal,
-          warehouse_id || product.warehouse_id || null,
-          product.location_id || null,
-          purchasePrice,
-          unitPrice,
-          lineProfit
-        ]
-      );
-
-      saleItems.push(itemResult.rows[0]);
-
-      if (shouldFinalizeImmediately) {
-        await client.query(
-          `INSERT INTO stock_movements
-           (type, product_reference, product_name, quantity, source_warehouse,
-            destination_warehouse, reason, status, company_id, created_by,
-            created_by_name, created_by_role, location_code, warehouse_id,
-            approval_status, original_quantity, final_quantity, product_id,
-            location_id, partner_id, partner_name, partner_type, apply_price,
-            unit_price, total_amount)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'ValidÃ©',$8,$9,$10,$11,$12,$13,'ValidÃ©',$4,$4,$14,$15,$16,$17,$18,true,$19,$20)`,
-          [
-            "Sortie",
-            product.reference,
-            product.name,
-            quantity,
-            product.warehouse || "",
-            "",
-            `Vente POS ${saleNumber}`,
-            companyId,
-            req.user.id,
-            req.user.email || "Caissier",
-            req.user.role || "caissier",
-            product.location_code || "",
-            warehouse_id || product.warehouse_id || null,
-            product.id,
-            product.location_id || null,
-            client_id || null,
-            saleCustomerName,
-            "client",
-            unitPrice,
-            unitPrice * quantity
-          ]
-        );
-      }
-    }
-
-    const totalAmount = Math.max(subtotal - Number(discount_amount || 0) + taxAmount, 0);
-    const confirmedPaidAmount = isMixedPayment
-      ? mixedPaymentRows
-          .filter((row) => !isPendingPosPaymentMethod(row.method))
-          .reduce((sum, row) => sum + Number(row.amount || 0), 0)
-      : shouldFinalizeImmediately
-        ? Math.min(Number(amount_received || totalAmount), totalAmount)
-        : 0;
-    const dueAmount = shouldFinalizeImmediately
-      ? 0
-      : Math.max(remaining_amount || totalAmount - confirmedPaidAmount, 0);
-
-    const updatedSale = await client.query(
-      `UPDATE sales
-       SET subtotal=$1,
-           tax_amount=$2,
-           total_amount=$3,
-           amount_paid=$4,
-           amount_due=$5,
-           remaining_amount=$5,
-           change_due=$6,
-           total_profit=$7,
-           provider=$8,
-           payment_status=$9,
-           status=$10,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$11
-       RETURNING *`,
-      [
-        subtotal,
-        taxAmount,
-        totalAmount,
-        confirmedPaidAmount,
-        dueAmount,
-        Number(change_due || 0),
-        totalProfit,
-        providerKey,
-        requestedPaymentStatus,
-        requestedPaymentStatus === "payÃ©" ? "validÃ©e" : "en attente",
-        sale.id
-      ]
-    );
-
-    let paymentTransaction = null;
-    let paymentReference = "";
-    const rowsToCreate = isMixedPayment && mixedPaymentRows.length > 0
-      ? mixedPaymentRows
-      : [{ method: payment_method, amount: totalAmount, reference: "" }];
-
-    for (let index = 0; index < rowsToCreate.length; index += 1) {
-      const row = rowsToCreate[index];
-      const rowProviderKey = providerKeyFromMethod(row.method);
-      const rowStatus = isPendingPosPaymentMethod(row.method)
-        ? "en attente"
-        : requestedPaymentStatus === "payÃ©"
-          ? "paid"
-          : requestedPaymentStatus;
-      const transactionReference = row.reference || `${rowProviderKey.toUpperCase()}-${saleNumber}-${index + 1}`;
-
-      const transactionResult = await client.query(
-        `INSERT INTO payment_transactions
-         (company_id, sale_id, provider_key, payment_method, amount, currency,
-          status, provider_reference, external_reference, phone_number,
-          request_payload, response_payload, provider_response, created_by,
-          caisse_id)
-         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11,$11,$12,$13)
-         RETURNING *`,
-        [
-          companyId,
-          sale.id,
-          rowProviderKey,
-          row.method,
-          Number(row.amount || 0),
-          rowStatus,
-          transactionReference,
-          saleNumber,
-          saleCustomerPhone,
-          JSON.stringify({ sale_id: sale.id, payment_method: row.method, amount: row.amount }),
-          JSON.stringify({
-            sandbox: isPendingPosPaymentMethod(row.method),
-            message: isPendingPosPaymentMethod(row.method)
-              ? "Transaction sandbox crÃ©Ã©e. Simulez le rÃ©sultat dans Paiements POS."
-              : "Paiement manuel enregistrÃ©."
-          }),
-          req.user.id,
-          caisse?.id || null
-        ]
-      );
-
-      const createdTransaction = transactionResult.rows[0];
-      if (!paymentTransaction || createdTransaction.status === "en attente") {
-        paymentTransaction = createdTransaction;
-        paymentReference = transactionReference;
-      }
-
-      await client.query(
-        `INSERT INTO sale_payments
-         (company_id, sale_id, transaction_id, payment_method, amount, currency,
-          status, created_by, caisse_id)
-         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8)`,
-        [
-          companyId,
-          sale.id,
-          createdTransaction.id,
-          row.method,
-          Number(row.amount || 0),
-          rowStatus,
-          req.user.id,
-          caisse?.id || null
-        ]
-      );
-    }
-
-    await client.query(
-      `UPDATE sales
-       SET transaction_id=$1, payment_reference=$2
-       WHERE id=$3`,
-      [paymentTransaction?.id || null, paymentReference || saleNumber, sale.id]
-    );
-
-    const companySettings = await getCompanySettingsForCompany(client, companyId);
-    let receipt = null;
-
-    if (shouldFinalizeImmediately) {
-      const receiptNumber = `REC-${saleYear}-${String(sale.id).padStart(6, "0")}`;
-      const receiptResult = await client.query(
-        `INSERT INTO receipts
-         (company_id, sale_id, receipt_number, receipt_data, total_amount,
-          payment_method, payment_status, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-         RETURNING *`,
-        [
-          companyId,
-          sale.id,
-          receiptNumber,
-          JSON.stringify({
-            sale: updatedSale.rows[0],
-            items: saleItems,
-            company_settings: companySettings
-          }),
-          totalAmount,
-          payment_method,
-          requestedPaymentStatus,
-          req.user.id
-        ]
-      );
-      receipt = receiptResult.rows[0];
-
-      await client.query(
-        `INSERT INTO documents
-         (document_type, document_number, client_name, total_amount,
-          observation, created_by, company_id, related_entity_type,
-          related_entity_id, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [
-          "ReÃ§u POS",
-          receiptNumber,
-          saleCustomerName,
-          totalAmount,
-          `ReÃ§u gÃ©nÃ©rÃ© depuis vente POS ${saleNumber}`,
-          req.user.email || "Caissier",
-          companyId,
-          "sale",
-          sale.id,
-          "ValidÃ©"
-        ]
-      );
-
-      const paymentResult = await client.query(
-        `INSERT INTO payments
-         (company_id, amount, currency, payment_method, payment_reference,
-          status, notes, paid_at, sale_id, receipt_id, payment_status, caisse_id)
-         VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5,$9)
-         RETURNING *`,
-        [
-          companyId,
-          totalAmount,
-          payment_method,
-          saleNumber,
-          requestedPaymentStatus,
-          `Paiement POS ${saleNumber}`,
-          sale.id,
-          receipt.id,
-          caisse?.id || null
-        ]
-      );
-
-      await recordPosPaymentAccounting(client, {
-        sale: updatedSale.rows[0],
-        payment: paymentResult.rows[0],
-        user: req.user,
-        amount: confirmedPaidAmount || totalAmount
-      });
-    }
-
-    await client.query("COMMIT");
-
-    res.status(201).json({
-      sale: updatedSale.rows[0],
-      items: saleItems,
-      receipt,
-      company_settings: companySettings,
-      payment_transaction: paymentTransaction,
-      payment_required: requestedPaymentStatus !== "payÃ©"
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR POS SALE :", error);
-    res.status(500).json({ error: error.message || "Erreur validation vente POS" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/pos/sales", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const {
-      q = "",
-      date_from,
-      date_to,
-      payment_method,
-      status,
-      product = "",
-      cashier = "",
-      cash_register_id
-    } = req.query;
-    const values = [];
-
-    let query = `SELECT DISTINCT sales.*,
-                        COALESCE(c.nom_caisse, sales.nom_caisse, '') AS nom_caisse
-                 FROM sales
-                 LEFT JOIN sale_items ON sale_items.sale_id = sales.id
-                 LEFT JOIN caisses c ON c.id = sales.caisse_id
-                 WHERE 1=1`;
-
-    if (shouldFilterByCompany) {
-      values.push(companyId);
-      query += ` AND sales.company_id=$${values.length}`;
-    }
-
-    if (!canManageCaisses(req.user) && !canAccessDirectionModule(req.user)) {
-      const assigned = await getUserCaisse(pool, req.user.id);
-      if (assigned?.caisse_id) {
-        values.push(assigned.caisse_id);
-        query += ` AND (sales.caisse_id=$${values.length} OR sales.cash_register_id=$${values.length})`;
-      } else {
-        values.push(req.user.id);
-        query += ` AND sales.created_by=$${values.length}`;
-      }
-    }
-
-    if (q) {
-      values.push(`%${String(q)}%`);
-      query += ` AND (sales.sale_number ILIKE $${values.length}
-                      OR sales.customer_name ILIKE $${values.length}
-                      OR sales.created_by_name ILIKE $${values.length}
-                      OR sale_items.product_name ILIKE $${values.length}
-                      OR sale_items.product_reference ILIKE $${values.length})`;
-    }
-
-    if (product) {
-      values.push(`%${String(product)}%`);
-      query += ` AND (sale_items.product_name ILIKE $${values.length}
-                      OR sale_items.product_reference ILIKE $${values.length}
-                      OR sale_items.barcode ILIKE $${values.length})`;
-    }
-
-    if (cashier) {
-      values.push(`%${String(cashier)}%`);
-      query += ` AND sales.created_by_name ILIKE $${values.length}`;
-    }
-
-    if (cash_register_id) {
-      values.push(cash_register_id);
-      query += ` AND (sales.cash_register_id=$${values.length} OR sales.caisse_id=$${values.length})`;
-    }
-
-    if (date_from) {
-      values.push(date_from);
-      query += ` AND DATE(sales.created_at) >= $${values.length}`;
-    }
-
-    if (date_to) {
-      values.push(date_to);
-      query += ` AND DATE(sales.created_at) <= $${values.length}`;
-    }
-
-    if (payment_method) {
-      values.push(payment_method);
-      query += ` AND sales.payment_method=$${values.length}`;
-    }
-
-    if (status) {
-      values.push(status);
-      query += ` AND LOWER(sales.status)=LOWER($${values.length})`;
-    }
-
-    query += ` ORDER BY sales.id DESC LIMIT 300`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR POS SALES :", error);
-    res.status(500).json({ error: "Erreur lecture ventes POS" });
-  }
-});
-
-app.get("/pos/sales-summary", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const { date_from, date_to, payment_method, status, cash_register_id } = req.query;
-    const values = [];
-    let where = "WHERE 1=1";
-
-    if (shouldFilterByCompany) {
-      values.push(companyId);
-      where += ` AND sales.company_id=$${values.length}`;
-    }
-
-    if (!canManageCaisses(req.user) && !canAccessDirectionModule(req.user)) {
-      const assigned = await getUserCaisse(pool, req.user.id);
-      if (assigned?.caisse_id) {
-        values.push(assigned.caisse_id);
-        where += ` AND (sales.caisse_id=$${values.length} OR sales.cash_register_id=$${values.length})`;
-      } else {
-        values.push(req.user.id);
-        where += ` AND sales.created_by=$${values.length}`;
-      }
-    }
-
-    if (cash_register_id) {
-      values.push(cash_register_id);
-      where += ` AND (sales.caisse_id=$${values.length} OR sales.cash_register_id=$${values.length})`;
-    }
-    if (date_from) {
-      values.push(date_from);
-      where += ` AND DATE(sales.created_at) >= $${values.length}`;
-    }
-    if (date_to) {
-      values.push(date_to);
-      where += ` AND DATE(sales.created_at) <= $${values.length}`;
-    }
-    if (payment_method) {
-      values.push(payment_method);
-      where += ` AND sales.payment_method=$${values.length}`;
-    }
-    if (status) {
-      values.push(status);
-      where += ` AND LOWER(sales.status)=LOWER($${values.length})`;
-    }
-
-    const summary = await pool.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulÃ©e')::int AS nombre_ventes,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulÃ©e' THEN total_amount ELSE 0 END),0)::numeric AS total_vendu,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulÃ©e' THEN amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulÃ©e' THEN COALESCE(NULLIF(remaining_amount,0), amount_due, 0) ELSE 0 END),0)::numeric AS total_credit,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) = 'annulÃ©e' THEN total_amount ELSE 0 END),0)::numeric AS total_annule,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulÃ©e' THEN total_profit ELSE 0 END),0)::numeric AS total_profit,
-         CASE
-           WHEN COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulÃ©e') > 0
-           THEN COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulÃ©e' THEN total_amount ELSE 0 END),0)
-                / COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulÃ©e')
-           ELSE 0
-         END::numeric AS montant_moyen
-       FROM sales
-       ${where}`,
-      values
-    );
-
-    const byCaisse = await pool.query(
-      `SELECT
-         COALESCE(c.id, sales.caisse_id, sales.cash_register_id) AS caisse_id,
-         COALESCE(c.nom_caisse, sales.nom_caisse, 'Sans caisse') AS nom_caisse,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(sales.status,'')) <> 'annulÃ©e' THEN sales.total_amount ELSE 0 END),0)::numeric AS total_vendu,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(sales.status,'')) <> 'annulÃ©e' THEN sales.amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
-         COUNT(*) FILTER (WHERE lower(COALESCE(sales.status,'')) <> 'annulÃ©e')::int AS nombre_ventes
-       FROM sales
-       LEFT JOIN caisses c ON c.id=sales.caisse_id
-       ${where}
-       GROUP BY COALESCE(c.id, sales.caisse_id, sales.cash_register_id), COALESCE(c.nom_caisse, sales.nom_caisse, 'Sans caisse')
-       ORDER BY nom_caisse ASC`,
-      values
-    );
-
-    res.json({
-      totals: summary.rows[0],
-      by_caisse: byCaisse.rows
-    });
-  } catch (error) {
-    console.error("ERREUR POS SALES SUMMARY :", error);
-    res.status(500).json({ error: "Erreur rÃ©sumÃ© ventes POS" });
-  }
-});
-
-app.get("/pos/sales/:id", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-
-    const saleResult = await pool.query(
-      `SELECT *
-       FROM sales
-       WHERE id=$1 ${shouldFilterByCompany ? "AND company_id=$2" : ""}`,
-      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
-    );
-
-    if (saleResult.rows.length === 0) {
-      return res.status(404).json({ error: "Vente introuvable" });
-    }
-
-    const itemsResult = await pool.query(
-      "SELECT * FROM sale_items WHERE sale_id=$1 ORDER BY id ASC",
-      [req.params.id]
-    );
-    const receiptResult = await pool.query(
-      "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
-      [req.params.id]
-    );
-    const companySettings = await getCompanySettingsForCompany(pool, saleResult.rows[0].company_id || companyId);
-
-    res.json({
-      sale: saleResult.rows[0],
-      items: itemsResult.rows,
-      receipt: receiptResult.rows[0] || null,
-      company_settings: companySettings
-    });
-  } catch (error) {
-    console.error("ERREUR POS SALE DETAIL :", error);
-    res.status(500).json({ error: "Erreur dÃ©tail vente POS" });
-  }
-});
-
-app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-
-  try {
-    if (!canAdjustPosPrice(req.user)) {
-      return res.status(403).json({ error: "Seul un admin peut annuler une vente." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const shouldFilterByCompany = req.user.is_super_admin !== true || Boolean(companyId);
-    const { reason } = req.body;
-
-    await client.query("BEGIN");
-
-    const saleResult = await client.query(
-      `SELECT * FROM sales
-       WHERE id=$1 ${shouldFilterByCompany ? "AND company_id=$2" : ""}
-       FOR UPDATE`,
-      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
-    );
-    const sale = saleResult.rows[0];
-
-    if (!sale) throw new Error("Vente introuvable");
-    if (sale.status === "annulÃ©e") throw new Error("Vente dÃ©jÃ  annulÃ©e");
-
-    const itemsResult = await client.query("SELECT * FROM sale_items WHERE sale_id=$1", [sale.id]);
-
-    for (const item of itemsResult.rows) {
-      await client.query("UPDATE products SET stock = stock + $1 WHERE id=$2", [
-        item.quantity,
-        item.product_id
-      ]);
-
-      if (item.batch_id) {
-        await client.query(
-          "UPDATE product_batches SET quantity_remaining = quantity_remaining + $1 WHERE id=$2",
-          [item.quantity, item.batch_id]
-        );
-      }
-    }
-
-    const updated = await client.query(
-      `UPDATE sales
-       SET status='annulÃ©e', cancelled_by=$1, cancelled_at=CURRENT_TIMESTAMP,
-           cancel_reason=$2
-       WHERE id=$3
-       RETURNING *`,
-      [req.user.id, reason || "", sale.id]
-    );
-
-    if (sale.caisse_id || sale.cash_register_id) {
-      await client.query(
-        `UPDATE caisses
-         SET solde_actuel = GREATEST(COALESCE(solde_actuel,0) - $1, 0),
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [Number(sale.amount_paid || 0), sale.caisse_id || sale.cash_register_id]
-      );
-    }
-
-    await client.query("COMMIT");
-    res.json(updated.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR ANNULATION POS :", error);
-    res.status(500).json({ error: "Erreur annulation vente" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/pos/receipts/:id", authenticateToken, async (req, res) => {
-  try {
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const companyId = getEffectiveCompanyId(req);
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const result = await pool.query(
-      `SELECT *
-       FROM receipts
-       WHERE id=$1 ${shouldFilterByCompany ? "AND company_id=$2" : ""}`,
-      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "ReÃ§u introuvable" });
-    }
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR RECU POS :", error);
-    res.status(500).json({ error: "Erreur lecture reÃ§u" });
-  }
-});
-
-app.post("/pos/send-receipt-email", authenticateToken, async (req, res) => {
-  try {
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return res.status(503).json({
-        error: "Configuration SMTP manquante. Configurez SMTP_HOST, SMTP_USER et SMTP_PASS."
-      });
-    }
-
-    const { receipt_id, sale_id, recipient_email, subject = "", message = "" } = req.body || {};
-    const recipientEmail = String(recipient_email || "").trim();
-
-    if (!recipientEmail || !recipientEmail.includes("@")) {
-      return res.status(400).json({ error: "Email destinataire invalide." });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const values = [receipt_id || null, sale_id || null];
-    let companyFilter = "";
-    if (shouldFilterByCompany) {
-      values.push(companyId);
-      companyFilter = `AND r.company_id=$${values.length}`;
-    }
-
-    const receiptResult = await pool.query(
-      `SELECT r.*, s.sale_number, s.customer_name, s.customer_phone,
-              s.payment_method, s.payment_status, s.created_at AS sale_created_at
-       FROM receipts r
-       LEFT JOIN sales s ON s.id=r.sale_id
-       WHERE (($1::int IS NOT NULL AND r.id=$1) OR ($2::int IS NOT NULL AND r.sale_id=$2))
-       ${companyFilter}
-       ORDER BY r.id DESC
-       LIMIT 1`,
-      values
-    );
-
-    const receipt = receiptResult.rows[0];
-    if (!receipt) {
-      return res.status(404).json({ error: "ReÃ§u introuvable." });
-    }
-
-    const companySettings = await getCompanySettingsForCompany(pool, receipt.company_id || companyId);
-    const rawReceiptData = receipt.receipt_data || {};
-    const receiptData =
-      typeof rawReceiptData === "string"
-        ? JSON.parse(rawReceiptData || "{}")
-        : rawReceiptData;
-    const items = Array.isArray(receiptData.items) ? receiptData.items : [];
-    const appName = companySettings?.company_name || receiptData.company_name || "Triangle WMS Pro";
-    const totalAmount = Number(receipt.total_amount || receiptData.total_amount || 0);
-    const emailSubject =
-      subject ||
-      `ReÃ§u ${receipt.receipt_number || receipt.sale_number || ""} - ${appName}`;
-    const htmlItems = items
-      .map(
-        (item) => `<tr>
-          <td>${escapeHtml(item.product_name || item.name || "")}</td>
-          <td style="text-align:right">${Number(item.quantity || 0)}</td>
-          <td style="text-align:right">${Number(item.unit_price || item.price || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
-          <td style="text-align:right">${Number(item.total_price || item.total || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
-        </tr>`
-      )
-      .join("");
-    const html = `
-      <div style="font-family:Arial,sans-serif;color:#111827">
-        <h2>${escapeHtml(appName)}</h2>
-        <p>${escapeHtml(message || "Veuillez trouver ci-dessous votre reÃ§u POS.")}</p>
-        <p><strong>ReÃ§u :</strong> ${escapeHtml(receipt.receipt_number || "")}</p>
-        <p><strong>Vente :</strong> ${escapeHtml(receipt.sale_number || "")}</p>
-        <p><strong>Client :</strong> ${escapeHtml(receipt.customer_name || receiptData.customer_name || "Client comptoir")}</p>
-        <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb">
-          <thead>
-            <tr style="background:#f9fafb">
-              <th align="left">Produit</th>
-              <th align="right">QtÃ©</th>
-              <th align="right">Prix</th>
-              <th align="right">Total</th>
-            </tr>
-          </thead>
-          <tbody>${htmlItems || "<tr><td colspan=\"4\">Aucun article dÃ©taillÃ©.</td></tr>"}</tbody>
-        </table>
-        <h3 style="text-align:right">Total : ${totalAmount.toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</h3>
-      </div>`;
-
-    const logResult = await pool.query(
-      `INSERT INTO pos_receipt_email_logs
-       (tenant_id, company_id, sale_id, receipt_id, recipient_email, subject, status, sent_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)
-       RETURNING id`,
-      [req.tenant_id || getTenantFromRequest(req), receipt.company_id || companyId, receipt.sale_id || null, receipt.id, recipientEmail, emailSubject, req.user.id || null]
-    );
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-
-    const info = await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: recipientEmail,
-      subject: emailSubject,
-      html
-    });
-
-    await pool.query(
-      `UPDATE pos_receipt_email_logs
-       SET status='sent',
-           provider_message_id=$1,
-           sent_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [info.messageId || "", logResult.rows[0].id]
-    );
-
-    await logAudit(req, "email_pos_receipt", "receipt", receipt.id, {
-      recipient_email: recipientEmail,
-      message_id: info.messageId || ""
-    });
-
-    res.json({ message: "ReÃ§u envoyÃ© par email.", message_id: info.messageId || "" });
-  } catch (error) {
-    console.error("ERREUR EMAIL RECU POS :", error);
-    res.status(500).json({ error: error.message || "Erreur envoi reÃ§u POS" });
-  }
-});
-
-app.post("/push/subscribe", authenticateToken, async (req, res) => {
-  try {
-    if (!process.env.WEB_PUSH_VAPID_PUBLIC_KEY || !process.env.WEB_PUSH_VAPID_PRIVATE_KEY) {
-      return res.status(503).json({
-        error: "Configuration Web Push manquante. Configurez WEB_PUSH_VAPID_PUBLIC_KEY et WEB_PUSH_VAPID_PRIVATE_KEY."
-      });
-    }
-
-    const { endpoint, keys = {} } = req.body || {};
-    if (!endpoint || !keys.p256dh || !keys.auth) {
-      return res.status(400).json({ error: "Abonnement push invalide." });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO push_subscriptions
-       (tenant_id, company_id, user_id, endpoint, p256dh, auth, user_agent, is_active)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,true)
-       ON CONFLICT (tenant_id, endpoint)
-       DO UPDATE SET
-         company_id=EXCLUDED.company_id,
-         user_id=EXCLUDED.user_id,
-         p256dh=EXCLUDED.p256dh,
-         auth=EXCLUDED.auth,
-         user_agent=EXCLUDED.user_agent,
-         is_active=true,
-         updated_at=CURRENT_TIMESTAMP
-       RETURNING id`,
-      [
-        req.tenant_id || getTenantFromRequest(req),
-        getEffectiveCompanyId(req),
-        req.user.id || null,
-        endpoint,
-        keys.p256dh,
-        keys.auth,
-        req?.headers?.["user-agent"] || ""
-      ]
-    );
-
-    res.status(201).json({ message: "Abonnement notification enregistrÃ©.", id: result.rows[0].id });
-  } catch (error) {
-    console.error("ERREUR PUSH SUBSCRIBE :", error);
-    res.status(500).json({ error: "Erreur abonnement notification" });
-  }
-});
-
-app.post("/push/test", authenticateToken, async (req, res) => {
-  try {
-    if (!process.env.WEB_PUSH_VAPID_PUBLIC_KEY || !process.env.WEB_PUSH_VAPID_PRIVATE_KEY) {
-      return res.status(503).json({
-        error: "Configuration Web Push manquante. Configurez WEB_PUSH_VAPID_PUBLIC_KEY et WEB_PUSH_VAPID_PRIVATE_KEY."
-      });
-    }
-
-    if (!webPush) {
-      return res.status(503).json({
-        error: "Module web-push non installÃ© cÃ´tÃ© backend. Installez web-push avant dâ€™envoyer des notifications rÃ©elles."
-      });
-    }
-
-    webPush.setVapidDetails(
-      process.env.WEB_PUSH_CONTACT || `mailto:${process.env.SMTP_FROM || process.env.SMTP_USER || "support@trianglewmspro.com"}`,
-      process.env.WEB_PUSH_VAPID_PUBLIC_KEY,
-      process.env.WEB_PUSH_VAPID_PRIVATE_KEY
-    );
-
-    const result = await pool.query(
-      `SELECT *
-       FROM push_subscriptions
-       WHERE tenant_id=$1
-         AND user_id=$2
-         AND is_active=true
-       ORDER BY id DESC
-       LIMIT 5`,
-      [req.tenant_id || getTenantFromRequest(req), req.user.id || null]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Aucun abonnement push actif pour cet utilisateur." });
-    }
-
-    const payload = JSON.stringify({
-      title: "Triangle WMS Pro",
-      message: "Notification test envoyÃ©e depuis le backend.",
-      url: "/notifications"
-    });
-
-    const deliveries = [];
-    for (const subscription of result.rows) {
-      try {
-        await webPush.sendNotification(
-          {
-            endpoint: subscription.endpoint,
-            keys: {
-              p256dh: subscription.p256dh,
-              auth: subscription.auth
-            }
-          },
-          payload
-        );
-        deliveries.push({ id: subscription.id, sent: true });
-      } catch (pushError) {
-        deliveries.push({ id: subscription.id, sent: false, error: pushError.message || String(pushError) });
-      }
-    }
-
-    res.json({ message: "Test Web Push terminÃ©.", deliveries });
-  } catch (error) {
-    console.error("ERREUR PUSH TEST :", error);
-    res.status(500).json({ error: "Erreur test notification push" });
-  }
-});
-
-app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const date = req.query.date || new Date().toISOString().slice(0, 10);
-
-    const sales = await pool.query(
-      `SELECT COUNT(*)::int AS sales_count,
-              COALESCE(SUM(total_amount),0)::numeric AS revenue
-       FROM sales
-       WHERE DATE(created_at)=$1
-       ${shouldFilterByCompany ? "AND company_id=$2" : ""}`,
-      shouldFilterByCompany ? [date, companyId] : [date]
-    );
-
-    const payments = await pool.query(
-      `SELECT payment_method, COUNT(*)::int AS count,
-              COALESCE(SUM(total_amount),0)::numeric AS total
-       FROM sales
-       WHERE DATE(created_at)=$1
-       ${shouldFilterByCompany ? "AND company_id=$2" : ""}
-       GROUP BY payment_method
-       ORDER BY total DESC`,
-      shouldFilterByCompany ? [date, companyId] : [date]
-    );
-
-    res.json({
-      date,
-      totals: sales.rows[0],
-      payments: payments.rows
-    });
-  } catch (error) {
-    console.error("ERREUR RAPPORT POS DAILY :", error);
-    res.status(500).json({ error: "Erreur rapport POS journalier" });
-  }
-});
-
-app.post("/pos/payments", authenticateToken, async (req, res) => {
-  try {
-    if (!canUsePos(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-    }
-
-    const {
-      sale_id,
-      amount,
-      payment_method = "EspÃ¨ces",
-      payment_status = "payÃ©",
-      notes = ""
-    } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO payments
-       (company_id, amount, currency, payment_method, status, notes,
-        paid_at, sale_id, payment_status)
-       VALUES ($1,$2,'FCFA',$3,$4,$5,CURRENT_TIMESTAMP,$6,$4)
-       RETURNING *`,
-      [
-        getEffectiveCompanyId(req),
-        Number(amount || 0),
-        payment_method,
-        payment_status,
-        notes,
-        sale_id || null
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR POS PAYMENT :", error);
-    res.status(500).json({ error: "Erreur paiement POS" });
-  }
-});
-
-app.get("/payments", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const result = await pool.query(
-      `SELECT pt.*, s.sale_number, s.customer_name
-       FROM payment_transactions pt
-       LEFT JOIN sales s ON s.id = pt.sale_id
-       WHERE 1=1 ${shouldFilterByCompany ? "AND pt.company_id=$1" : ""}
-       ORDER BY pt.id DESC
-       LIMIT 200`,
-      shouldFilterByCompany ? [companyId] : []
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LECTURE PAIEMENTS :", error);
-    res.status(500).json({ error: "Erreur lecture paiements" });
-  }
-});
-
-app.get("/payments/:id", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-    const result = await pool.query(
-      `SELECT pt.*, s.sale_number, s.customer_name
-       FROM payment_transactions pt
-       LEFT JOIN sales s ON s.id = pt.sale_id
-       WHERE pt.id=$1 ${shouldFilterByCompany ? "AND pt.company_id=$2" : ""}`,
-      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Paiement introuvable" });
-    }
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR DETAIL PAIEMENT :", error);
-    res.status(500).json({ error: "Erreur dÃ©tail paiement" });
-  }
-});
-
-app.post("/payments/initiate", authenticateToken, async (req, res) => {
-  try {
-    if (!canUsePos(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s POS refusÃ©." });
-    }
-
-    const {
-      sale_id = null,
-      payment_method = "Carte bancaire",
-      amount = 0,
-      currency = "FCFA",
-      customer_name = "",
-      customer_phone = ""
-    } = req.body;
-    const providerKey = providerKeyFromMethod(payment_method);
-    const providerReference = `MOCK-${providerKey.toUpperCase()}-${Date.now()}`;
-
-    const result = await pool.query(
-      `INSERT INTO payment_transactions
-       (company_id, sale_id, provider_key, payment_method, amount, currency,
-        status, provider_reference, external_reference, phone_number,
-        request_payload, response_payload, provider_response, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11,$11,$12)
-       RETURNING *`,
-      [
-        getEffectiveCompanyId(req),
-        sale_id,
-        providerKey,
-        payment_method,
-        Number(amount || 0),
-        currency || "FCFA",
-        providerReference,
-        providerReference,
-        customer_phone || "",
-        JSON.stringify({ sale_id, payment_method, amount, customer_name, customer_phone }),
-        JSON.stringify({
-          sandbox: true,
-          message: "Paiement sandbox initiÃ©. Utilisez confirmer pour simuler le fournisseur."
-        }),
-        req.user.id
-      ]
-    );
-
-    res.status(201).json({
-      transaction: result.rows[0],
-      status: "en attente",
-      provider_reference: providerReference,
-      sandbox: true,
-      message: "Paiement initiÃ© en mode sandbox."
-    });
-  } catch (error) {
-    console.error("ERREUR INIT PAIEMENT :", error);
-    res.status(500).json({ error: "Erreur initiation paiement" });
-  }
-});
-
-app.post("/payments/confirm", authenticateToken, async (req, res) => {
-  const { status = "payÃ©" } = req.body;
-  const nextStatus =
-    status === "Ã©chouÃ©" || status === "failed" || status === "fail"
-      ? "failed"
-      : "paid";
-
-  return updateSandboxPayment(req, res, nextStatus);
-});
-
-async function updateSandboxPayment(req, res, nextStatus) {
-  const client = await pool.connect();
-
-  try {
-    const { transaction_id, provider_reference } = req.body;
-    const numericTransactionId =
-      transaction_id !== undefined &&
-      transaction_id !== null &&
-      String(transaction_id).trim() !== "" &&
-      Number.isInteger(Number(transaction_id))
-        ? Number(transaction_id)
-        : null;
-    const safeReference = String(
-      provider_reference || (!numericTransactionId ? transaction_id || "" : "")
-    ).trim();
-    console.log("Sandbox simulation request:", req.body);
-    console.log("Reference received:", safeReference || transaction_id || "");
-    await client.query("BEGIN");
-
-    const transactionResult = await client.query(
-      `SELECT *
-       FROM payment_transactions
-       WHERE ($1::integer IS NOT NULL AND id=$1::integer)
-          OR ($2::text <> '' AND LOWER(TRIM(provider_reference::text))=LOWER(TRIM($2::text)))
-          OR ($2::text <> '' AND LOWER(TRIM(external_reference::text))=LOWER(TRIM($2::text)))
-       ORDER BY id DESC
-       LIMIT 1
-       FOR UPDATE`,
-      [numericTransactionId, safeReference]
-    );
-
-    if (transactionResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        error: "Transaction sandbox introuvable.",
-        reference: safeReference || transaction_id || ""
-      });
-    }
-
-    const transaction = transactionResult.rows[0];
-    console.log("Payment found:", {
-      id: transaction.id,
-      sale_id: transaction.sale_id,
-      provider_reference: transaction.provider_reference,
-      external_reference: transaction.external_reference,
-      status: transaction.status
-    });
-    const currentStatus = String(transaction.status || "").toLowerCase();
-
-    if (!["pending", "en attente"].includes(currentStatus)) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        error: "Ce paiement a dÃ©jÃ  Ã©tÃ© traitÃ©",
-        status: transaction.status,
-        transaction_id: transaction.id,
-        provider_reference: transaction.provider_reference
-      });
-    }
-
-    await client.query(
-      `UPDATE payment_transactions
-       SET status=$1::varchar,
-           paid_at=CASE WHEN $1::text='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
-           response_payload=$2,
-           provider_response=$2,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$3`,
-      [
-        nextStatus,
-        JSON.stringify({ sandbox: true, status: nextStatus, confirmed_by: req.user.id }),
-        transaction.id
-      ]
-    );
-
-    await client.query(
-      `UPDATE sale_payments SET status=$1::varchar WHERE transaction_id=$2`,
-      [nextStatus, transaction.id]
-    );
-
-    let sale = null;
-    let receipt = null;
-    let items = [];
-    let companySettings = null;
-
-    if (transaction.sale_id) {
-      if (nextStatus === "paid") {
-        const paymentTotals = await client.query(
-          `SELECT s.total_amount,
-                  COALESCE(SUM(CASE WHEN sp.status IN ('paid','payÃ©') THEN sp.amount ELSE 0 END), 0)::numeric AS paid_amount
-           FROM sales s
-           LEFT JOIN sale_payments sp ON sp.sale_id=s.id
-           WHERE s.id=$1
-           GROUP BY s.id`,
-          [transaction.sale_id]
-        );
-        const totalAmount = Number(paymentTotals.rows[0]?.total_amount || 0);
-        const paidAmount = Number(paymentTotals.rows[0]?.paid_amount || 0);
-
-        if (paidAmount >= totalAmount) {
-          const finalized = await finalizePaidPosSale(client, transaction.sale_id, req.user);
-          sale = finalized.sale || null;
-          receipt = finalized.receipt || null;
-          items = finalized.items || [];
-          companySettings = finalized.company_settings || null;
-          console.log("sale liÃ©e", sale);
-          console.log("receipt crÃ©Ã©", receipt);
-        } else {
-          const saleResult = await client.query(
-            `UPDATE sales
-             SET payment_status='en attente',
-                 status='en attente',
-                 amount_paid=$1,
-                 amount_due=GREATEST(total_amount - $1, 0),
-                 remaining_amount=GREATEST(total_amount - $1, 0),
-                 updated_at=CURRENT_TIMESTAMP
-             WHERE id=$2
-             RETURNING *`,
-            [paidAmount, transaction.sale_id]
-          );
-          sale = saleResult.rows[0] || null;
-          console.log("sale liÃ©e", sale);
-        }
-      } else {
-        const saleResult = await client.query(
-          `UPDATE sales
-           SET payment_status=$1,
-               status='annulÃ©e',
-               amount_due=total_amount - COALESCE(amount_paid, 0),
-               remaining_amount=total_amount - COALESCE(amount_paid, 0),
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$2
-           RETURNING *`,
-          [nextStatus, transaction.sale_id]
-        );
-        sale = saleResult.rows[0] || null;
-        console.log("sale liÃ©e", sale);
-      }
-    }
-
-    await client.query("COMMIT");
-
-    res.json({
-      ok: true,
-      status: nextStatus,
-      transaction_id: transaction.id,
-      provider_reference: transaction.provider_reference,
-      sale,
-      receipt,
-      items,
-      company_settings: companySettings
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR SANDBOX PAIEMENT :", error);
-    res.status(500).json({
-      error: "Erreur sandbox paiement",
-      details: error.message || String(error)
-    });
-  } finally {
-    client.release();
-  }
-}
-
-app.post("/payments/sandbox/success", authenticateToken, async (req, res) => {
-  return updateSandboxPayment(req, res, "paid");
-});
-
-app.post("/payments/sandbox/fail", authenticateToken, async (req, res) => {
-  return updateSandboxPayment(req, res, "failed");
-});
-
-async function handlePaymentWebhook(req, res, providerKey) {
-  try {
-    const payload = req.body || {};
-    const reference =
-      payload.provider_reference ||
-      payload.payment_reference ||
-      payload.reference ||
-      payload.transaction_id ||
-      payload.external_reference ||
-      "";
-    const status =
-      payload.status === "paid" || payload.status === "success" || payload.status === "payÃ©"
-        ? "payÃ©"
-        : payload.status || "en attente";
-
-    const transactionResult = await pool.query(
-      `SELECT *
-       FROM payment_transactions
-       WHERE provider_key=$1
-       AND (
-         provider_reference=$2
-         OR external_reference=$2
-         OR CAST(id AS TEXT)=$2
-       )
-       ORDER BY id DESC
-       LIMIT 1`,
-      [providerKey, String(reference)]
-    );
-
-    if (transactionResult.rows.length === 0) {
-      return res.status(404).json({ error: "Transaction introuvable" });
-    }
-
-    const transaction = transactionResult.rows[0];
-
-    await pool.query(
-      `UPDATE payment_transactions
-       SET status=$1,
-           response_payload=$2,
-           paid_at=CASE WHEN $1='payÃ©' THEN CURRENT_TIMESTAMP ELSE paid_at END,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$3`,
-      [status, JSON.stringify(payload), transaction.id]
-    );
-
-    await pool.query(
-      `UPDATE sale_payments
-       SET status=$1
-       WHERE transaction_id=$2`,
-      [status, transaction.id]
-    );
-
-    const saleUpdate = await pool.query(
-      `UPDATE sales
-       SET payment_status=$1,
-           status=CASE WHEN $1='payÃ©' THEN 'validÃ©e' ELSE status END,
-           amount_paid=CASE WHEN $1='payÃ©' THEN total_amount ELSE amount_paid END,
-           amount_due=CASE WHEN $1='payÃ©' THEN 0 ELSE amount_due END,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2
-       RETURNING *`,
-      [status, transaction.sale_id]
-    );
-
-    if (status === "payÃ©" && saleUpdate.rows[0]) {
-      await createNotification({
-        user_id: saleUpdate.rows[0].created_by,
-        title: "Paiement POS confirmÃ©",
-        message: `Paiement confirmÃ© pour ${saleUpdate.rows[0].sale_number}.`,
-        type: "payment_validated",
-        company_id: saleUpdate.rows[0].company_id,
-        related_entity_type: "sale",
-        related_entity_id: saleUpdate.rows[0].id,
-        action_url: `/pos/recus?sale=${saleUpdate.rows[0].id}`,
-        created_by: saleUpdate.rows[0].created_by
-      });
-    }
-
-    res.json({ ok: true, status, sale: saleUpdate.rows[0] || null });
-  } catch (error) {
-    console.error("ERREUR WEBHOOK PAIEMENT :", error);
-    res.status(500).json({ error: "Erreur webhook paiement" });
-  }
-}
-
-app.post("/payments/webhook/card", async (req, res) => {
-  await handlePaymentWebhook(req, res, "card");
-});
-
-app.post("/payments/webhook/orange-money", async (req, res) => {
-  await handlePaymentWebhook(req, res, "orange_money");
-});
-
-app.post("/payments/webhook/moov-money", async (req, res) => {
-  await handlePaymentWebhook(req, res, "moov_money");
-});
-
-app.post("/payments/webhook/wave", async (req, res) => {
-  await handlePaymentWebhook(req, res, "wave");
-});
-
-app.get("/pos/reports/products", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-
-    const result = await pool.query(
-      `SELECT product_reference, product_name,
-              SUM(quantity)::int AS quantity_sold,
-              COALESCE(SUM(total_price),0)::numeric AS total
-       FROM sale_items
-       ${shouldFilterByCompany ? "WHERE company_id=$1" : ""}
-       GROUP BY product_reference, product_name
-       ORDER BY quantity_sold DESC
-       LIMIT 50`,
-      shouldFilterByCompany ? [companyId] : []
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR RAPPORT POS PRODUITS :", error);
-    res.status(500).json({ error: "Erreur rapport produits POS" });
-  }
-});
-
-app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
-
-    const result = await pool.query(
-      `SELECT payment_method, payment_status,
-              COUNT(*)::int AS count,
-              COALESCE(SUM(total_amount),0)::numeric AS total
-       FROM sales
-       ${shouldFilterByCompany ? "WHERE company_id=$1" : ""}
-       GROUP BY payment_method, payment_status
-       ORDER BY total DESC`,
-      shouldFilterByCompany ? [companyId] : []
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR RAPPORT POS PAIEMENTS :", error);
-    res.status(500).json({ error: "Erreur rapport paiements POS" });
-  }
-});
-
-async function nextAccountingNumber(client, tableName, columnName, prefix, companyId) {
-  const year = new Date().getFullYear();
-  const safeCompanyId = Number(companyId || 0);
-  const counterKey = `${tableName}.${columnName}.${prefix}.${year}`;
-  const counterResult = await client.query(
-    `INSERT INTO number_counters (company_id, counter_key, last_value)
-     VALUES ($1,$2,1)
-     ON CONFLICT (company_id, counter_key)
-     DO UPDATE SET
-       last_value=number_counters.last_value + 1,
-       updated_at=CURRENT_TIMESTAMP
-     RETURNING last_value`,
-    [safeCompanyId, counterKey]
-  );
-  const counterSequence = Number(counterResult.rows[0]?.last_value || 1);
-  const hasCompanyId = await columnExists(tableName, "company_id");
-
-  const result = await client.query(
-    `SELECT ${columnName} AS number
-     FROM ${tableName}
-     WHERE ${hasCompanyId ? "company_id=$1 AND" : ""}
-       ${columnName} LIKE $${hasCompanyId ? "2" : "1"}
-     ORDER BY id DESC
-     LIMIT 1`,
-    hasCompanyId ? [companyId, `${prefix}-${year}-%`] : [`${prefix}-${year}-%`]
-  );
-  const lastNumber = String(result.rows[0]?.number || "");
-  const lastSequence = Number(lastNumber.split("-").pop() || 0);
-  const nextSequence = Math.max(counterSequence, lastSequence + 1);
-
-  if (nextSequence !== counterSequence) {
-    await client.query(
-      `UPDATE number_counters
-       SET last_value=$1,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE company_id=$2
-         AND counter_key=$3`,
-      [nextSequence, safeCompanyId, counterKey]
-    );
-  }
-
-  return `${prefix}-${year}-${String(nextSequence).padStart(6, "0")}`;
-}
-
-async function ensureTreasuryAccount(client, companyId, currency = "FCFA") {
-  const result = await client.query(
-    `INSERT INTO treasury_accounts (company_id, currency, initial_balance, current_balance)
-     VALUES ($1,$2,0,0)
-     ON CONFLICT (company_id)
-     DO UPDATE SET company_id=EXCLUDED.company_id
-     RETURNING *`,
-    [companyId, currency || "FCFA"]
-  );
-  return result.rows[0];
-}
-
-function normalizePaymentMethodLabel(method = "") {
-  return String(method || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function paymentMethodBankKeywords(method = "") {
-  const normalized = normalizePaymentMethodLabel(method);
-  if (normalized.includes("orange")) return ["orange", "orange money"];
-  if (normalized.includes("moov")) return ["moov", "moov money"];
-  if (normalized.includes("wave")) return ["wave"];
-  if (normalized.includes("carte")) return ["carte", "card", "banque"];
-  if (normalized.includes("virement") || normalized.includes("banque")) {
-    return ["virement", "banque", "bank"];
-  }
-  return [];
-}
-
-async function findAccountingBankForPayment(client, companyId, method = "") {
-  const keywords = paymentMethodBankKeywords(method);
-  if (keywords.length === 0) return null;
-
-  const values = [companyId];
-  const filters = keywords.map((keyword) => {
-    values.push(`%${keyword}%`);
-    return `LOWER(bank_name) LIKE LOWER($${values.length})`;
-  });
-
-  const result = await client.query(
-    `SELECT *
-     FROM accounting_banks
-     WHERE company_id=$1
-       AND is_active=true
-       AND (${filters.join(" OR ")})
-     ORDER BY id ASC
-     LIMIT 1
-     FOR UPDATE`,
-    values
-  );
-
-  return result.rows[0] || null;
-}
-
-async function recordPosPaymentAccounting(client, { sale, payment, user = {}, amount = null }) {
-  const paymentId = payment?.id || null;
-  const saleId = sale?.id || payment?.sale_id || null;
-  const companyId = sale?.company_id || payment?.company_id || user?.company_id || null;
-  const amountValue = Number(amount ?? payment?.amount ?? sale?.total_amount ?? 0);
-  const method = payment?.payment_method || payment?.method || sale?.payment_method || "";
-  const normalizedMethod = normalizePaymentMethodLabel(method);
-
-  if (!paymentId || !saleId || !companyId || amountValue <= 0) return null;
-  if (normalizedMethod.includes("credit")) return null;
-
-  const existing = await client.query(
-    `SELECT id
-     FROM accounting_transactions
-     WHERE source_type='pos_payment'
-       AND source_id=$1
-       AND company_id=$2
-     LIMIT 1`,
-    [paymentId, companyId]
-  );
-  if (existing.rows[0]) return existing.rows[0];
-
-  await ensureTreasuryAccount(client, companyId, payment?.currency || "FCFA");
-
-  let bank = null;
-  const isCash = normalizedMethod.includes("espece") || normalizedMethod.includes("cash");
-  const caisseId = sale?.caisse_id || sale?.cash_register_id || payment?.caisse_id || null;
-  let destinationLabel = "TrÃ©sorerie interne";
-  let bankId = null;
-  let finalCaisseId = null;
-
-  if (isCash && caisseId) {
-    finalCaisseId = caisseId;
-    await client.query(
-      `UPDATE caisses
-       SET solde_actuel=COALESCE(solde_actuel,0)+$1,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2
-         AND company_id=$3`,
-      [amountValue, finalCaisseId, companyId]
-    );
-    destinationLabel = sale?.nom_caisse || "Caisse POS";
-  } else if (!isCash) {
-    bank = await findAccountingBankForPayment(client, companyId, method);
-    if (bank) {
-      bankId = bank.id;
-      destinationLabel = bank.bank_name || method || "Banque";
-      await client.query(
-        `UPDATE accounting_banks
-         SET current_balance=COALESCE(current_balance,0)+$1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [amountValue, bank.id]
-      );
-    } else {
-      await client.query(
-        `UPDATE treasury_accounts
-         SET current_balance=COALESCE(current_balance,0)+$1,
-             updated_by=$2,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE company_id=$3`,
-        [amountValue, user?.id || sale?.created_by || null, companyId]
-      );
-      destinationLabel = `TrÃ©sorerie interne (${method || "paiement POS"})`;
-    }
-  } else {
-    await client.query(
-      `UPDATE treasury_accounts
-       SET current_balance=COALESCE(current_balance,0)+$1,
-           updated_by=$2,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE company_id=$3`,
-      [amountValue, user?.id || sale?.created_by || null, companyId]
-    );
-  }
-
-  const transactionNumber = await nextAccountingNumber(
-    client,
-    "accounting_transactions",
-    "transaction_number",
-    "POS",
-    companyId
-  );
-
-  const transaction = await client.query(
-    `INSERT INTO accounting_transactions
-     (company_id, transaction_number, transaction_type, source_type, source_id,
-      bank_id, caisse_id, amount, currency, direction, category, partner_name,
-      description, status, source_label, destination_label, created_by,
-      validated_by, validated_at)
-     VALUES ($1,$2,'encaissement_pos','pos_payment',$3,$4,$5,$6,$7,'entrÃ©e',
-             'Vente POS',$8,$9,'validÃ©',$10,$11,$12,$12,CURRENT_TIMESTAMP)
-     RETURNING *`,
-    [
-      companyId,
-      transactionNumber,
-      paymentId,
-      bankId,
-      finalCaisseId,
-      amountValue,
-      payment?.currency || "FCFA",
-      sale?.customer_name || "",
-      `Encaissement POS ${sale?.sale_number || saleId} - ${method || "paiement"}`,
-      method || "POS",
-      destinationLabel,
-      user?.id || sale?.created_by || null
-    ]
-  );
-
-  await client.query(
-    `UPDATE payments
-     SET accounting_transaction_id=$1,
-         updated_at=CURRENT_TIMESTAMP
-     WHERE id=$2`,
-    [transaction.rows[0].id, paymentId]
-  );
-
-  await createAccountingEntry(client, {
-    companyId,
-    sourceType: "pos_payment",
-    sourceId: paymentId,
-    accountLabel: destinationLabel,
-    debit: amountValue,
-    credit: 0,
-    description: `Encaissement POS ${sale?.sale_number || saleId}`,
-    createdBy: user?.id || sale?.created_by || null
-  });
-
-  await createAccountingEntry(client, {
-    companyId,
-    sourceType: "pos_payment",
-    sourceId: paymentId,
-    accountLabel: "Ventes POS",
-    debit: 0,
-    credit: amountValue,
-    description: `Vente POS ${sale?.sale_number || saleId}`,
-    createdBy: user?.id || sale?.created_by || null
-  });
-
-  return transaction.rows[0];
-}
-
-async function createAccountingEntry(client, {
-  companyId,
-  sourceType,
-  sourceId,
-  accountLabel,
-  debit = 0,
-  credit = 0,
-  description = "",
-  createdBy = null
-}) {
-  const entryNumber = await nextAccountingNumber(
-    client,
-    "accounting_entries",
-    "entry_number",
-    "ECR",
-    companyId
-  );
-
-  await client.query(
-    `INSERT INTO accounting_entries
-     (company_id, entry_number, source_type, source_id, account_label,
-      debit, credit, description, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [
-      companyId,
-      entryNumber,
-      sourceType,
-      sourceId,
-      accountLabel,
-      Number(debit || 0),
-      Number(credit || 0),
-      description,
-      createdBy
-    ]
-  );
-}
-
-async function createJournalEntry(client, {
-  companyId,
-  label,
-  moduleSource,
-  sourceId,
-  lines,
-  createdBy = null
-}) {
-  const normalizedLines = (lines || []).map((line) => ({
-    ...line,
-    debit: Number(line.debit || 0),
-    credit: Number(line.credit || 0)
-  }));
-  const totalDebit = normalizedLines.reduce((sum, line) => sum + line.debit, 0);
-  const totalCredit = normalizedLines.reduce((sum, line) => sum + line.credit, 0);
-
-  if (Math.round(totalDebit) !== Math.round(totalCredit)) {
-    const error = new Error("Ã‰criture comptable dÃ©sÃ©quilibrÃ©e.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const entryNumber = await nextAccountingNumber(
-    client,
-    "journal_entries",
-    "entry_number",
-    "JRN",
-    companyId
-  );
-  const entryResult = await client.query(
-    `INSERT INTO journal_entries
-     (company_id, entry_number, label, module_source, source_id, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     RETURNING *`,
-    [companyId, entryNumber, label, moduleSource, sourceId, createdBy]
-  );
-
-  for (const line of normalizedLines) {
-    await client.query(
-      `INSERT INTO journal_entry_lines
-       (entry_id, company_id, account_code, account_name, debit, credit,
-        partner_id, bank_id, caisse_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [
-        entryResult.rows[0].id,
-        companyId,
-        line.account_code,
-        line.account_name,
-        line.debit,
-        line.credit,
-        line.partner_id || null,
-        line.bank_id || null,
-        line.caisse_id || null
-      ]
-    );
-  }
-
-  return entryResult.rows[0];
-}
-
-function normalizeOptionalId(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const numeric = Number(value);
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
-}
-
-async function loadAccountingBankForUpdate(client, user, bankId) {
-  if (!bankId) return null;
-  const isSuperAdmin = user?.is_super_admin === true || normalizeRole(user?.role) === "super_admin";
-  const result = await client.query(
-    `SELECT * FROM accounting_banks
-     WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
-     FOR UPDATE`,
-    isSuperAdmin ? [bankId] : [bankId, user.company_id]
-  );
-  return result.rows[0] || null;
-}
-
-async function loadAccountingCaisseForUpdate(client, user, caisseId) {
-  if (!caisseId) return null;
-  const isSuperAdmin = user?.is_super_admin === true || normalizeRole(user?.role) === "super_admin";
-  const result = await client.query(
-    `SELECT * FROM caisses
-     WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
-     FOR UPDATE`,
-    isSuperAdmin ? [caisseId] : [caisseId, user.company_id]
-  );
-  return result.rows[0] || null;
-}
-
-function ensureSufficientBalance(balance, amount, message) {
-  if (Number(balance || 0) < Number(amount || 0)) {
-    const error = new Error(message);
-    error.statusCode = 400;
-    throw error;
-  }
-}
-
-function getAccountingScope(req, requireCompany = false) {
-  const isSuperAdmin = isSuperAdminUser(req.user);
-  const companyId = getEffectiveCompanyId(req);
-  if (requireCompany && !companyId) {
-    const error = new Error("Veuillez choisir une entreprise active avant cette opÃ©ration.");
-    error.statusCode = 400;
-    throw error;
-  }
-  const values = companyId ? [companyId] : [];
-  const filter = companyId ? "WHERE company_id=$1" : "";
-  const andFilter = companyId ? "AND company_id=$1" : "";
-  return { isSuperAdmin, companyId, values, filter, andFilter };
-}
-
-function logAccountingError(route, error, req, extra = {}) {
-  const payload = req?.body && typeof req.body === "object" ? { ...req.body } : req?.body;
-  console.error(`[ACCOUNTING ERROR] ${route}`, {
-    message: error?.message,
-    stack: error?.stack,
-    postgres: {
-      code: error?.code,
-      detail: error?.detail,
-      hint: error?.hint,
-      table: error?.table,
-      column: error?.column,
-      constraint: error?.constraint,
-      routine: error?.routine
-    },
-    context: {
-      company_id: getEffectiveCompanyId(req),
-      user_id: req?.user?.id || null,
-      role: req?.user?.role || "",
-      bank_id: payload?.bank_id || req?.params?.bank_id || null,
-      caisse_id: payload?.caisse_id || req?.params?.caisse_id || null,
-      transaction_number: payload?.transaction_number || extra.transaction_number || null,
-      ...extra
-    },
-    payload
-  });
-}
-
-function accountingErrorMessage(error, fallback) {
-  return error?.detail || error?.message || fallback;
-}
-
-app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-
-    const { companyId, values, filter, andFilter } = getAccountingScope(req, false);
-
-    const treasury = await pool.query(
-      `SELECT COALESCE(SUM(current_balance),0)::numeric AS total
-       FROM treasury_accounts ${filter}`,
-      values
-    );
-    const banks = await pool.query(
-      `SELECT COALESCE(SUM(current_balance),0)::numeric AS total
-       FROM accounting_banks ${filter}`,
-      values
-    );
-    const caisses = await pool.query(
-      `SELECT COALESCE(SUM(solde_actuel),0)::numeric AS total
-       FROM caisses ${filter}`,
-      values
-    );
-    const dailyIn = await pool.query(
-      `SELECT COALESCE(SUM(amount),0)::numeric AS total
-       FROM accounting_transactions
-       WHERE direction='entrÃ©e' AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
-      values
-    );
-    const dailyOut = await pool.query(
-      `SELECT COALESCE(SUM(amount),0)::numeric AS total
-       FROM accounting_transactions
-       WHERE direction='sortie' AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
-      values
-    );
-    const monthExpenses = await pool.query(
-      `SELECT COALESCE(SUM(amount),0)::numeric AS total
-       FROM accounting_transactions
-       WHERE direction='sortie'
-         AND date_trunc('month', created_at)=date_trunc('month', CURRENT_DATE)
-         ${andFilter}`,
-      values
-    );
-    const requests = await pool.query(
-      `SELECT status, COUNT(*)::int AS count
-       FROM expense_requests
-       ${filter}
-       GROUP BY status`,
-      values
-    );
-    const payroll = await pool.query(
-      `SELECT COALESCE(SUM(net_amount),0)::numeric AS total
-       FROM payroll_runs
-       WHERE status IN ('brouillon','Ã  payer','validÃ©') ${andFilter}`,
-      values
-    );
-
-    res.json({
-      treasury_balance: Number(treasury.rows[0]?.total || 0),
-      bank_balance: Number(banks.rows[0]?.total || 0),
-      cash_register_balance: Number(caisses.rows[0]?.total || 0),
-      total_treasury: Number(treasury.rows[0]?.total || 0) + Number(banks.rows[0]?.total || 0) + Number(caisses.rows[0]?.total || 0),
-      encaissements_jour: Number(dailyIn.rows[0]?.total || 0),
-      cash_in_today: Number(dailyIn.rows[0]?.total || 0),
-      decaissements_jour: Number(dailyOut.rows[0]?.total || 0),
-      cash_out_today: Number(dailyOut.rows[0]?.total || 0),
-      depenses_mois: Number(monthExpenses.rows[0]?.total || 0),
-      expenses_month: Number(monthExpenses.rows[0]?.total || 0),
-      salaires_a_payer: Number(payroll.rows[0]?.total || 0),
-      payroll_pending: Number(payroll.rows[0]?.total || 0),
-      expense_requests_pending: Number(requests.rows.find((row) => row.status === "soumis")?.count || 0),
-      expense_requests_approved: Number(requests.rows.find((row) => row.status === "validÃ©")?.count || 0),
-      expense_requests_rejected: Number(requests.rows.find((row) => row.status === "refusÃ©")?.count || 0),
-      demandes: requests.rows.reduce((acc, row) => {
-        acc[row.status] = Number(row.count || 0);
-        return acc;
-      }, {})
-    });
-  } catch (error) {
-    logAccountingError("/accounting/dashboard", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur dashboard comptable" });
-  }
-});
-
-app.get("/accounting/chart-accounts", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter } = getAccountingScope(req, false);
-    const result = await pool.query(
-      `SELECT *
-       FROM accounting_chart_accounts
-       ${filter}
-       ORDER BY account_code ASC`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR CHART ACCOUNTS :", error);
-    res.status(500).json({ error: "Erreur plan comptable" });
-  }
-});
-
-app.post("/accounting/chart-accounts", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s gestion comptable refusÃ©." });
-    }
-    const { account_code, account_name, account_class = "", account_type = "" } = req.body;
-    const { companyId } = getAccountingScope(req, true);
-    if (!account_code || !account_name) {
-      return res.status(400).json({ error: "Code et nom de compte obligatoires." });
-    }
-    const result = await pool.query(
-      `INSERT INTO accounting_chart_accounts
-       (company_id, account_code, account_name, account_class, account_type, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (company_id, account_code)
-       DO UPDATE SET
-         account_name=EXCLUDED.account_name,
-         account_class=EXCLUDED.account_class,
-         account_type=EXCLUDED.account_type,
-         updated_at=CURRENT_TIMESTAMP
-       RETURNING *`,
-      [companyId, account_code, account_name, account_class, account_type, req.user.id]
-    );
-    await logAudit(req, "upsert_chart_account", "accounting_chart_account", result.rows[0].id, { account_code });
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR UPSERT CHART ACCOUNT :", error);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur enregistrement compte" });
-  }
-});
-
-app.get("/accounting/caisses", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter } = getAccountingScope(req, false);
-    const result = await pool.query(
-      `SELECT c.*, u.fullname AS responsable_name, u.email AS responsable_email
-       FROM caisses c
-       LEFT JOIN users u ON u.caisse_id=c.id
-       ${filter ? "WHERE c.company_id=$1" : ""}
-       ORDER BY c.id DESC`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    logAccountingError("GET /accounting/caisses", error, req);
-    res.status(500).json({ error: "Erreur lecture caisses comptables" });
-  }
-});
-
-app.get("/accounting/journal-entries", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter } = getAccountingScope(req, false);
-    const result = await pool.query(
-      `SELECT e.*,
-        COALESCE(json_agg(l ORDER BY l.id) FILTER (WHERE l.id IS NOT NULL), '[]') AS lines
-       FROM journal_entries e
-       LEFT JOIN journal_entry_lines l ON l.entry_id=e.id
-       ${filter ? "WHERE e.company_id=$1" : ""}
-       GROUP BY e.id
-       ORDER BY e.id DESC
-       LIMIT 300`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR JOURNAL ENTRIES :", error);
-    res.status(500).json({ error: "Erreur lecture journal" });
-  }
-});
-
-app.get("/accounting/banks", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter } = getAccountingScope(req, false);
-    const result = await pool.query(
-      `SELECT * FROM accounting_banks
-       ${filter}
-       ORDER BY is_active DESC, bank_name ASC`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    logAccountingError("GET /accounting/banks", error, req);
-    res.status(500).json({ error: "Erreur lecture banques" });
-  }
-});
-
-app.post("/accounting/banks", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s gestion comptable refusÃ©." });
-    }
-    const {
-      bank_name,
-      account_number = "",
-      iban = "",
-      swift = req.body.swift_code || "",
-      currency = "FCFA",
-      initial_balance = 0,
-      is_active = true
-    } = req.body;
-
-    if (!bank_name) {
-      return res.status(400).json({ error: "Nom banque obligatoire." });
-    }
-    const { companyId } = getAccountingScope(req, true);
-
-    const result = await pool.query(
-      `INSERT INTO accounting_banks
-       (company_id, bank_name, account_number, iban, swift, currency,
-        initial_balance, current_balance, is_active, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9)
-       RETURNING *`,
-      [
-        companyId,
-        bank_name,
-        account_number,
-        iban,
-        swift,
-        currency,
-        Number(initial_balance || 0),
-        is_active !== false,
-        req.user.id
-      ]
-    );
-    await logAudit(req, "create_bank", "accounting_bank", result.rows[0].id, { bank_name });
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    logAccountingError("POST /accounting/banks", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur crÃ©ation banque") });
-  }
-});
-
-app.put("/accounting/banks/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s gestion comptable refusÃ©." });
-    }
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      bank_name,
-      account_number = "",
-      iban = "",
-      swift = "",
-      currency = "FCFA",
-      is_active = true
-    } = req.body;
-    const result = await pool.query(
-      `UPDATE accounting_banks
-       SET bank_name=$1, account_number=$2, iban=$3, swift=$4,
-           currency=$5, is_active=$6, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$7 ${isSuperAdmin && !companyId ? "" : "AND company_id=$8"}
-       RETURNING *`,
-      isSuperAdmin && !companyId
-        ? [bank_name, account_number, iban, swift, currency, is_active !== false, req.params.id]
-        : [bank_name, account_number, iban, swift, currency, is_active !== false, req.params.id, companyId || req.user.company_id]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Banque introuvable." });
-    await logAudit(req, "update_bank", "accounting_bank", req.params.id, { bank_name });
-    res.json(result.rows[0]);
-  } catch (error) {
-    logAccountingError("PUT /accounting/banks/:id", error, req, { bank_id: req.params.id });
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur modification banque") });
-  }
-});
-
-app.delete("/accounting/banks/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s gestion comptable refusÃ©." });
-    }
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `UPDATE accounting_banks
-       SET is_active=false,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$1 ${isSuperAdmin && !companyId ? "" : "AND company_id=$2"}
-       RETURNING *`,
-      isSuperAdmin && !companyId ? [req.params.id] : [req.params.id, companyId || req.user.company_id]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Banque introuvable." });
-    await logAudit(req, "deactivate_bank", "accounting_bank", req.params.id, {
-      bank_name: result.rows[0].bank_name
-    });
-    res.json({ message: "Banque dÃ©sactivÃ©e.", bank: result.rows[0] });
-  } catch (error) {
-    logAccountingError("DELETE /accounting/banks/:id", error, req, { bank_id: req.params.id });
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur suppression banque") });
-  }
-});
-
-app.get("/accounting/transactions", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter } = getAccountingScope(req, false);
-    const result = await pool.query(
-      `SELECT t.*, b.bank_name, c.nom_caisse
-       FROM accounting_transactions t
-       LEFT JOIN accounting_banks b ON b.id=t.bank_id
-       LEFT JOIN caisses c ON c.id=t.caisse_id
-       ${filter ? "WHERE t.company_id=$1" : ""}
-       ORDER BY t.id DESC
-       LIMIT 300`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    logAccountingError("GET /accounting/transactions", error, req);
-    res.status(500).json({ error: "Erreur lecture mouvements comptables" });
-  }
-});
-
-app.post("/accounting/transactions", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s gestion comptable refusÃ©." });
-    }
-    const {
-      transaction_type,
-      bank_id = null,
-      caisse_id = null,
-      amount,
-      direction,
-      category = "",
-      partner_id = null,
-      partner_name = "",
-      description = "",
-      attachment_url = "",
-      source_label = "",
-      destination_label = ""
-    } = req.body;
-
-    const amountValue = Number(amount || 0);
-    if (!transaction_type || amountValue <= 0 || !["entrÃ©e", "sortie"].includes(direction)) {
-      return res.status(400).json({ error: "Type, sens et montant valides obligatoires." });
-    }
-    const bankId = normalizeOptionalId(bank_id);
-    const caisseId = normalizeOptionalId(caisse_id);
-
-    await client.query("BEGIN");
-    const bank = await loadAccountingBankForUpdate(client, req.user, bankId);
-    if (bankId && !bank) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Banque introuvable ou non autorisÃ©e pour cette entreprise." });
-    }
-    const caisse = await loadAccountingCaisseForUpdate(client, req.user, caisseId);
-    if (caisseId && !caisse) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Caisse introuvable ou non autorisÃ©e pour cette entreprise." });
-    }
-
-    const companyId = bank?.company_id || caisse?.company_id || getAccountingScope(req, true).companyId;
-    await ensureTreasuryAccount(client, companyId);
-    const transactionNumber = await nextAccountingNumber(
-      client,
-      "accounting_transactions",
-      "transaction_number",
-      direction === "entrÃ©e" ? "ENC" : "DEC",
-      companyId
-    );
-
-    if (bank) {
-      const bankDelta =
-        transaction_type === "depot_caisse_banque" || direction === "entrÃ©e"
-          ? amountValue
-          : -amountValue;
-      if (bankDelta < 0) {
-        ensureSufficientBalance(bank.current_balance, amountValue, "Solde insuffisant dans cette banque.");
-      }
-      await client.query(
-        `UPDATE accounting_banks
-         SET current_balance=COALESCE(current_balance,0)+$1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [bankDelta, bankId]
-      );
-    }
-
-    if (caisse) {
-      const caisseDelta =
-        transaction_type === "retrait_banque" || direction === "entrÃ©e"
-          ? amountValue
-          : -amountValue;
-      if (caisseDelta < 0) {
-        ensureSufficientBalance(caisse.solde_actuel, amountValue, "Solde insuffisant dans cette caisse.");
-      }
-      await client.query(
-        `UPDATE caisses
-         SET solde_actuel=COALESCE(solde_actuel,0)+$1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [caisseDelta, caisseId]
-      );
-    }
-
-    const treasuryDelta =
-      transaction_type === "retrait_banque" && bank && !caisse
-        ? amountValue
-        : !bank && !caisse && (transaction_type === "encaissement_especes" || direction === "entrÃ©e")
-          ? amountValue
-          : !bank && !caisse && direction === "sortie"
-            ? -amountValue
-            : 0;
-
-    if (treasuryDelta !== 0) {
-      if (treasuryDelta < 0) {
-        const treasuryResult = await client.query(
-          `SELECT * FROM treasury_accounts WHERE company_id=$1 FOR UPDATE`,
-          [companyId]
-        );
-        ensureSufficientBalance(treasuryResult.rows[0]?.current_balance, amountValue, "Solde insuffisant dans la trÃ©sorerie.");
-      }
-      await client.query(
-        `UPDATE treasury_accounts
-         SET current_balance=COALESCE(current_balance,0)+$1,
-             updated_by=$2,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE company_id=$3`,
-        [treasuryDelta, req.user.id, companyId]
-      );
-    }
-
-    const result = await client.query(
-      `INSERT INTO accounting_transactions
-       (company_id, transaction_number, transaction_type, bank_id, caisse_id, amount,
-        direction, category, partner_id, partner_name, description,
-        attachment_url, source_label, destination_label, created_by, validated_by, validated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,CURRENT_TIMESTAMP)
-       RETURNING *`,
-      [
-        companyId,
-        transactionNumber,
-        transaction_type,
-        bankId,
-        caisseId,
-        amountValue,
-        direction,
-        category,
-        partner_id || null,
-        partner_name || "",
-        description,
-        attachment_url,
-        source_label,
-        destination_label,
-        req.user.id
-      ]
-    );
-
-    await createAccountingEntry(client, {
-      companyId,
-      sourceType: "accounting_transaction",
-      sourceId: result.rows[0].id,
-      accountLabel: direction === "entrÃ©e" ? "Banque / TrÃ©sorerie" : "Charge / DÃ©caissement",
-      debit: direction === "entrÃ©e" ? amountValue : 0,
-      credit: direction === "sortie" ? amountValue : 0,
-      description,
-      createdBy: req.user.id
-    });
-
-    const isBankCashTransfer = transaction_type === "retrait_banque" && bankId && caisseId;
-    const isCashBankDeposit = transaction_type === "depot_caisse_banque" && bankId && caisseId;
-    const debitLine =
-      isBankCashTransfer
-        ? {
-            account_code: "57",
-            account_name: "Caisse",
-            debit: amountValue,
-            credit: 0,
-            caisse_id: caisseId
-          }
-        : isCashBankDeposit
-          ? {
-              account_code: "52",
-              account_name: "Banque",
-              debit: amountValue,
-              credit: 0,
-              bank_id: bankId
-            }
-          : direction === "entrÃ©e"
-        ? {
-            account_code: bankId ? "52" : caisseId ? "57" : "57",
-            account_name: bankId ? "Banque" : "Caisse",
-            debit: amountValue,
-            credit: 0,
-            bank_id: bankId,
-            caisse_id: caisseId
-          }
-        : {
-            account_code:
-              transaction_type === "salaire"
-                ? "64"
-                : transaction_type === "paiement_fournisseur"
-                  ? "40"
-                  : "65",
-            account_name:
-              transaction_type === "salaire"
-                ? "Charges de personnel"
-                : transaction_type === "paiement_fournisseur"
-                  ? "Fournisseurs"
-                  : "Autres charges",
-            debit: amountValue,
-            credit: 0,
-            partner_id: partner_id || null
-          };
-    const creditLine =
-      isBankCashTransfer
-        ? {
-            account_code: "52",
-            account_name: "Banque",
-            debit: 0,
-            credit: amountValue,
-            bank_id: bankId
-          }
-        : isCashBankDeposit
-          ? {
-              account_code: "57",
-              account_name: "Caisse",
-              debit: 0,
-              credit: amountValue,
-              caisse_id: caisseId
-            }
-          : direction === "entrÃ©e"
-        ? {
-            account_code: transaction_type === "encaissement_bancaire" ? "70" : "75",
-            account_name: transaction_type === "encaissement_bancaire" ? "Ventes" : "Autres produits",
-            debit: 0,
-            credit: amountValue,
-            partner_id: partner_id || null
-          }
-        : {
-            account_code: bankId ? "52" : "57",
-            account_name: bankId ? "Banque" : "Caisse",
-            debit: 0,
-            credit: amountValue,
-            bank_id: bankId,
-            caisse_id: caisseId
-          };
-
-    await createJournalEntry(client, {
-      companyId,
-      label: description || transaction_type,
-      moduleSource: "accounting_transaction",
-      sourceId: result.rows[0].id,
-      lines: [debitLine, creditLine],
-      createdBy: req.user.id
-    });
-
-    await client.query("COMMIT");
-    await logAudit(req, "create_accounting_transaction", "accounting_transaction", result.rows[0].id, { amount: amountValue, direction });
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    logAccountingError("POST /accounting/transactions", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur mouvement comptable") });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/accounting/vouchers", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter } = getAccountingScope(req, false);
-    const result = await pool.query(
-      `SELECT v.*, b.bank_name, c.nom_caisse
-       FROM cash_vouchers v
-       LEFT JOIN accounting_banks b ON b.id=v.bank_id
-       LEFT JOIN caisses c ON c.id=v.caisse_id
-       ${filter ? "WHERE v.company_id=$1" : ""}
-       ORDER BY v.id DESC
-       LIMIT 300`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    logAccountingError("GET /accounting/vouchers", error, req);
-    res.status(500).json({ error: "Erreur lecture bons" });
-  }
-});
-
-app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s gestion comptable refusÃ©." });
-    }
-    const {
-      voucher_type,
-      amount,
-      origin = "",
-      beneficiary = "",
-      bank_id = null,
-      caisse_id = null,
-      partner_id = null,
-      partner_name = "",
-      reason = "",
-      expense_category = "",
-      attachment_url = ""
-    } = req.body;
-    const amountValue = Number(amount || 0);
-    const bankId = normalizeOptionalId(bank_id);
-    const caisseId = normalizeOptionalId(caisse_id);
-    if (!["encaissement", "decaissement"].includes(voucher_type) || amountValue <= 0) {
-      return res.status(400).json({ error: "Type de bon et montant valides obligatoires." });
-    }
-    const { companyId } = getAccountingScope(req, true);
-    const voucherNumber = await nextAccountingNumber(
-      pool,
-      "cash_vouchers",
-      "voucher_number",
-      voucher_type === "encaissement" ? "BE" : "BD",
-      companyId
-    );
-    const result = await pool.query(
-      `INSERT INTO cash_vouchers
-       (company_id, voucher_number, voucher_type, amount, origin, beneficiary,
-        bank_id, caisse_id, partner_id, partner_name, reason, expense_category,
-        attachment_url, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'soumis',$14)
-       RETURNING *`,
-      [
-        companyId,
-        voucherNumber,
-        voucher_type,
-        amountValue,
-        origin,
-        beneficiary,
-        bankId,
-        caisseId,
-        partner_id || null,
-        partner_name || "",
-        reason,
-        expense_category,
-        attachment_url,
-        req.user.id
-      ]
-    );
-    await logAudit(req, "create_cash_voucher", "cash_voucher", result.rows[0].id, { voucher_type, amount: amountValue });
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    logAccountingError("POST /accounting/vouchers", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur crÃ©ation bon") });
-  }
-});
-
-app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canApproveAccounting(req.user) && !canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s validation comptable refusÃ©." });
-    }
-    await client.query("BEGIN");
-    const voucherResult = await client.query(
-      `SELECT *
-       FROM cash_vouchers
-       WHERE id=$1 ${isSuperAdminUser(req.user) && !getEffectiveCompanyId(req) ? "" : "AND company_id=$2"}
-       FOR UPDATE`,
-      isSuperAdminUser(req.user) && !getEffectiveCompanyId(req)
-        ? [req.params.id]
-        : [req.params.id, getEffectiveCompanyId(req) || req.user.company_id]
-    );
-    const voucher = voucherResult.rows[0];
-    if (!voucher) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Bon introuvable." });
-    }
-    if (voucher.status === "validÃ©") {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Bon dÃ©jÃ  validÃ©." });
-    }
-
-    await ensureTreasuryAccount(client, voucher.company_id);
-    const amountValue = Number(voucher.amount || 0);
-    const direction = voucher.voucher_type === "encaissement" ? "entrÃ©e" : "sortie";
-    const bank = await loadAccountingBankForUpdate(client, req.user, normalizeOptionalId(voucher.bank_id));
-    const caisse = await loadAccountingCaisseForUpdate(client, req.user, normalizeOptionalId(voucher.caisse_id));
-
-    if (voucher.bank_id && !bank) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Banque introuvable ou non autorisÃ©e pour ce bon." });
-    }
-    if (voucher.caisse_id && !caisse) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Caisse introuvable ou non autorisÃ©e pour ce bon." });
-    }
-
-    if (bank) {
-      const delta = direction === "entrÃ©e" ? amountValue : -amountValue;
-      if (delta < 0) ensureSufficientBalance(bank.current_balance, amountValue, "Solde insuffisant dans cette banque.");
-      await client.query(
-        `UPDATE accounting_banks
-         SET current_balance=COALESCE(current_balance,0)+$1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [delta, bank.id]
-      );
-    } else if (caisse) {
-      const delta = direction === "entrÃ©e" ? amountValue : -amountValue;
-      if (delta < 0) ensureSufficientBalance(caisse.solde_actuel, amountValue, "Solde insuffisant dans cette caisse.");
-      await client.query(
-        `UPDATE caisses
-         SET solde_actuel=COALESCE(solde_actuel,0)+$1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [delta, caisse.id]
-      );
-    } else {
-      const treasuryDelta = direction === "entrÃ©e" ? amountValue : -amountValue;
-      if (treasuryDelta < 0) {
-        const treasuryResult = await client.query(
-          `SELECT * FROM treasury_accounts WHERE company_id=$1 FOR UPDATE`,
-          [voucher.company_id]
-        );
-        ensureSufficientBalance(treasuryResult.rows[0]?.current_balance, amountValue, "Solde insuffisant dans la trÃ©sorerie.");
-      }
-      await client.query(
-        `UPDATE treasury_accounts
-         SET current_balance=COALESCE(current_balance,0)+$1,
-             updated_by=$2,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE company_id=$3`,
-        [treasuryDelta, req.user.id, voucher.company_id]
-      );
-    }
-
-    const transactionNumber = await nextAccountingNumber(
-      client,
-      "accounting_transactions",
-      "transaction_number",
-      voucher.voucher_type === "encaissement" ? "ENC" : "DEC",
-      voucher.company_id
-    );
-    await client.query(
-      `INSERT INTO accounting_transactions
-       (company_id, transaction_number, transaction_type, source_type, source_id,
-        bank_id, caisse_id, amount, direction, category, partner_id, partner_name,
-        description, attachment_url, created_by, validated_by, validated_at)
-       VALUES ($1,$2,$3,'cash_voucher',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,CURRENT_TIMESTAMP)`,
-      [
-        voucher.company_id,
-        transactionNumber,
-        voucher.voucher_type,
-        voucher.id,
-        voucher.bank_id,
-        voucher.caisse_id,
-        amountValue,
-        direction,
-        voucher.expense_category || "",
-        voucher.partner_id,
-        voucher.partner_name || "",
-        voucher.reason || "",
-        voucher.attachment_url || "",
-        req.user.id
-      ]
-    );
-
-    await createJournalEntry(client, {
-      companyId: voucher.company_id,
-      label: voucher.reason || voucher.voucher_number,
-      moduleSource: "cash_voucher",
-      sourceId: voucher.id,
-      lines: direction === "entrÃ©e"
-        ? [
-            {
-              account_code: bank ? "52" : "57",
-              account_name: bank ? "Banque" : "Caisse",
-              debit: amountValue,
-              credit: 0,
-              bank_id: bank?.id || null,
-              caisse_id: caisse?.id || null
-            },
-            {
-              account_code: "75",
-              account_name: "Autres produits",
-              debit: 0,
-              credit: amountValue,
-              partner_id: voucher.partner_id || null
-            }
-          ]
-        : [
-            {
-              account_code: voucher.expense_category === "achat" ? "60" : "65",
-              account_name: voucher.expense_category === "achat" ? "Achats" : "Autres charges",
-              debit: amountValue,
-              credit: 0,
-              partner_id: voucher.partner_id || null
-            },
-            {
-              account_code: bank ? "52" : "57",
-              account_name: bank ? "Banque" : "Caisse",
-              debit: 0,
-              credit: amountValue,
-              bank_id: bank?.id || null,
-              caisse_id: caisse?.id || null
-            }
-          ],
-      createdBy: req.user.id
-    });
-
-    const updated = await client.query(
-      `UPDATE cash_vouchers
-       SET status='validÃ©',
-           validated_by=$1,
-           validated_at=CURRENT_TIMESTAMP,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2
-       RETURNING *`,
-      [req.user.id, voucher.id]
-    );
-    await client.query("COMMIT");
-    await logAudit(req, "validate_cash_voucher", "cash_voucher", voucher.id, { voucher_type: voucher.voucher_type });
-    res.json(updated.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    logAccountingError("PUT /accounting/vouchers/:id/validate", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur validation bon") });
-  } finally {
-    client.release();
-  }
-});
-
-app.put("/accounting/vouchers/:id/reject", authenticateToken, async (req, res) => {
-  try {
-    if (!canApproveAccounting(req.user) && !canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refus bon comptable refusÃ©." });
-    }
-    const isGlobalSuperAdmin = isSuperAdminUser(req.user) && !getEffectiveCompanyId(req);
-    const values = [
-      "refusÃ©",
-      req.body?.rejection_reason || req.body?.reason || "",
-      req.user.id,
-      req.params.id
-    ];
-    let query = `
-      UPDATE cash_vouchers
-      SET status=$1,
-          rejection_reason=$2,
-          validated_by=$3,
-          validated_at=CURRENT_TIMESTAMP,
-          updated_at=CURRENT_TIMESTAMP
-      WHERE id=$4
-    `;
-    if (!isGlobalSuperAdmin) {
-      values.push(getEffectiveCompanyId(req) || req.user.company_id);
-      query += " AND company_id=$5";
-    }
-    query += " RETURNING *";
-
-    const result = await pool.query(query, values);
-    if (!result.rows[0]) return res.status(404).json({ error: "Bon introuvable." });
-    await logAudit(req, "reject_cash_voucher", "cash_voucher", req.params.id, {
-      reason: req.body?.rejection_reason || req.body?.reason || ""
-    });
-    res.json(result.rows[0]);
-  } catch (error) {
-    logAccountingError("PUT /accounting/vouchers/:id/reject", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur refus bon") });
-  }
-});
-
-app.get("/accounting/expense-requests", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const isSuperAdmin = isSuperAdminUser(req.user);
-    const activeCompanyId = getEffectiveCompanyId(req);
-    const whereClause = isSuperAdmin
-      ? activeCompanyId ? "company_id=$1" : "true"
-      : "company_id=$1";
-    const values = isSuperAdmin
-      ? activeCompanyId ? [activeCompanyId] : []
-      : [req.user.company_id];
-    const result = await pool.query(
-      `SELECT *
-       FROM expense_requests
-       WHERE ${whereClause}
-       ORDER BY id DESC`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    logAccountingError("GET /accounting/expense-requests", error, req);
-    res.status(500).json({ error: "Erreur lecture demandes" });
-  }
-});
-
-app.post("/accounting/expense-requests", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const {
-      requested_amount,
-      reason,
-      description = "",
-      urgency = "normale",
-      attachment_url = ""
-    } = req.body;
-    const amountValue = Number(requested_amount || 0);
-    if (amountValue <= 0 || !reason) {
-      return res.status(400).json({ error: "Montant et motif obligatoires." });
-    }
-    const { companyId } = getAccountingScope(req, true);
-    const requestNumber = await nextAccountingNumber(
-      pool,
-      "expense_requests",
-      "request_number",
-      "DD",
-      companyId
-    );
-    const result = await pool.query(
-      `INSERT INTO expense_requests
-       (company_id, request_number, requested_amount, reason, description,
-        urgency, attachment_url, status, created_by, created_by_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'soumis',$8,$9)
-       RETURNING *`,
-      [
-        companyId,
-        requestNumber,
-        amountValue,
-        reason,
-        description,
-        urgency,
-        attachment_url,
-        req.user.id,
-        req.user.email || ""
-      ]
-    );
-    await logAudit(req, "create_expense_request", "expense_request", result.rows[0].id, { amount: amountValue });
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    logAccountingError("POST /accounting/expense-requests", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur crÃ©ation demande") });
-  }
-});
-
-app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    let { status, rejection_reason = "", proof_url = "" } = req.body;
-    if (status === "payÃ©") status = "paiement_effectuÃ©";
-    const allowed = ["validÃ©", "refusÃ©", "paiement_effectuÃ©", "justificatif_reÃ§u", "clÃ´turÃ©"];
-    if (!allowed.includes(status)) {
-      return res.status(400).json({ error: "Statut invalide." });
-    }
-    if ((status === "validÃ©" || status === "refusÃ©") && !canApproveAccounting(req.user)) {
-      return res.status(403).json({ error: "Validation rÃ©servÃ©e Ã  la direction/admin." });
-    }
-    if ((status === "paiement_effectuÃ©" || status === "justificatif_reÃ§u" || status === "clÃ´turÃ©") && !canManageAccounting(req.user)) {
-      return res.status(403).json({ error: "Paiement/clÃ´ture rÃ©servÃ© au comptable/admin." });
-    }
-
-    await client.query("BEGIN");
-    const isGlobalSuperAdmin = isSuperAdminUser(req.user) && !getEffectiveCompanyId(req);
-    const requestResult = await client.query(
-      `SELECT *
-       FROM expense_requests
-       WHERE id=$1 ${isGlobalSuperAdmin ? "" : "AND company_id=$2"}
-       FOR UPDATE`,
-      isGlobalSuperAdmin ? [req.params.id] : [req.params.id, getEffectiveCompanyId(req) || req.user.company_id]
-    );
-    const request = requestResult.rows[0];
-    if (!request) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Demande introuvable." });
-    }
-    if (status === "clÃ´turÃ©" && !proof_url && !request.proof_url) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Justificatif obligatoire pour clÃ´turer." });
-    }
-
-    if (status === "paiement_effectuÃ©" && request.status !== "paiement_effectuÃ©") {
-      await ensureTreasuryAccount(client, request.company_id);
-      const treasuryResult = await client.query(
-        `SELECT * FROM treasury_accounts WHERE company_id=$1 FOR UPDATE`,
-        [request.company_id]
-      );
-      ensureSufficientBalance(treasuryResult.rows[0]?.current_balance, Number(request.requested_amount || 0), "Solde insuffisant dans la trÃ©sorerie.");
-      await client.query(
-        `UPDATE treasury_accounts
-         SET current_balance=COALESCE(current_balance,0)-$1,
-             updated_by=$2,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE company_id=$3`,
-        [Number(request.requested_amount || 0), req.user.id, request.company_id]
-      );
-    }
-
-    const update = await client.query(
-      `UPDATE expense_requests
-       SET status=$1,
-           rejection_reason=CASE WHEN $1='refusÃ©' THEN $2 ELSE rejection_reason END,
-           proof_url=COALESCE(NULLIF($3,''), proof_url),
-           approved_by=CASE WHEN $1 IN ('validÃ©','refusÃ©') THEN $4 ELSE approved_by END,
-           approved_at=CASE WHEN $1 IN ('validÃ©','refusÃ©') THEN CURRENT_TIMESTAMP ELSE approved_at END,
-           paid_by=CASE WHEN $1='paiement_effectuÃ©' THEN $4 ELSE paid_by END,
-           paid_at=CASE WHEN $1='paiement_effectuÃ©' THEN CURRENT_TIMESTAMP ELSE paid_at END,
-           closed_by=CASE WHEN $1='clÃ´turÃ©' THEN $4 ELSE closed_by END,
-           closed_at=CASE WHEN $1='clÃ´turÃ©' THEN CURRENT_TIMESTAMP ELSE closed_at END,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$5
-       RETURNING *`,
-      [status, rejection_reason, proof_url, req.user.id, request.id]
-    );
-    await client.query("COMMIT");
-    await logAudit(req, "update_expense_request_status", "expense_request", request.id, { status });
-    res.json(update.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    logAccountingError("PUT /accounting/expense-requests/:id/status", error, req);
-    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur changement statut demande") });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/accounting/statements", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewAccounting(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s comptabilitÃ© refusÃ©." });
-    }
-    const { values, filter, andFilter } = getAccountingScope(req, false);
-
-    const entries = await pool.query(
-      `SELECT e.*, COALESCE(json_agg(l ORDER BY l.id) FILTER (WHERE l.id IS NOT NULL), '[]') AS lines
-       FROM journal_entries e
-       LEFT JOIN journal_entry_lines l ON l.entry_id=e.id
-       ${filter ? "WHERE e.company_id=$1" : ""}
-       GROUP BY e.id
-       ORDER BY e.id DESC
-       LIMIT 500`,
-      values
-    );
-    const debitsCredits = await pool.query(
-      `SELECT
-         COALESCE(SUM(debit),0)::numeric AS debit,
-         COALESCE(SUM(credit),0)::numeric AS credit
-       FROM journal_entry_lines
-       ${filter}`,
-      values
-    );
-    const cashflow = await pool.query(
-      `SELECT direction, COALESCE(SUM(amount),0)::numeric AS total
-       FROM accounting_transactions
-       WHERE status='validÃ©' ${andFilter}
-       GROUP BY direction`,
-      values
-    );
-    const assets = await pool.query(
-      `SELECT
-         (SELECT COALESCE(SUM(current_balance),0) FROM accounting_banks ${filter}) AS banks,
-         (SELECT COALESCE(SUM(current_balance),0) FROM treasury_accounts ${filter}) AS treasury,
-         (SELECT COALESCE(SUM(solde_actuel),0) FROM caisses ${filter}) AS caisses`,
-      values
-    );
-
-    res.json({
-      bilan: {
-        actif:
-          Number(assets.rows[0]?.banks || 0) +
-          Number(assets.rows[0]?.treasury || 0) +
-          Number(assets.rows[0]?.caisses || 0),
-        passif: 0,
-        banques: Number(assets.rows[0]?.banks || 0),
-        caisses: Number(assets.rows[0]?.caisses || 0),
-        tresorerie: Number(assets.rows[0]?.treasury || 0)
-      },
-      compte_resultat: {
-        produits: Number(cashflow.rows.find((row) => row.direction === "entrÃ©e")?.total || 0),
-        charges: Number(cashflow.rows.find((row) => row.direction === "sortie")?.total || 0)
-      },
-      tableau_tresorerie: cashflow.rows,
-      balance_generale: debitsCredits.rows[0],
-      grand_livre: entries.rows
-    });
-  } catch (error) {
-    logAccountingError("GET /accounting/statements", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur Ã©tats financiers" });
-  }
-});
-
-app.use("/super-admin", authenticateToken, (req, res, next) => {
-  if (req.user?.is_super_admin !== true && normalizeRole(req.user?.role) !== "super_admin") {
-    return res.status(403).json({ error: "AccÃ¨s super admin requis." });
-  }
-  next();
-});
-
-app.get("/super-admin/modules", authenticateToken, async (req, res) => {
-  try {
-    if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
-      return res.status(403).json({ error: "AccÃ¨s super admin requis." });
-    }
-
-    // Tout le catalogue, verticales comprises : l'ancienne liste n'en
-    // contenait que 12 et le super-admin ne pouvait retirer ni Restaurant ni
-    // Ã‰ducation Ã  une sociÃ©tÃ©.
-    const moduleKeys = access.MODULE_CATALOG.filter((m) => !m.core).map((m) => m.key);
-
-    const companiesResult = await pool.query(
-      "SELECT id, name FROM companies ORDER BY id ASC"
-    );
-    const modulesResult = await pool.query(
-      "SELECT * FROM company_modules ORDER BY company_id ASC, module_key ASC"
-    );
-
-    res.json({
-      module_keys: moduleKeys,
-      companies: companiesResult.rows.map((company) => ({
-        ...company,
-        modules: moduleKeys.reduce((acc, key) => {
-          const configured = modulesResult.rows.find(
-            (item) => Number(item.company_id) === Number(company.id) && item.module_key === key
-          );
-          acc[key] = configured ? configured.is_enabled === true : null;
-          return acc;
-        }, {})
-      }))
-    });
-  } catch (error) {
-    console.error("ERREUR SUPER ADMIN MODULES :", error);
-    res.status(500).json({ error: "Erreur lecture modules" });
-  }
-});
-
-app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req, res) => {
-  try {
-    if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
-      return res.status(403).json({ error: "AccÃ¨s super admin requis." });
-    }
-
-    const { modules = {} } = req.body;
-    const saved = [];
-
-    for (const [moduleKey, isEnabled] of Object.entries(modules)) {
-      const result = await pool.query(
-        `INSERT INTO company_modules
-         (company_id, module_key, is_enabled, enabled, updated_by, source)
-         VALUES ($1,$2,$3,$3,$4,'super_admin')
-         ON CONFLICT (company_id, module_key)
-         DO UPDATE SET
-           is_enabled=EXCLUDED.is_enabled,
-           enabled=EXCLUDED.enabled,
-           updated_by=EXCLUDED.updated_by,
-           source='super_admin',
-           updated_at=CURRENT_TIMESTAMP
-         RETURNING *`,
-        [req.params.companyId, access.normalizeKey(moduleKey), isEnabled === true, req.user.id]
-      );
-
-      saved.push(result.rows[0]);
-    }
-
-    res.json(saved);
-  } catch (error) {
-    console.error("ERREUR UPDATE MODULES :", error);
-    res.status(500).json({ error: "Erreur modification modules" });
-  }
-});
-
-/* Modules d'UNE sociÃ©tÃ©, vus par le super-admin : pour chaque module, la
-   dÃ©cision enregistrÃ©e, sa provenance, le verdict effectif et sa raison
-   (profil mÃ©tier, plan, dÃ©rogation). */
-app.get("/super-admin/companies/:id/modules", authenticateToken, async (req, res) => {
-  try {
-    if (!isSuperAdminUser(req.user)) return res.status(403).json({ error: "AccÃ¨s super admin requis." });
-    const societe = (await pool.query(
-      `SELECT c.id, c.name, c.business_type, c.tenant_id, p.id AS plan_id,
-              p.name AS plan_name, p.excluded_modules
-         FROM companies c
-         LEFT JOIN subscription_plans p ON p.id = COALESCE(
-           (SELECT s.plan_id FROM subscriptions s
-             WHERE s.company_id = c.id AND s.plan_id IS NOT NULL
-             ORDER BY s.id DESC LIMIT 1),
-           c.plan_id)
-        WHERE c.id = $1`, [req.params.id])).rows[0];
-    if (!societe) return res.status(404).json({ error: "SociÃ©tÃ© introuvable." });
-
-    const ctx = await access.loadAccessContext(pool, { companyId: societe.id });
-    const profil = access.profileModules(ctx.profileKey);
-    const groupes = Object.entries(access.GROUP_LABELS).map(([cle, libelle]) => ({
-      key: cle,
-      label: libelle,
-      modules: access.MODULE_CATALOG.filter((m) => m.group === cle && !m.core).map((m) => {
-        const ligne = ctx.companyRows.get(m.key) || null;
-        const etat = access.companyModuleState(ctx, m.key);
-        return {
-          key: m.key,
-          label: m.label,
-          vertical: Boolean(m.vertical),
-          stored: ligne,
-          effective: etat.enabled,
-          reason: etat.reason,
-          in_profile: profil.has(m.key),
-          plan_allows: access.planAllows(ctx.plan, m.key),
-        };
-      }),
-    })).filter((g) => g.modules.length > 0);
-
-    res.json({
-      company: {
-        id: societe.id, name: societe.name, business_type: societe.business_type,
-        business_profile: ctx.profileKey,
-        business_profile_label: access.BUSINESS_PROFILES[ctx.profileKey]?.label || "",
-        tenant_id: societe.tenant_id, plan_id: societe.plan_id, plan_name: societe.plan_name,
-        plan_excluded_modules: societe.excluded_modules || [],
-      },
-      groups: groupes,
-    });
-  } catch (error) {
-    console.error("super-admin companies modules GET:", error);
-    res.status(500).json({ error: "Erreur lecture des modules de la sociÃ©tÃ©." });
-  }
-});
-
-/* Enregistre des dÃ©cisions du super-admin pour une sociÃ©tÃ©. Elles priment sur
-   le plan et ne sont jamais recalculÃ©es automatiquement. Aucune donnÃ©e mÃ©tier
-   n'est supprimÃ©e : dÃ©sactiver = masquer et interdire l'usage. */
-app.put("/super-admin/companies/:id/modules", authenticateToken, async (req, res) => {
-  try {
-    if (!isSuperAdminUser(req.user)) return res.status(403).json({ error: "AccÃ¨s super admin requis." });
-    const societe = (await pool.query(`SELECT id FROM companies WHERE id = $1`, [req.params.id])).rows[0];
-    if (!societe) return res.status(404).json({ error: "SociÃ©tÃ© introuvable." });
-
-    const demandes = (req.body && typeof req.body.modules === "object" && req.body.modules) || {};
-    const inconnus = [];
-    const enregistres = [];
-    for (const [cleBrute, valeur] of Object.entries(demandes)) {
-      const cle = access.normalizeKey(cleBrute);
-      const entree = access.CATALOG_BY_KEY.get(cle);
-      if (!entree || entree.core) { inconnus.push(cleBrute); continue; }
-      await pool.query(
-        `INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, updated_by, source)
-         VALUES ($1,$2,$3,$3,$4,'super_admin')
-         ON CONFLICT (company_id, module_key) DO UPDATE SET
-           is_enabled=EXCLUDED.is_enabled, enabled=EXCLUDED.enabled,
-           updated_by=EXCLUDED.updated_by, source='super_admin', updated_at=CURRENT_TIMESTAMP`,
-        [societe.id, cle, valeur === true, req.user.id]);
-      enregistres.push({ key: cle, enabled: valeur === true });
-    }
-    res.json({ ok: true, saved: enregistres, ignored: inconnus });
-  } catch (error) {
-    console.error("super-admin companies modules PUT:", error);
-    res.status(500).json({ error: "Erreur enregistrement des modules." });
-  }
-});
-
-/* DOCUMENTS SAAS */
-app.get("/documents", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = `
-      SELECT * FROM documents
-    `;
-
-    let values = [];
-
-    if (!isSuperAdmin || companyId) {
-      query += ` WHERE company_id = $1 `;
-      values.push(companyId);
-    }
-
-    query += ` ORDER BY id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur lecture documents SaaS"
-    });
-  }
-});
-
-app.get("/documents/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const documentResult = await pool.query(
-      `SELECT * FROM documents
-       WHERE id=$1 ${isSuperAdmin && !companyId ? "" : "AND company_id=$2"}`,
-      isSuperAdmin && !companyId ? [req.params.id] : [req.params.id, companyId]
-    );
-
-    if (!documentResult.rows[0]) {
-      return res.status(404).json({ error: "Document introuvable" });
-    }
-
-    const itemsResult = await pool.query(
-      "SELECT * FROM document_items WHERE document_id=$1 ORDER BY id ASC",
-      [req.params.id]
-    );
-
-    res.json({
-      document: documentResult.rows[0],
-      items: itemsResult.rows
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur dÃ©tail document" });
-  }
-});
-
-function escapeHtml(value = "") {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-function renderDocumentHtml(document, items = [], companySettings = {}) {
-  const isReceipt = String(document.document_type || "").toLowerCase().includes("reÃ§u");
-  const rows = items.map((item) => `
-    <tr>
-      <td>${escapeHtml(item.product_reference || "")}</td>
-      <td>${escapeHtml(item.product_name || "")}</td>
-      <td class="right">${Number(item.quantity || 0).toLocaleString("fr-FR")}</td>
-      <td class="right">${Number(item.unit_price || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
-      <td class="right">${Number(item.total_price || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
-    </tr>
-  `).join("");
-
-  return `<!doctype html>
-  <html lang="fr">
-  <head>
-    <meta charset="utf-8" />
-    <style>
-      body { font-family: Arial, sans-serif; color: #111; margin: 0; padding: ${isReceipt ? "10px" : "28px"}; }
-      .page { max-width: ${isReceipt ? "80mm" : "210mm"}; margin: 0 auto; }
-      .header { display: flex; justify-content: space-between; gap: 24px; border-bottom: 2px solid #111; padding-bottom: 16px; }
-      .logo { max-height: 70px; max-width: 140px; object-fit: contain; }
-      h1 { margin: 18px 0 6px; font-size: ${isReceipt ? "18px" : "28px"}; }
-      .muted { color: #555; font-size: 13px; }
-      table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: ${isReceipt ? "11px" : "13px"}; }
-      th, td { border-bottom: 1px solid #ddd; padding: 8px 6px; text-align: left; }
-      th { background: #f3f4f6; }
-      .right { text-align: right; }
-      .total { margin-top: 18px; text-align: right; font-size: ${isReceipt ? "15px" : "20px"}; font-weight: 700; }
-      .signature { display: flex; justify-content: space-between; margin-top: 60px; gap: 40px; }
-      .signature div { width: 45%; border-top: 1px solid #111; padding-top: 8px; text-align: center; }
-      @media print { button { display: none; } body { padding: 0; } }
-    </style>
-  </head>
-  <body>
-    <main class="page">
-      <section class="header">
-        <div>
-          ${companySettings.logo_url ? `<img class="logo" src="${escapeHtml(companySettings.logo_url)}" alt="Logo" />` : ""}
-          <h2>${escapeHtml(companySettings.name || companySettings.company_name || "Triangle WMS Pro")}</h2>
-          <p class="muted">${escapeHtml(companySettings.address || "")}</p>
-          <p class="muted">${escapeHtml(companySettings.phone || "")} ${companySettings.email ? `| ${escapeHtml(companySettings.email)}` : ""}</p>
-        </div>
-        <div class="right">
-          <h1>${escapeHtml(document.document_type || "Document")}</h1>
-          <p><strong>${escapeHtml(document.document_number || "")}</strong></p>
-          <p class="muted">${document.created_at ? new Date(document.created_at).toLocaleString("fr-FR") : ""}</p>
-        </div>
-      </section>
-      <section>
-        <p><strong>Client / Fournisseur :</strong> ${escapeHtml(document.client_name || "-")}</p>
-        ${document.client_phone ? `<p><strong>TÃ©lÃ©phone :</strong> ${escapeHtml(document.client_phone)}</p>` : ""}
-        ${document.client_address ? `<p><strong>Adresse :</strong> ${escapeHtml(document.client_address)}</p>` : ""}
-      </section>
-      <table>
-        <thead>
-          <tr><th>RÃ©f.</th><th>Produit</th><th class="right">QtÃ©</th><th class="right">Prix</th><th class="right">Total</th></tr>
-        </thead>
-        <tbody>${rows || `<tr><td colspan="5">Aucune ligne dÃ©taillÃ©e.</td></tr>`}</tbody>
-      </table>
-      <div class="total">Total : ${Number(document.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</div>
-      ${document.observation ? `<p><strong>Observation :</strong> ${escapeHtml(document.observation)}</p>` : ""}
-      ${!isReceipt ? `<section class="signature"><div>Signature</div><div>Cachet</div></section>` : ""}
-    </main>
-  </body>
-  </html>`;
-}
-
-app.post("/documents/:id/email", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const { recipient_email, subject, message } = req.body || {};
-    if (!recipient_email || !String(recipient_email).includes("@")) {
-      return res.status(400).json({ error: "Email destinataire invalide." });
-    }
-
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return res.status(503).json({
-        error: "SMTP non configurÃ©. Configurez SMTP dans ParamÃ¨tres > Email."
-      });
-    }
-
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const documentResult = await pool.query(
-      `SELECT * FROM documents
-       WHERE id=$1 ${isSuperAdmin && !companyId ? "" : "AND company_id=$2"}`,
-      isSuperAdmin && !companyId ? [req.params.id] : [req.params.id, companyId]
-    );
-    const document = documentResult.rows[0];
-    if (!document) return res.status(404).json({ error: "Document introuvable" });
-
-    const itemsResult = await pool.query(
-      "SELECT * FROM document_items WHERE document_id=$1 ORDER BY id ASC",
-      [req.params.id]
-    );
-    const companySettings = await getCompanySettingsForCompany(pool, document.company_id);
-    const html = renderDocumentHtml(document, itemsResult.rows, companySettings || {});
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-
-    const info = await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: recipient_email,
-      subject: subject || `${document.document_type} ${document.document_number}`,
-      text: message || `Veuillez trouver le document ${document.document_number}.`,
-      html: `<p>${escapeHtml(message || `Veuillez trouver le document ${document.document_number}.`)}</p>${html}`,
-      attachments: [
-        {
-          filename: `${document.document_number || "document"}.html`,
-          content: html,
-          contentType: "text/html"
-        }
-      ]
-    });
-
-    await pool.query(
-      `UPDATE documents
-       SET email_sent_to=$1,
-           email_sent_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [recipient_email, document.id]
-    );
-
-    await logAudit(req, "email_document", "document", document.id, {
-      recipient_email,
-      message_id: info.messageId || ""
-    });
-
-    res.json({ message: "Document envoyÃ© par email.", message_id: info.messageId || "" });
-  } catch (error) {
-    console.error("ERREUR EMAIL DOCUMENT :", error);
-    res.status(500).json({
-      error: error.message || "Erreur envoi email document"
-    });
-  }
-});
-
-app.post("/reports/email", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-    const { recipient_email = "", subject = "Rapport Triangle WMS Pro", html = "", message = "" } = req.body || {};
-    if (!recipient_email || !String(recipient_email).includes("@")) {
-      return res.status(400).json({ error: "Email destinataire invalide." });
-    }
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return res.status(503).json({ error: "SMTP non configurÃ©. Configurez SMTP dans .env." });
-    }
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    });
-    const finalHtml = html || `<p>${escapeHtml(message || "Rapport Triangle WMS Pro")}</p>`;
-    const info = await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: recipient_email,
-      subject,
-      text: message || "Rapport Triangle WMS Pro",
-      html: finalHtml,
-      attachments: [{ filename: "rapport-triangle-wms.html", content: finalHtml, contentType: "text/html" }]
-    });
-    await logAudit(req, "email_report", "report", null, { recipient_email, message_id: info.messageId || "" });
-    res.json({ message: "Rapport envoyÃ© par email.", message_id: info.messageId || "" });
-  } catch (error) {
-    console.error("ERREUR EMAIL REPORT :", error);
-    res.status(500).json({ error: error.message || "Erreur envoi email rapport" });
-  }
-});
-
-app.post("/documents", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const {
-      document_type,
-      client_name,
-      client_phone,
-      client_address,
-      observation,
-      created_by,
-      items
-    } = req.body;
-
-    const prefix =
-      document_type === "Facture"
-        ? "FAC"
-        : document_type === "Proforma"
-          ? "PRO"
-          : document_type === "Bon de rÃ©ception"
-            ? "BR"
-            : "BL";
-
-    const document_number = `${prefix}-${Date.now()}`;
-
-    const total_amount = (items || []).reduce((sum, item) => {
-      return sum + Number(item.quantity || 0) * Number(item.unit_price || 0);
-    }, 0);
-
-    const documentResult = await pool.query(
-      `INSERT INTO documents
-      (
-        document_type,
-        document_number,
-        client_name,
-        client_phone,
-        client_address,
-        total_amount,
-        observation,
-        created_by,
-        company_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      RETURNING *`,
-      [
-        document_type,
-        document_number,
-        client_name,
-        client_phone,
-        client_address,
-        total_amount,
-        observation,
-        created_by || req.user.fullname || req.user.email || "Utilisateur",
-        req.user.company_id || null
-      ]
-    );
-
-    const document = documentResult.rows[0];
-
-    for (const item of items || []) {
-      const total_price =
-        Number(item.quantity || 0) * Number(item.unit_price || 0);
-
-      await pool.query(
-        `INSERT INTO document_items
-        (
-          document_id,
-          product_reference,
-          product_name,
-          quantity,
-          unit_price,
-          total_price
-        )
-        VALUES ($1,$2,$3,$4,$5,$6)`,
-        [
-          document.id,
-          item.product_reference,
-          item.product_name,
-          Number(item.quantity || 0),
-          Number(item.unit_price || 0),
-          total_price
-        ]
-      );
-    }
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "CrÃ©ation document",
-      "Documents",
-      `${document_type} crÃ©Ã© : ${document_number}`
-    );
-
-    res.status(201).json(document);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur crÃ©ation document" });
-  }
-});
-
-app.delete("/documents/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessAdminSettings(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : rÃ©servÃ© Ã  lâ€™administrateur" });
-    }
-
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    await pool.query(
-      `DELETE FROM documents
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
-    );
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Suppression document",
-      "Documents",
-      `Document supprimÃ© ID : ${req.params.id}`
-    );
-
-    res.json({ message: "Document supprimÃ©" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur suppression document" });
-  }
-});
-
-/* GÃ‰NÃ‰RER DOCUMENT DEPUIS MOUVEMENT STOCK */
-app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "AccÃ¨s refusÃ© : module rÃ©servÃ© Ã  la direction" });
-    }
-
-    const { id } = req.params;
-
-    const {
-      document_type,
-      client_name,
-      client_phone,
-      client_address,
-      created_by
-    } = req.body;
-
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const movementResult = await pool.query(
-      `SELECT * FROM stock_movements
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [id] : [id, companyId]
-    );
-
-    const movement = movementResult.rows[0];
-
-    if (!movement) {
-      return res.status(404).json({
-        error: "Mouvement introuvable"
-      });
-    }
-
-    if (movement.status !== "ValidÃ©") {
-      return res.status(400).json({
-        error: "Le mouvement doit Ãªtre validÃ© avant de gÃ©nÃ©rer un document"
-      });
-    }
-
-    let finalType = document_type;
-
-    if (!finalType) {
-      if (movement.type === "EntrÃ©e") {
-        finalType = "Bon de rÃ©ception";
-      } else if (movement.type === "Sortie") {
-        finalType = "Bon de livraison";
-      } else if (movement.type === "Transfert") {
-        finalType = "Bon de transfert";
-      } else if (movement.type === "Inventaire") {
-        finalType = "Fiche inventaire";
-      } else {
-        finalType = "Document stock";
-      }
-    }
-
-    const prefix =
-      finalType === "Facture"
-        ? "FAC"
-        : finalType === "Proforma"
-          ? "PRO"
-          : finalType === "Bon de rÃ©ception"
-            ? "BR"
-            : finalType === "Bon de sortie"
-              ? "BS"
-              : finalType === "Bon de transfert"
-                ? "BT"
-                : finalType === "Fiche inventaire"
-                  ? "INV"
-                  : "BL";
-
-    const document_number = `${prefix}-${Date.now()}`;
-
-    const documentResult = await pool.query(
-      `INSERT INTO documents
-      (
-        document_type,
-        document_number,
-        client_name,
-        client_phone,
-        client_address,
-        total_amount,
-        observation,
-        created_by,
-        company_id,
-        related_entity_type,
-        related_entity_id,
-        stock_movement_id,
-        warehouse_id,
-        status
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      RETURNING *`,
-      [
-        finalType,
-        document_number,
-        client_name || "",
-        client_phone || "",
-        client_address || "",
-        0,
-        `Document gÃ©nÃ©rÃ© depuis mouvement stock ID ${movement.id} - ${movement.type}`,
-        created_by || req.user.fullname || req.user.email || "Utilisateur",
-        movement.company_id || companyId,
-        "stock_movement",
-        movement.id,
-        movement.id,
-        movement.warehouse_id || null,
-        "ValidÃ©"
-      ]
-    );
-
-    const document = documentResult.rows[0];
-
-    await pool.query(
-      `INSERT INTO document_items
-      (
-        document_id,
-        product_reference,
-        product_name,
-        quantity,
-        unit_price,
-        total_price
-      )
-      VALUES ($1,$2,$3,$4,$5,$6)`,
-      [
-        document.id,
-        movement.product_reference,
-        movement.product_name,
-        Number(movement.quantity || 0),
-        0,
-        0
-      ]
-    );
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Document gÃ©nÃ©rÃ© depuis mouvement",
-      "Documents",
-      `${finalType} gÃ©nÃ©rÃ© : ${document_number}`
-    );
-
-    res.status(201).json(document);
-  } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      error: "Erreur gÃ©nÃ©ration document depuis mouvement"
-    });
-  }
-});
-
-/* TRIANGLE MARKETPLACE B2B/B2C */
-function canManageMarketplaceVendor(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "marketplace_vendor" ||
-    role === "marketplace_admin"
-  );
-}
-
-function canAdminMarketplace(user) {
-  const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "marketplace_admin";
-}
-
-const MARKETPLACE_ORDER_STATUSES = {
-  pending: "En attente",
-  pending_payment: "En attente",
-  confirmed: "AcceptÃ©e",
-  accepted: "AcceptÃ©e",
-  paid: "Paiement confirmÃ©",
-  preparing: "En prÃ©paration",
-  ready: "PrÃªte",
-  shipped: "ExpÃ©diÃ©e",
-  delivered: "LivrÃ©e",
-  closed: "ClÃ´turÃ©e",
-  completed: "ClÃ´turÃ©e",
-  cancelled: "AnnulÃ©e",
-  canceled: "AnnulÃ©e",
-  rejected: "RefusÃ©e",
-  refused: "RefusÃ©e",
-  received: "ClÃ´turÃ©e"
-};
-
-const MARKETPLACE_PAYMENT_STATUSES = {
-  pending: "En attente",
-  "en attente": "En attente",
-  paid: "PayÃ©",
-  paye: "PayÃ©",
-  payÃ©: "PayÃ©",
-  failed: "Ã‰chouÃ©",
-  cancelled: "AnnulÃ©",
-  canceled: "AnnulÃ©",
-  annule: "AnnulÃ©",
-  annulÃ©: "AnnulÃ©",
-  partial: "Partiel",
-  partiel: "Partiel"
-};
-
-function normalizeMarketplaceOrderStatus(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  const key = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  return MARKETPLACE_ORDER_STATUSES[key] || MARKETPLACE_ORDER_STATUSES[raw.toLowerCase()] || raw;
-}
-
-function normalizeMarketplacePaymentStatus(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  const key = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  return MARKETPLACE_PAYMENT_STATUSES[key] || MARKETPLACE_PAYMENT_STATUSES[raw.toLowerCase()] || raw;
-}
-
-function isMarketplaceClosedStatus(value) {
-  const status = normalizeMarketplaceOrderStatus(value).toLowerCase();
-  return ["clÃ´turÃ©e", "cloturee", "annulÃ©e", "annulee", "refusÃ©e", "refusee"].includes(
-    status.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-  );
-}
-
-async function refreshMarketplaceOrderPaymentState(client, orderId) {
-  const paidResult = await client.query(
-    `SELECT COALESCE(SUM(amount),0)::numeric AS amount_paid
-     FROM marketplace_payments
-     WHERE order_id=$1
-       AND LOWER(status) IN ('payÃ©','paye','paid')`,
-    [orderId]
-  );
-  const orderResult = await client.query("SELECT * FROM marketplace_orders WHERE id=$1 FOR UPDATE", [orderId]);
-  const order = orderResult.rows[0];
-  if (!order) throw new Error("Commande marketplace introuvable.");
-  const amountPaid = Number(paidResult.rows[0]?.amount_paid || 0);
-  const totalAmount = Number(order.total_amount || 0);
-  const amountDue = Math.max(totalAmount - amountPaid, 0);
-  const paymentStatus = amountDue <= 0 && totalAmount > 0 ? "PayÃ©" : amountPaid > 0 ? "Partiel" : "En attente";
-  const nextStatus = normalizeMarketplaceOrderStatus(order.status || "En attente");
-  const updated = await client.query(
-    `UPDATE marketplace_orders
-     SET amount_paid=$1,
-         amount_due=$2,
-         payment_status=$3::text,
-         status=$4::text,
-         closed_at=CASE WHEN $4::text='ClÃ´turÃ©e' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
-         updated_at=CURRENT_TIMESTAMP
-     WHERE id=$5
-     RETURNING *`,
-    [amountPaid, amountDue, paymentStatus, nextStatus, orderId]
-  );
-  return updated.rows[0];
-}
-
-async function getOrCreateMarketplaceCart(clientOrPool, user) {
-  const role = normalizeRole(user?.role);
-  const isCustomer = role === "customer";
-  const buyerCompanyId = isCustomer ? null : user.company_id || null;
-  const existing = await clientOrPool.query(
-    `SELECT *
-     FROM marketplace_carts
-     WHERE user_id=$1
-       AND status='active'
-     ORDER BY id DESC
-     LIMIT 1`,
-    [user.id]
-  );
-  if (existing.rows[0]) return existing.rows[0];
-
-  const created = await clientOrPool.query(
-    `INSERT INTO marketplace_carts
-     (user_id, company_id, buyer_company_id, customer_email, cart_type, status)
-     VALUES ($1,$2,$2,$3,$4,'active')
-     RETURNING *`,
-    [user.id, buyerCompanyId, user.email || "", buyerCompanyId ? "B2B" : "B2C"]
-  );
-  return created.rows[0];
-}
-
-async function getMarketplaceCartPayload(user) {
-  const cart = await getOrCreateMarketplaceCart(pool, user);
-  const items = await pool.query(
-    `SELECT ci.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
-            COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-            mp.image_url, mp.status AS marketplace_status,
-            p.reference, p.name AS product_name, p.stock,
-            c.name AS vendor_name
-     FROM marketplace_cart_items ci
-     JOIN marketplace_products mp ON mp.id=ci.marketplace_product_id
-     LEFT JOIN products p ON p.id=ci.product_id
-     LEFT JOIN companies c ON c.id=ci.vendor_company_id
-     WHERE ci.cart_id=$1
-     ORDER BY ci.id ASC`,
-    [cart.id]
-  );
-  const total = items.rows.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
-  return { cart, items: items.rows, total };
-}
-
-async function createMarketplaceDocument(client, { order, items, companyId, documentType, prefix, status = "ValidÃ©", createdBy = "Marketplace", observation = "" }) {
-  const documentNumber = `${prefix}-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
-  const documentResult = await client.query(
-    `INSERT INTO documents
-     (document_type, document_number, client_name, client_phone, client_address,
-      total_amount, observation, created_by, company_id, related_entity_type,
-      related_entity_id, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'marketplace_order',$10,$11)
-     RETURNING *`,
-    [
-      documentType,
-      documentNumber,
-      order.customer_name || order.customer_email || "",
-      order.customer_phone || "",
-      order.delivery_address || "",
-      Number(order.total_amount || 0),
-      observation || `${documentType} gÃ©nÃ©rÃ© depuis la commande marketplace ${order.order_number}`,
-      createdBy,
-      companyId,
-      order.id,
-      status
-    ]
-  );
-
-  for (const item of items) {
-    await client.query(
-      `INSERT INTO document_items
-       (document_id, product_reference, product_name, quantity, unit_price, total_price)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [
-        documentResult.rows[0].id,
-        item.product_reference || "",
-        item.product_name || "",
-        Number(item.quantity || 0),
-        Number(item.unit_price || 0),
-        Number(item.total_price || 0)
-      ]
-    );
-  }
-
-  return documentResult.rows[0];
-}
-
-async function finalizeMarketplaceOrder(client, orderId, user = {}) {
-  const orderResult = await client.query(
-    "SELECT * FROM marketplace_orders WHERE id=$1 FOR UPDATE",
-    [orderId]
-  );
-  const order = orderResult.rows[0];
-  if (!order) throw new Error("Commande marketplace introuvable.");
-
-  if (["paid", "payÃ©", "paye"].includes(String(order.payment_status || "").toLowerCase())) {
-    return order;
-  }
-
-  const itemsResult = await client.query(
-    "SELECT * FROM marketplace_order_items WHERE order_id=$1 ORDER BY id ASC",
-    [order.id]
-  );
-
-  for (const item of itemsResult.rows) {
-    const publicationResult = await client.query(
-      `SELECT *
-       FROM marketplace_products
-       WHERE id=$1
-         AND company_id=$2
-       FOR UPDATE`,
-      [item.marketplace_product_id, order.vendor_company_id]
-    );
-    const publication = publicationResult.rows[0];
-    if (!publication) throw new Error(`Publication marketplace introuvable : ${item.marketplace_product_id}`);
-
-    const productResult = await client.query(
-      `SELECT *
-       FROM products
-       WHERE id=$1
-         AND company_id=$2
-       FOR UPDATE`,
-      [item.product_id, order.vendor_company_id]
-    );
-    const product = productResult.rows[0];
-    if (!product) throw new Error(`Produit marketplace introuvable : ${item.product_name || item.product_id}`);
-
-    const quantity = Number(item.quantity || 0);
-    const publicationAvailable = Number(publication.available_quantity ?? publication.available_stock ?? product.stock ?? 0);
-    if (Number(product.stock || 0) < quantity || publicationAvailable < quantity) {
-      throw new Error(`Stock insuffisant pour ${product.reference || product.name}.`);
-    }
-
-    await client.query(
-      `UPDATE products
-       SET stock=COALESCE(stock,0)-$1,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [quantity, product.id]
-    );
-
-    await client.query(
-      `UPDATE marketplace_products
-       SET sold_quantity=COALESCE(sold_quantity,0)+$1,
-           available_quantity=GREATEST(COALESCE(available_quantity, available_stock, 0)-$1,0),
-           available_stock=GREATEST(COALESCE(available_stock, available_quantity, 0)-$1,0),
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [quantity, item.marketplace_product_id]
-    );
-
-    await client.query(
-      `INSERT INTO stock_movements
-       (type, product_reference, product_name, quantity, source_warehouse,
-        destination_warehouse, reason, status, company_id, created_by,
-        created_by_name, created_by_role, product_id, location_id,
-        warehouse_id, approval_status, original_quantity, final_quantity)
-       VALUES ('Sortie',$1,$2,$3,$4,$5,$6,'ValidÃ©',$7,$8,$9,$10,$11,$12,$13,'ValidÃ©',$3,$3)`,
-      [
-        product.reference || item.product_reference || "",
-        product.name || item.product_name || "",
-        quantity,
-        product.warehouse || "",
-        order.delivery_address || "Marketplace",
-        `Commande marketplace ${order.order_number}`,
-        order.vendor_company_id,
-        user.id || order.customer_user_id || null,
-        user.email || order.customer_email || "Marketplace",
-        user.role || "marketplace",
-        product.id,
-        product.location_id || null,
-        product.warehouse_id || null
-      ]
-    );
-  }
-
-  const paidSumResult = await client.query(
-    `SELECT COALESCE(SUM(amount),0)::numeric AS amount_paid
-     FROM marketplace_payments
-     WHERE order_id=$1
-       AND LOWER(status) IN ('payÃ©','paye','paid')`,
-    [order.id]
-  );
-  const amountAlreadyPaid = Number(paidSumResult.rows[0]?.amount_paid || 0);
-  const totalToPay = Number(order.total_amount || 0);
-  const amountToComplete = Math.max(totalToPay - amountAlreadyPaid, 0);
-
-  const paidOrder = await client.query(
-    `UPDATE marketplace_orders
-     SET payment_status='PayÃ©',
-         status='Paiement confirmÃ©',
-         amount_paid=$2,
-         amount_due=0,
-         buyer_user_id=COALESCE(buyer_user_id, customer_user_id),
-         seller_company_id=COALESCE(seller_company_id, vendor_company_id),
-         updated_at=CURRENT_TIMESTAMP
-     WHERE id=$1
-     RETURNING *`,
-    [order.id, totalToPay]
-  );
-
-  let marketplacePayment = null;
-  if (amountToComplete > 0) {
-    const createdPayment = await client.query(
-      `INSERT INTO marketplace_payments
-       (order_id, company_id, amount, currency, method, status, provider_reference,
-        paid_at, created_by)
-       VALUES ($1,$2,$3,'FCFA',$4,'PayÃ©',$5,CURRENT_TIMESTAMP,$6)
-       RETURNING *`,
-      [
-        order.id,
-        order.vendor_company_id,
-        amountToComplete,
-        order.payment_method || "EspÃ¨ces",
-        order.order_number,
-        user.id || order.customer_user_id || null
-      ]
-    );
-    marketplacePayment = createdPayment.rows[0];
-  } else {
-    const existingPayment = await client.query(
-      `SELECT *
-       FROM marketplace_payments
-       WHERE order_id=$1
-         AND LOWER(status) IN ('payÃ©','paye','paid')
-       ORDER BY id DESC
-       LIMIT 1`,
-      [order.id]
-    );
-    marketplacePayment = existingPayment.rows[0] || null;
-  }
-
-  const accountingPayment = await client.query(
-    `INSERT INTO payments
-     (company_id, amount, currency, payment_method, payment_reference,
-      status, notes, paid_at, payment_status)
-     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,'paid')
-     RETURNING *`,
-    [
-      order.vendor_company_id,
-      Number(order.total_amount || 0),
-      order.payment_method || "EspÃ¨ces",
-      order.order_number,
-      `Paiement marketplace ${order.order_number}`
-    ]
-  );
-
-  await recordPosPaymentAccounting(client, {
-    sale: {
-      id: order.id,
-      company_id: order.vendor_company_id,
-      total_amount: Number(order.total_amount || 0),
-      payment_method: order.payment_method || "EspÃ¨ces",
-      sale_number: order.order_number,
-      customer_name: order.customer_name || order.customer_email || "Client marketplace",
-      created_by: user.id || order.customer_user_id || null
-    },
-    payment: accountingPayment.rows[0],
-    user,
-    amount: Number(order.total_amount || 0)
-  });
-
-  await createMarketplaceDocument(client, {
-    order,
-    items: itemsResult.rows,
-    companyId: order.vendor_company_id,
-    documentType: "Facture marketplace",
-    prefix: "FAC-MKP",
-    createdBy: user.email || "Marketplace"
-  });
-  await createMarketplaceDocument(client, {
-    order,
-    items: itemsResult.rows,
-    companyId: order.vendor_company_id,
-    documentType: "ReÃ§u marketplace",
-    prefix: "REC-MKP",
-    createdBy: user.email || "Marketplace",
-    observation: `ReÃ§u de paiement marketplace ${order.order_number}`
-  });
-  await createMarketplaceDocument(client, {
-    order,
-    items: itemsResult.rows,
-    companyId: order.vendor_company_id,
-    documentType: "Bon de livraison marketplace",
-    prefix: "BL-MKP",
-    createdBy: user.email || "Marketplace",
-    observation: `Bon de livraison vendeur pour commande marketplace ${order.order_number}`
-  });
-
-  if (order.buyer_company_id && Number(order.buyer_company_id) !== Number(order.vendor_company_id)) {
-    await createMarketplaceDocument(client, {
-      order,
-      items: itemsResult.rows,
-      companyId: order.buyer_company_id,
-      documentType: "Bon de rÃ©ception marketplace",
-      prefix: "BR-MKP",
-      status: "En attente",
-      createdBy: user.email || "Marketplace",
-      observation: `Bon de rÃ©ception acheteur pour commande B2B ${order.order_number}`
-    });
-
-    if (!order.purchase_created && await tableExists("purchases")) {
-      const vendor = await client.query("SELECT name FROM companies WHERE id=$1", [order.vendor_company_id]);
-      const purchaseNumber = `ACH-MKP-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
-      await client.query(
-        `INSERT INTO purchases
-         (company_id, supplier_company_id, supplier_name, marketplace_order_id,
-          purchase_number, total_amount, amount_paid, amount_due, status,
-          created_by, created_at, updated_at)
-         SELECT $1,$2,$3,$4,$5,$6,$6,0,'paid',$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-         WHERE NOT EXISTS (
-           SELECT 1 FROM purchases WHERE purchase_number=$5
-         )`,
-        [
-          order.buyer_company_id,
-          order.vendor_company_id,
-          vendor.rows[0]?.name || "Vendeur marketplace",
-          order.id,
-          purchaseNumber,
-          Number(order.total_amount || 0),
-          user.id || order.customer_user_id || null
-        ]
-      );
-      await client.query(
-        "UPDATE marketplace_orders SET purchase_created=true, updated_at=CURRENT_TIMESTAMP WHERE id=$1",
-        [order.id]
-      );
-    }
-  }
-
-  await createNotification({
-    user_id: order.customer_user_id,
-    title: "Commande marketplace payÃ©e",
-    message: `Votre commande ${order.order_number} est payÃ©e.`,
-    type: "marketplace_order_paid",
-    company_id: order.buyer_company_id || order.vendor_company_id,
-    related_entity_type: "marketplace_order",
-    related_entity_id: order.id,
-    action_url: order.buyer_company_id ? `/marketplace/orders/${order.id}` : `/client/orders/${order.id}`
-  });
-
-  return { ...paidOrder.rows[0], payment: marketplacePayment };
-}
-
-app.get("/marketplace/products", async (req, res) => {
-  try {
-    const { q = "", vendor_company_id = "", category = "", min_price = "", max_price = "" } = req.query;
-    const values = [];
-    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND p.is_sellable IS NOT FALSE AND p.is_active IS NOT FALSE";
-
-    if (q) {
-      values.push(`%${q}%`);
-      where += ` AND (COALESCE(NULLIF(mp.public_title,''), mp.title) ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
-    }
-    if (vendor_company_id) {
-      values.push(Number(vendor_company_id));
-      where += ` AND mp.company_id=$${values.length}`;
-    }
-    if (category) {
-      values.push(String(category));
-      where += ` AND mp.category=$${values.length}`;
-    }
-    if (min_price) {
-      values.push(Number(min_price));
-      where += ` AND COALESCE(NULLIF(mp.public_price,0), mp.price, 0) >= $${values.length}`;
-    }
-    if (max_price) {
-      values.push(Number(max_price));
-      where += ` AND COALESCE(NULLIF(mp.public_price,0), mp.price, 0) <= $${values.length}`;
-    }
-
-    /* Route PUBLIQUE : mÃªmes rÃ¨gles que la fiche. Aucun `mp.*`. */
-    const result = await pool.query(
-      `SELECT mp.id, mp.company_id, mp.category, mp.slug, mp.created_at, mp.updated_at,
-              mp.image_url, mp.images,
-              COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
-              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
-              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-              mp.available_quantity, mp.available_stock,
-              p.reference, p.stock, c.name AS vendor_name,
-              CASE WHEN cpp.is_public THEN cpp.slug END AS vendor_slug,
-              CASE WHEN cpp.is_public THEN cpp.city END AS vendor_city,
-              CASE WHEN cpp.is_public THEN cpp.quartier END AS vendor_quartier
-       FROM marketplace_products mp
-       LEFT JOIN products p ON p.id=mp.product_id
-       LEFT JOIN companies c ON c.id=mp.company_id
-       LEFT JOIN company_public_profile cpp ON cpp.company_id=mp.company_id
-       ${where}
-       ORDER BY mp.id DESC
-       LIMIT 100`,
-      values
-    );
-    res.json(result.rows.map(publicCatalog.publicProduct));
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE PRODUCTS :", error);
-    res.status(500).json({ error: "Erreur lecture produits marketplace" });
-  }
-});
-
-app.get("/marketplace/products/:id", async (req, res) => {
-  try {
-    /* Route PUBLIQUE : ni `mp.*`, ni emplacement, ni entrepÃ´t, ni niveau de
-       stock. Le stock interne n'est lu que pour en dÃ©duire une disponibilitÃ©,
-       et publicProduct ne le laisse pas ressortir. */
-    const result = await pool.query(
-      `SELECT mp.id, mp.company_id, mp.category, mp.slug, mp.created_at, mp.updated_at,
-              mp.image_url, mp.images,
-              COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
-              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
-              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-              mp.available_quantity, mp.available_stock,
-              p.reference, p.stock, c.name AS vendor_name,
-              CASE WHEN cpp.is_public THEN cpp.slug END AS vendor_slug,
-              CASE WHEN cpp.is_public THEN cpp.city END AS vendor_city,
-              CASE WHEN cpp.is_public THEN cpp.quartier END AS vendor_quartier
-       FROM marketplace_products mp
-       LEFT JOIN products p ON p.id=mp.product_id
-       LEFT JOIN companies c ON c.id=mp.company_id
-       LEFT JOIN company_public_profile cpp ON cpp.company_id=mp.company_id
-       WHERE mp.id=$1
-         AND (mp.status='published' OR mp.is_published=true)
-       LIMIT 1`,
-      [Number(req.params.id) || 0]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    res.json(publicCatalog.publicProduct(result.rows[0]));
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE PRODUCT DETAIL :", error);
-    res.status(500).json({ error: "Erreur dÃ©tail produit marketplace" });
-  }
-});
-
-/* ---------- Catalogue central MaliLink (Lot A) â€” offres transverses ----------
-   AgrÃ¨ge les offres PUBLIÃ‰ES de tous les modules (Voyage d'abord). Public,
-   additif : ne modifie pas les endpoints /marketplace/products existants. */
-/* Surface publique indexable (SEO) : lecture seule, sans authentification.
-   Toutes ses rÃ©ponses passent par la liste blanche de public-catalog. */
-app.use("/", require("./routes/public-seo")({ pool }));
-
-const catalogService = require("./services/catalog");
-
-// Arbre des catÃ©gories (Voyages et rÃ©servations + sous-catÃ©gories, etc.)
-app.get("/marketplace/catalog/categories", async (req, res) => {
-  try {
-    res.json({ categories: await catalogService.categoryTree(pool) });
-  } catch (error) {
-    console.error("ERREUR CATALOG CATEGORIES :", error.message);
-    res.status(500).json({ error: "Erreur chargement des catÃ©gories." });
-  }
-});
-
-// DÃ©tail d'une offre publiÃ©e du catalogue.
-app.get("/marketplace/catalog/offer/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT * FROM catalog_offers WHERE id=$1 AND status='published' LIMIT 1`,
-      [Number(req.params.id)]
-    );
-    if (!rows[0]) return res.status(404).json({ error: "Offre introuvable." });
-    res.json({ offer: rows[0] });
-  } catch (error) {
-    console.error("ERREUR CATALOG OFFER :", error.message);
-    res.status(500).json({ error: "Erreur dÃ©tail de l'offre." });
-  }
-});
-
-// Parcours des offres publiÃ©es (filtres category / subcategory / q).
-app.get("/marketplace/catalog", async (req, res) => {
-  try {
-    const category = req.query.category ? String(req.query.category) : null;
-    const subcategory = req.query.subcategory ? String(req.query.subcategory) : null;
-    const q = req.query.q ? String(req.query.q).slice(0, 60) : null;
-    const [offers, counts] = await Promise.all([
-      catalogService.listPublished(pool, { category, subcategory, q, limit: req.query.limit }),
-      catalogService.countsBySubcategory(pool, category),
-    ]);
-    res.json({ count: offers.length, counts, offers });
-  } catch (error) {
-    console.error("ERREUR CATALOG LIST :", error.message);
-    res.status(500).json({ error: "Erreur chargement du catalogue." });
-  }
-});
-
-app.get("/marketplace/vendors", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT DISTINCT c.id, c.name,
-              COALESCE(mvs.store_name, c.name) AS store_name,
-              mvs.store_description, mvs.logo_url,
-              COUNT(mp.id)::int AS products_count
-       FROM companies c
-       JOIN marketplace_products mp ON mp.company_id=c.id AND (mp.status='published' OR mp.is_published=true)
-       LEFT JOIN marketplace_vendor_settings mvs ON mvs.company_id=c.id
-       GROUP BY c.id, c.name, mvs.store_name, mvs.store_description, mvs.logo_url
-       ORDER BY store_name ASC`
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE VENDORS :", error);
-    res.status(500).json({ error: "Erreur lecture vendeurs marketplace" });
-  }
-});
-
-app.get("/marketplace/business", authenticateToken, async (req, res) => {
-  try {
-    const { q = "", category = "" } = req.query;
-    const values = [req.user.company_id || 0];
-    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND mp.is_b2b=true AND p.is_sellable IS NOT FALSE AND p.is_active IS NOT FALSE";
-    if (q) {
-      values.push(`%${q}%`);
-      where += ` AND (COALESCE(NULLIF(mp.public_title,''), mp.title) ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
-    }
-    if (category) {
-      values.push(String(category));
-      where += ` AND mp.category=$${values.length}`;
-    }
-    const result = await pool.query(
-      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
-              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
-              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
-              p.reference, p.name AS product_name, c.name AS vendor_name,
-              mp.company_id AS vendor_company_id,
-              (mp.company_id=$1) AS is_own_product
-       FROM marketplace_products mp
-       LEFT JOIN products p ON p.id=mp.product_id
-       LEFT JOIN companies c ON c.id=mp.company_id
-       ${where}
-       ORDER BY mp.id DESC
-       LIMIT 100`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE BUSINESS :", error);
-    res.status(500).json({ error: "Erreur marketplace B2B" });
-  }
-});
-
-app.post("/marketplace/customers/register", async (req, res) => {
-  try {
-    const { fullname, email, phone, password, country = "", city = "", address = "" } = req.body || {};
-    const cleanEmail = String(email || "").trim().toLowerCase();
-    const cleanPhone = normalizeMaliPhone(phone);
-    if (!fullname || (!cleanEmail && !cleanPhone) || !password) {
-      return res.status(400).json({ error: "Nom, contact et mot de passe obligatoires." });
-    }
-
-    if (cleanPhone) {
-      const phoneDigits = maliPhoneVariants(cleanPhone).map((variant) => variant.replace(/[^0-9]/g, ""));
-      const existingPhone = await pool.query(
-        `SELECT id FROM users
-         WHERE regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g') = ANY($1)
-         LIMIT 1`,
-        [phoneDigits]
-      );
-      if (existingPhone.rows.length > 0) {
-        return res.status(400).json({
-          error: "NumÃ©ro de tÃ©lÃ©phone dÃ©jÃ  utilisÃ©. Connectez-vous avec votre numÃ©ro de tÃ©lÃ©phone."
-        });
-      }
-    }
-
-    if (cleanEmail) {
-      const existingEmail = await pool.query(
-        `SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-        [cleanEmail]
-      );
-      if (existingEmail.rows.length > 0) {
-        return res.status(400).json({ error: "Cet email existe dÃ©jÃ ." });
-      }
-    }
-
-    const storedEmail = cleanEmail || `customer-${Date.now()}-${Math.floor(Math.random() * 100000)}@pending.trianglewmspro.local`;
-
-    /* Inscription par tÃ©lÃ©phone seul : pas de vÃ©rification SMS pour
-       l'instant (aucun provider SMS branchÃ©) â€” le compte est actif
-       immÃ©diatement, tÃ©lÃ©phone + mot de passe suffisent.
-       Avec email : le flux de vÃ©rification existant est conservÃ©. */
-    const phoneOnly = !cleanEmail;
-
-    const passwordHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
-    const userResult = await pool.query(
-      `INSERT INTO users
-       (fullname, email, phone, password, role, is_active, account_status,
-        verification_required, phone_verified, created_at)
-       VALUES ($1,$2,$3,$4,'customer',true,$5,$6,$7,NOW())
-       RETURNING id, fullname, email, phone, role`,
-      [
-        fullname,
-        storedEmail,
-        cleanPhone,
-        passwordHash,
-        phoneOnly ? "active" : "pending_verification",
-        !phoneOnly,
-        phoneOnly
-      ]
-    );
-    const user = userResult.rows[0];
-
-    await pool.query(
-      `INSERT INTO marketplace_profiles
-       (user_id, profile_type, full_name, email, phone, country, city, address, status)
-       VALUES ($1,'customer',$2,$3,$4,$5,$6,$7,'active')`,
-      [user.id, fullname, cleanEmail, cleanPhone, country, city, address]
-    );
-
-    if (phoneOnly) {
-      const token = jwt.sign(
-        {
-          id: user.id,
-          email: user.email,
-          role: "customer",
-          company_id: null,
-          is_super_admin: false
-        },
-        JWT_SECRET,
-        { expiresIn: "1d" }
-      );
-
-      return res.status(201).json({
-        success: true,
-        message: "Compte crÃ©Ã© avec succÃ¨s. Connectez-vous avec votre numÃ©ro de tÃ©lÃ©phone.",
-        token,
-        user,
-        verification: { required: false }
-      });
-    }
-
-    const targetType = "email";
-    const targetValue = cleanEmail;
-    const verification = await createVerificationCode({
-      companyId: null,
-      userId: user.id,
-      targetType,
-      targetValue
-    });
-    const delivery = await sendVerificationMessage({
-      targetType,
-      targetValue,
-      code: verification.code,
-      verifyUrl: verification.verify_url
-    });
-
-    res.status(201).json({
-      success: true,
-      user,
-      verification: {
-        required: true,
-        target_type: targetType,
-        target_value: targetValue,
-        delivery
-      }
-    });
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE CUSTOMER REGISTER :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur inscription client marketplace" });
-  }
-});
-
-app.get("/marketplace/customers/profile", authenticateToken, async (req, res) => {
-  try {
-    if (normalizeRole(req.user?.role) !== "customer") {
-      return res.status(403).json({ error: "AccÃ¨s rÃ©servÃ© aux clients Marketplace." });
-    }
-    const profile = await pool.query(
-      `SELECT mp.*, u.fullname, u.email AS user_email, u.phone AS user_phone,
-              u.profile_image_url AS photo_url
-       FROM marketplace_profiles mp
-       LEFT JOIN users u ON u.id=mp.user_id
-       WHERE mp.user_id=$1 AND mp.profile_type='customer'
-       LIMIT 1`,
-      [req.user.id]
-    );
-    res.json(profile.rows[0] || {
-      user_id: req.user.id,
-      full_name: req.user.fullname || "",
-      email: req.user.email || "",
-      phone: req.user.phone || "",
-      country: "",
-      city: "",
-      address: ""
-    });
-  } catch (error) {
-    console.error("ERREUR CUSTOMER PROFILE :", error);
-    res.status(500).json({ error: "Erreur profil client marketplace" });
-  }
-});
-
-app.put("/marketplace/customers/profile", authenticateToken, async (req, res) => {
-  try {
-    if (normalizeRole(req.user?.role) !== "customer") {
-      return res.status(403).json({ error: "AccÃ¨s rÃ©servÃ© aux clients Marketplace." });
-    }
-    const { full_name = "", phone = "", email = "", country = "", city = "", address = "", photo_url = "" } = req.body || {};
-    let result = await pool.query(
-      `UPDATE marketplace_profiles
-       SET full_name=$2,
-           email=$3,
-           phone=$4,
-           country=$5,
-           city=$6,
-           address=$7,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE user_id=$1 AND profile_type='customer'
-       RETURNING *`,
-      [req.user.id, full_name, email, phone, country, city, address]
-    );
-    if (!result.rows[0]) {
-      result = await pool.query(
-        `INSERT INTO marketplace_profiles
-         (user_id, profile_type, full_name, email, phone, country, city, address, status)
-         VALUES ($1,'customer',$2,$3,$4,$5,$6,$7,'active')
-         RETURNING *`,
-        [req.user.id, full_name, email, phone, country, city, address]
-      );
-    }
-    await pool.query(
-      `UPDATE users
-       SET fullname=COALESCE(NULLIF($1,''), fullname),
-           phone=COALESCE(NULLIF($2,''), phone),
-           profile_image_url=COALESCE(NULLIF($3,''), profile_image_url)
-       WHERE id=$4`,
-      [full_name, phone, String(photo_url || ""), req.user.id]
-    );
-    res.json({ ...result.rows[0], photo_url: photo_url || undefined });
-  } catch (error) {
-    console.error("ERREUR UPDATE CUSTOMER PROFILE :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur modification profil client marketplace" });
-  }
-});
-
-function canManageLaboratory(user) {
-  const role = normalizeRole(user?.role);
-  return isSuperAdminUser(user) || ["admin", "directeur", "direction", "laboratoire", "employe_laboratoire", "comptable"].includes(role);
-}
-
-function generateLaboratoryResultCode() {
-  return `LAB-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-}
-
-
-async function createPatientFromAcceptedAppointment(appointmentId) {
-  try {
-    const appointmentResult = await pool.query(
-      `SELECT *
-       FROM laboratory_appointments
-       WHERE id=$1
-       LIMIT 1`,
-      [appointmentId]
-    );
-
-    const appointment = appointmentResult.rows[0];
-    if (!appointment) return;
-
-    const phone = appointment.patient_phone || "";
-    const fullName = appointment.patient_name || "Patient rendez-vous";
-
-    if (!phone && !fullName) return;
-
-    const existing = await pool.query(
-      `SELECT id FROM laboratory_patients
-       WHERE company_id=$1
-         AND (
-           phone=$2
-           OR full_name ILIKE $3
-         )
-       LIMIT 1`,
-      [appointment.company_id, phone, fullName]
-    );
-
-    if (existing.rows[0]) {
-      await pool.query(
-        `UPDATE laboratory_patients
-         SET full_name=COALESCE(NULLIF($1,''), full_name),
-             phone=COALESCE(NULLIF($2,''), phone),
-             email=COALESCE(NULLIF($3,''), email),
-             address=COALESCE(NULLIF($4,''), address),
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$5`,
-        [
-          fullName,
-          phone,
-          appointment.patient_email || "",
-          appointment.home_address || "",
-          existing.rows[0].id,
-        ]
-      );
-      return;
-    }
-
-    await pool.query(
-      `INSERT INTO laboratory_patients
-       (company_id, full_name, phone, email, address, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
-      [
-        appointment.company_id,
-        fullName,
-        phone,
-        appointment.patient_email || "",
-        appointment.home_address || "",
-      ]
-    );
-  } catch (error) {
-    console.error("ERREUR CREATION PATIENT DEPUIS RDV :", error);
-  }
-}
-
-
-app.get("/laboratory/appointments/public-by-phone", async (req, res) => {
-  try {
-    const phone = String(req.query.phone || "").trim();
-    if (!phone) return res.json([]);
-
-    const result = await pool.query(
-      `SELECT la.*, ls.lab_name
-       FROM laboratory_appointments la
-       LEFT JOIN laboratory_settings ls ON ls.company_id=la.company_id
-       WHERE la.patient_phone=$1
-       ORDER BY la.id DESC
-       LIMIT 100`,
-      [phone]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR RDV PUBLIC PHONE :", error);
-    res.status(500).json({ error: "Erreur rendez-vous." });
-  }
-});
-
-
-async function createPatientFromAcceptedAppointment(appointmentId) {
-  try {
-    const appointmentResult = await pool.query(
-      `SELECT * FROM laboratory_appointments WHERE id=$1 LIMIT 1`,
-      [appointmentId]
-    );
-
-    const a = appointmentResult.rows[0];
-    if (!a) return;
-
-    const fullName = a.patient_name || "Patient rendez-vous";
-    const phone = a.patient_phone || "";
-    const email = a.patient_email || "";
-    const address = a.home_address || "";
-
-    const existing = await pool.query(
-      `SELECT id FROM laboratory_patients
-       WHERE company_id=$1 AND (phone=$2 OR full_name ILIKE $3)
-       LIMIT 1`,
-      [a.company_id, phone, fullName]
-    );
-
-    if (existing.rows[0]) {
-      await pool.query(
-        `UPDATE laboratory_patients
-         SET full_name=$1, phone=$2, email=$3, address=$4, updated_at=CURRENT_TIMESTAMP
-         WHERE id=$5`,
-        [fullName, phone, email, address, existing.rows[0].id]
-      );
-      return;
-    }
-
-    await pool.query(
-      `INSERT INTO laboratory_patients
-       (company_id, full_name, phone, email, address, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
-      [a.company_id, fullName, phone, email, address]
-    );
-  } catch (error) {
-    console.error("ERREUR AUTO PATIENT RDV :", error);
-  }
-}
-
-function isAcceptedLabStatus(status) {
-  const s = String(status || "").toLowerCase();
-  return ["confirmÃ©", "confirmee", "confirmÃ©e", "confirmed", "acceptÃ©", "acceptÃ©e", "accepted", "validÃ©", "validÃ©e", "valide", "approved"].includes(s);
-}
-
-app.get("/laboratory/settings", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query("SELECT * FROM laboratory_settings WHERE company_id=$1 ORDER BY id DESC LIMIT 1", [companyId]);
-    res.json(result.rows[0] || { company_id: companyId, lab_name: "", is_published: false, public_category: "SantÃ© / Laboratoire" });
-  } catch (error) {
-    console.error("ERREUR LAB SETTINGS :", error);
-    res.status(500).json({ error: "Erreur paramÃ¨tres laboratoire" });
-  }
-});
-
-app.put("/laboratory/settings", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      lab_name = "", logo_url = "", phone = "", whatsapp = "", email = "",
-      address = "", city = "", opening_hours = "", description = "",
-      home_sampling_enabled = false, appointments_enabled = true,
-      online_payment_enabled = false, is_published = false,
-      public_image_url = "", public_description = ""
-    } = req.body || {};
-    let result = await pool.query(
-      `UPDATE laboratory_settings
-       SET lab_name=$2, logo_url=$3, phone=$4, whatsapp=$5, email=$6,
-           address=$7, city=$8, opening_hours=$9, description=$10,
-           home_sampling_enabled=$11, appointments_enabled=$12,
-           online_payment_enabled=$13, is_published=$14,
-           public_category='SantÃ© / Laboratoire',
-           public_image_url=$15, public_description=$16,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE company_id=$1
-       RETURNING *`,
-      [
-        companyId, lab_name, logo_url, phone, whatsapp, email, address, city,
-        opening_hours, description, home_sampling_enabled, appointments_enabled,
-        online_payment_enabled, is_published, public_image_url, public_description
-      ]
-    );
-    if (!result.rows[0]) {
-      result = await pool.query(
-        `INSERT INTO laboratory_settings
-         (company_id, lab_name, logo_url, phone, whatsapp, email, address, city,
-          opening_hours, description, home_sampling_enabled, appointments_enabled,
-          online_payment_enabled, is_published, public_category, public_image_url,
-          public_description)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'SantÃ© / Laboratoire',$15,$16)
-         RETURNING *`,
-        [
-          companyId, lab_name, logo_url, phone, whatsapp, email, address, city,
-          opening_hours, description, home_sampling_enabled, appointments_enabled,
-          online_payment_enabled, is_published, public_image_url, public_description
-        ]
-      );
-    }
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR UPDATE LAB SETTINGS :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur sauvegarde laboratoire" });
-  }
-});
-
-app.get("/laboratory/analyses", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `SELECT *
-       FROM laboratory_analyses
-       WHERE company_id=$1 OR company_id IS NULL
-       ORDER BY is_standard DESC, name ASC`,
-      [companyId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LAB ANALYSES :", error);
-    res.status(500).json({ error: "Erreur analyses laboratoire" });
-  }
-});
-
-app.post("/laboratory/analyses", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      name,
-      description = "",
-      price = 0,
-      result_delay = "",
-      estimated_duration = "",
-      is_available = true,
-      home_sampling_available = false,
-      on_site_available = true,
-      teleconsultation_available = false,
-      patient_instructions = ""
-    } = req.body || {};
-    if (!name) return res.status(400).json({ error: "Nom analyse obligatoire." });
-    const result = await pool.query(
-      `INSERT INTO laboratory_analyses
-       (company_id, name, description, price, result_delay, is_available ?? true,
-        home_sampling_available, patient_instructions, estimated_duration,
-        on_site_available, teleconsultation_available)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       RETURNING *`,
-      [
-        companyId,
-        name,
-        description,
-        Number(price || 0),
-        result_delay,
-        is_available ?? true,
-        home_sampling_available,
-        patient_instructions,
-        estimated_duration,
-        on_site_available,
-        teleconsultation_available
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATE LAB ANALYSIS :", error);
-    res.status(500).json({ error: "Erreur crÃ©ation analyse" });
-  }
-});
-
-app.put("/laboratory/analyses/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      name = "",
-      description = "",
-      price = 0,
-      result_delay = "",
-      estimated_duration = "",
-      is_available = true,
-      home_sampling_available = false,
-      on_site_available = true,
-      teleconsultation_available = false,
-      patient_instructions = ""
-    } = req.body || {};
-    const result = await pool.query(
-      `UPDATE laboratory_analyses
-       SET name=COALESCE(NULLIF($1,''), name), description=$2, price=$3,
-           result_delay=$4, is_available=$5, home_sampling_available=$6,
-           patient_instructions=$7, company_id=COALESCE(company_id,$8),
-           estimated_duration=$10, on_site_available=$11,
-           teleconsultation_available=$12,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$9 AND (company_id=$8 OR company_id IS NULL)
-       RETURNING *`,
-      [
-        name,
-        description,
-        Number(price || 0),
-        result_delay,
-        is_available ?? true,
-        home_sampling_available,
-        patient_instructions,
-        companyId,
-        req.params.id,
-        estimated_duration,
-        on_site_available,
-        teleconsultation_available
-      ]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR UPDATE LAB ANALYSIS :", error);
-    res.status(500).json({ error: "Erreur modification analyse" });
-  }
-});
-
-app.delete("/laboratory/analyses/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const id = Number(req.params.id);
-
-    const used = await pool.query(
-      "SELECT 1 FROM laboratory_case_analyses WHERE analysis_id=$1 LIMIT 1",
-      [id]
-    );
-
-    if (used.rows[0]) {
-      const disabled = await pool.query(
-        `UPDATE laboratory_analyses
-         SET is_available=false, updated_at=CURRENT_TIMESTAMP
-         WHERE id=$1 AND (company_id=$2 OR company_id IS NULL)
-         RETURNING *`,
-        [id, companyId]
-      );
-      if (!disabled.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
-      return res.json({ message: "Analyse utilisÃ©e dans lâ€™historique : elle a Ã©tÃ© dÃ©sactivÃ©e.", analysis: disabled.rows[0] });
-    }
-
-    const deleted = await pool.query(
-      "DELETE FROM laboratory_analyses WHERE id=$1 AND company_id=$2 RETURNING *",
-      [id, companyId]
-    );
-
-    if (!deleted.rows[0]) {
-      const disabled = await pool.query(
-        `UPDATE laboratory_analyses
-         SET is_available=false, updated_at=CURRENT_TIMESTAMP
-         WHERE id=$1 AND company_id IS NULL
-         RETURNING *`,
-        [id]
-      );
-      if (!disabled.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
-      return res.json({ message: "Analyse standard dÃ©sactivÃ©e pour Ã©viter de casser les rÃ©fÃ©rences.", analysis: disabled.rows[0] });
-    }
-
-    res.json({ message: "Analyse supprimÃ©e.", analysis: deleted.rows[0] });
-  } catch (error) {
-    console.error("ERREUR DELETE LAB ANALYSIS :", error);
-    res.status(500).json({ error: "Erreur suppression analyse" });
-  }
-});
-
-app.get("/laboratory/patients", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const result = await pool.query("SELECT * FROM laboratory_patients WHERE company_id=$1 ORDER BY id DESC LIMIT 300", [getEffectiveCompanyId(req)]);
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LAB PATIENTS :", error);
-    res.status(500).json({ error: "Erreur patients laboratoire" });
-  }
-});
-
-app.post("/laboratory/patients", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { full_name, phone = "", email = "", gender = "", birth_date = null, age = null, address = "", notes = "" } = req.body || {};
-    if (!full_name) return res.status(400).json({ error: "Nom patient obligatoire." });
-    const result = await pool.query(
-      `INSERT INTO laboratory_patients
-       (company_id, full_name, phone, email, gender, birth_date, age, address, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING *`,
-      [companyId, full_name, phone, email, gender, birth_date || null, age || null, address, notes]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATE LAB PATIENT :", error);
-    res.status(500).json({ error: "Erreur crÃ©ation patient" });
-  }
-});
-
-app.get("/laboratory/appointments", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const result = await pool.query("SELECT * FROM laboratory_appointments WHERE company_id=$1 ORDER BY id DESC LIMIT 300", [getEffectiveCompanyId(req)]);
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LAB APPOINTMENTS :", error);
-    res.status(500).json({ error: "Erreur rendez-vous laboratoire" });
-  }
-});
-
-app.post("/laboratory/appointments", async (req, res) => {
-  try {
-    const isCustomer = req.user ? normalizeRole(req.user?.role) === "customer" : false;
-    const companyId = Number(req.body?.company_id || 0);
-    if (!companyId) {
-      return res.status(400).json({ error: "Laboratoire obligatoire." });
-    }
-    const labExists = await pool.query(
-      "SELECT 1 FROM laboratory_settings WHERE company_id=$1 AND is_published=true AND is_active=true LIMIT 1",
-      [companyId]
-    );
-    if (!labExists.rows[0]) {
-      return res.status(404).json({ error: "Laboratoire public introuvable." });
-    }
-    const {
-      patient_name = req.user?.fullname || "", patient_phone = req.user?.phone || "",
-      patient_email = req.user?.email || "", analysis_id = null, analysis_name = "",
-      requested_date = null, requested_time = "", home_sampling = false,
-      home_address = "", message = "", service_type = "sur_place"
-    } = req.body || {};
-    const rawAnalysisIds = Array.isArray(req.body?.analysis_ids)
-      ? req.body.analysis_ids
-      : analysis_id
-        ? [analysis_id]
-        : [];
-    const analysisIds = rawAnalysisIds
-      .map((id) => Number(id))
-      .filter((id) => Number.isInteger(id) && id > 0);
-
-    if (analysisIds.length === 0) {
-      return res.status(400).json({ error: "Veuillez choisir au moins une analyse." });
-    }
-
-    const selectedAnalyses = await pool.query(
-      `SELECT id, name, price
-       FROM laboratory_analyses
-       WHERE company_id=$1 AND is_available=true AND id=ANY($2::int[])
-       ORDER BY name ASC`,
-      [companyId, analysisIds]
-    );
-
-    if (selectedAnalyses.rows.length !== analysisIds.length) {
-      return res.status(400).json({ error: "Une analyse sÃ©lectionnÃ©e est indisponible pour ce laboratoire." });
-    }
-
-    const selectedNames = selectedAnalyses.rows.map((analysis) => analysis.name).join(", ");
-    const totalAmount = selectedAnalyses.rows.reduce((sum, analysis) => sum + Number(analysis.price || 0), 0);
-    const result = await pool.query(
-      `INSERT INTO laboratory_appointments
-       (company_id, client_user_id, patient_name, patient_phone, patient_email,
-        analysis_id, analysis_name, requested_date, requested_time,
-        home_sampling, home_address, message, status, analysis_ids,
-        total_amount, service_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'En attente',$13,$14,$15)
-       RETURNING *`,
-      [
-        companyId,
-        req.user?.id || null,
-        patient_name,
-        patient_phone,
-        patient_email,
-        analysisIds[0],
-        analysis_name || selectedNames,
-        requested_date || null,
-        requested_time,
-        home_sampling || service_type === "domicile",
-        home_address,
-        message,
-        analysisIds,
-        totalAmount,
-        service_type
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATE LAB APPOINTMENT :", error);
-    res.status(500).json({ error: "Erreur demande rendez-vous laboratoire" });
-  }
-});
-
-app.put("/laboratory/appointments/:id/status", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      status = "ConfirmÃ©",
-      proposed_date = null,
-      proposed_time = "",
-      lab_response = "",
-      laboratory_message = "",
-      message = ""
-    } = req.body || {};
-    const normalizedStatusMap = {
-      pending: "En attente",
-      accepted: "ConfirmÃ©",
-      confirmed: "ConfirmÃ©",
-      rejected: "RefusÃ©",
-      refused: "RefusÃ©",
-      postponed: "ReportÃ©",
-      completed: "TerminÃ©",
-      "en attente": "En attente",
-      confirmÃ©: "ConfirmÃ©",
-      confirmÃ©e: "ConfirmÃ©",
-      refusÃ©: "RefusÃ©",
-      refusÃ©e: "RefusÃ©",
-      reportÃ©: "ReportÃ©",
-      reportÃ©e: "ReportÃ©",
-      terminÃ©: "TerminÃ©",
-      terminÃ©e: "TerminÃ©"
-    };
-    const normalizedStatus =
-      normalizedStatusMap[String(status || "").toLowerCase()] || String(status || "ConfirmÃ©");
-    const responseMessage = laboratory_message || lab_response || message || "";
-    const result = await pool.query(
-      `UPDATE laboratory_appointments
-       SET status=$1, proposed_date=$2, proposed_time=$3, lab_response=$4,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$5 AND company_id=$6
-       RETURNING *`,
-      [normalizedStatus, proposed_date || null, proposed_time, responseMessage, req.params.id, companyId]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Rendez-vous introuvable." });
-    const updatedAppointment = result.rows[0];
-
-    if (isAcceptedLabStatus(updatedAppointment?.status)) {
-      await createPatientFromAcceptedAppointment(updatedAppointment.id);
-    }
-
-    res.json(updatedAppointment);
-  } catch (error) {
-    console.error("ERREUR UPDATE LAB APPOINTMENT :", error);
-    res.status(500).json({ error: "Erreur statut rendez-vous" });
-  }
-});
-
-app.get("/laboratory/cases", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const result = await pool.query(
-      `SELECT c.*, p.full_name AS patient_name, p.phone AS patient_phone
-       FROM laboratory_cases c
-       LEFT JOIN laboratory_patients p ON p.id=c.patient_id
-       WHERE c.company_id=$1
-       ORDER BY c.id DESC LIMIT 300`,
-      [getEffectiveCompanyId(req)]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LAB CASES :", error);
-    res.status(500).json({ error: "Erreur dossiers laboratoire" });
-  }
-});
-
-app.post("/laboratory/cases", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { patient_id, appointment_id = null, analysis_ids = [] } = req.body || {};
-    if (!patient_id) return res.status(400).json({ error: "Patient obligatoire." });
-    await client.query("BEGIN");
-    const selectedAnalyses = await client.query(
-      `SELECT * FROM laboratory_analyses
-       WHERE id = ANY($1::int[]) AND (company_id=$2 OR company_id IS NULL)`,
-      [Array.isArray(analysis_ids) ? analysis_ids.map(Number) : [], companyId]
-    );
-    const total = selectedAnalyses.rows.reduce((sum, item) => sum + Number(item.price || 0), 0);
-    const caseNumber = await nextAccountingNumber(client, "laboratory_cases", "case_number", "LABD", companyId);
-    const resultCode = generateLaboratoryResultCode();
-    const caseResult = await client.query(
-      `INSERT INTO laboratory_cases
-       (company_id, patient_id, appointment_id, case_number, result_code,
-        status, total_amount, payment_status, created_by)
-       VALUES ($1,$2,$3,$4,$5,'en_attente',$6,'pending',$7)
-       RETURNING *`,
-      [companyId, patient_id, appointment_id || null, caseNumber, resultCode, total, req.user.id]
-    );
-    for (const analysis of selectedAnalyses.rows) {
-      await client.query(
-        `INSERT INTO laboratory_case_analyses
-         (case_id, analysis_id, analysis_name, price)
-         VALUES ($1,$2,$3,$4)`,
-        [caseResult.rows[0].id, analysis.id, analysis.name, Number(analysis.price || 0)]
-      );
-    }
-    await client.query("COMMIT");
-    res.status(201).json(caseResult.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR CREATE LAB CASE :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur crÃ©ation dossier analyse" });
-  } finally {
-    client.release();
-  }
-});
-
-app.put("/laboratory/cases/:id/result", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { status = "rÃ©sultat_prÃªt", result_summary = "", result_file_url = "", result_published = false } = req.body || {};
-    const result = await pool.query(
-      `UPDATE laboratory_cases
-       SET status=$1, result_summary=$2, result_file_url=$3,
-           result_published=$4,
-           published_at=CASE WHEN $4=true THEN CURRENT_TIMESTAMP ELSE published_at END,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$5 AND company_id=$6
-       RETURNING *`,
-      [status, result_summary, result_file_url, result_published, req.params.id, companyId]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Dossier introuvable." });
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR UPDATE LAB RESULT :", error);
-    res.status(500).json({ error: "Erreur rÃ©sultat laboratoire" });
-  }
-});
-
-app.post("/laboratory/cases/:id/upload-result", authenticateToken, uploadLaboratoryResult.single("result"), async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    if (!req.file) return res.status(400).json({ error: "Fichier rÃ©sultat obligatoire." });
-    const companyId = getEffectiveCompanyId(req);
-    const fileUrl = publicUploadUrl(req, `laboratory/${req.file.filename}`);
-    const result = await pool.query(
-      `UPDATE laboratory_cases
-       SET result_file_url=$1,
-           status=CASE WHEN status='en_attente' THEN 'rÃ©sultat_prÃªt' ELSE status END,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2 AND company_id=$3
-       RETURNING *`,
-      [fileUrl, req.params.id, companyId]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Dossier introuvable." });
-    res.json({ file_url: fileUrl, case: result.rows[0] });
-  } catch (error) {
-    console.error("ERREUR UPLOAD LAB RESULT :", error);
-    res.status(500).json({ error: error.message || "Erreur upload rÃ©sultat laboratoire" });
-  }
-});
-
-app.post("/laboratory/cases/:id/email-result", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const { recipient_email = "", message = "" } = req.body || {};
-    if (!recipient_email || !String(recipient_email).includes("@")) {
-      return res.status(400).json({ error: "Email destinataire invalide." });
-    }
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return res.status(503).json({ error: "SMTP non configurÃ©. Configurez SMTP dans .env." });
-    }
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `SELECT c.*, p.full_name AS patient_name, p.phone AS patient_phone,
-              ls.lab_name, ls.email AS lab_email
-       FROM laboratory_cases c
-       LEFT JOIN laboratory_patients p ON p.id=c.patient_id
-       LEFT JOIN laboratory_settings ls ON ls.company_id=c.company_id
-       WHERE c.id=$1 AND c.company_id=$2`,
-      [req.params.id, companyId]
-    );
-    const labCase = result.rows[0];
-    if (!labCase) return res.status(404).json({ error: "Dossier introuvable." });
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-    const html = `
-      <p>${escapeHtml(message || "Votre rÃ©sultat laboratoire est disponible.")}</p>
-      <p><strong>Laboratoire :</strong> ${escapeHtml(labCase.lab_name || "")}</p>
-      <p><strong>Patient :</strong> ${escapeHtml(labCase.patient_name || "")}</p>
-      <p><strong>Code rÃ©sultat :</strong> ${escapeHtml(labCase.result_code || "")}</p>
-      ${labCase.result_file_url ? `<p><a href="${escapeHtml(labCase.result_file_url)}">TÃ©lÃ©charger le rÃ©sultat</a></p>` : ""}
-    `;
-    const info = await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: recipient_email,
-      subject: `RÃ©sultat laboratoire ${labCase.case_number || ""}`,
-      text: message || `Votre rÃ©sultat laboratoire est disponible. Code : ${labCase.result_code}`,
-      html
-    });
-    await logAudit(req, "email_laboratory_result", "laboratory_case", labCase.id, {
-      recipient_email,
-      message_id: info.messageId || ""
-    });
-    res.json({ message: "RÃ©sultat envoyÃ© par email.", message_id: info.messageId || "" });
-  } catch (error) {
-    console.error("ERREUR EMAIL LAB RESULT :", error);
-    res.status(500).json({ error: error.message || "Erreur envoi email rÃ©sultat laboratoire" });
-  }
-});
-
-app.get("/laboratory/payments", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const result = await pool.query(
-      `SELECT lp.*, lc.case_number, lc.result_code, p.full_name AS patient_name
-       FROM laboratory_payments lp
-       LEFT JOIN laboratory_cases lc ON lc.id=lp.case_id
-       LEFT JOIN laboratory_patients p ON p.id=lc.patient_id
-       WHERE lp.company_id=$1
-       ORDER BY lp.id DESC LIMIT 300`,
-      [getEffectiveCompanyId(req)]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LAB PAYMENTS :", error);
-    res.status(500).json({ error: "Erreur paiements laboratoire" });
-  }
-});
-
-app.post("/laboratory/cases/:id/payments/confirm", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { method = "EspÃ¨ces", amount = null, payment_reference = "" } = req.body || {};
-    await client.query("BEGIN");
-    const labCase = await client.query("SELECT * FROM laboratory_cases WHERE id=$1 AND company_id=$2 FOR UPDATE", [req.params.id, companyId]);
-    if (!labCase.rows[0]) throw new Error("Dossier laboratoire introuvable.");
-    const paidAmount = Number(amount ?? labCase.rows[0].total_amount ?? 0);
-    const payment = await client.query(
-      `INSERT INTO laboratory_payments
-       (company_id, case_id, amount, method, status, payment_reference,
-        paid_at, created_by)
-       VALUES ($1,$2,$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6)
-       RETURNING *`,
-      [companyId, labCase.rows[0].id, paidAmount, method, payment_reference || labCase.rows[0].case_number, req.user.id]
-    );
-    await client.query("UPDATE laboratory_cases SET payment_status='paid', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [labCase.rows[0].id]);
-    const documentNumber = await nextAccountingNumber(client, "documents", "document_number", "REC-LAB", companyId);
-    await client.query(
-      `INSERT INTO documents
-       (document_type, document_number, client_name, total_amount, observation,
-        created_by, company_id, related_entity_type, related_entity_id, status)
-       SELECT 'ReÃ§u laboratoire',$1,p.full_name,$2,$3,$4,$5,'laboratory_case',$6,'ValidÃ©'
-       FROM laboratory_patients p WHERE p.id=$7`,
-      [
-        documentNumber,
-        paidAmount,
-        `Paiement laboratoire ${labCase.rows[0].case_number}`,
-        req.user.email || "Laboratoire",
-        companyId,
-        labCase.rows[0].id,
-        labCase.rows[0].patient_id
-      ]
-    );
-    await client.query("COMMIT");
-    res.json({ payment: payment.rows[0], status: "paid" });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR CONFIRM LAB PAYMENT :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur paiement laboratoire" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/laboratory/documents", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "AccÃ¨s laboratoire refusÃ©." });
-    const result = await pool.query(
-      `SELECT *
-       FROM documents
-       WHERE company_id=$1
-         AND (related_entity_type='laboratory_case' OR document_type ILIKE '%laboratoire%')
-       ORDER BY id DESC LIMIT 300`,
-      [getEffectiveCompanyId(req)]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LAB DOCUMENTS :", error);
-    res.status(500).json({ error: "Erreur documents laboratoire" });
-  }
-});
-
-
-app.get("/client/laboratory/appointments/public", async (req, res) => {
-  try {
-    const phone = String(req.query.phone || "").trim();
-    if (!phone) return res.json([]);
-
-    const result = await pool.query(
-      `SELECT la.*, ls.lab_name
-       FROM laboratory_appointments la
-       LEFT JOIN laboratory_settings ls ON ls.company_id=la.company_id
-       WHERE la.patient_phone=$1
-       ORDER BY la.id DESC
-       LIMIT 100`,
-      [phone]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR RDV PUBLIC CLIENT :", error);
-    res.status(500).json({ error: "Erreur rendez-vous client." });
-  }
-});
-
-app.get("/client/laboratory/appointments", authenticateToken, async (req, res) => {
-  try {
-    if (normalizeRole(req.user?.role) !== "customer") {
-      return res.status(403).json({ error: "AccÃ¨s rÃ©servÃ© aux clients Marketplace." });
-    }
-    const result = await pool.query(
-      `SELECT la.*, ls.lab_name, ls.city
-       FROM laboratory_appointments la
-       LEFT JOIN laboratory_settings ls ON ls.company_id=la.company_id
-       WHERE la.client_user_id=$1
-       ORDER BY la.id DESC LIMIT 200`,
-      [req.user.id]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR CLIENT LAB APPOINTMENTS :", error);
-    res.status(500).json({ error: "Erreur rendez-vous client laboratoire" });
-  }
-});
-
-app.get("/laboratories/public", async (req, res) => {
-  try {
-    const { city = "", q = "" } = req.query;
-    const values = [];
-    let where = "WHERE ls.is_published=true AND ls.is_active=true";
-    if (city) {
-      values.push(`%${city}%`);
-      where += ` AND ls.city ILIKE $${values.length}`;
-    }
-    if (q) {
-      values.push(`%${q}%`);
-      where += ` AND (ls.lab_name ILIKE $${values.length} OR ls.description ILIKE $${values.length} OR ls.public_description ILIKE $${values.length})`;
-    }
-    const result = await pool.query(
-      `SELECT ls.*, c.name AS company_name
-       FROM laboratory_settings ls
-       LEFT JOIN companies c ON c.id=ls.company_id
-       ${where}
-       ORDER BY ls.updated_at DESC
-       LIMIT 100`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR PUBLIC LABS :", error);
-    res.status(500).json({ error: "Erreur laboratoires publics" });
-  }
-});
-
-app.get("/laboratories/public/:id", async (req, res) => {
-  try {
-    const lab = await pool.query("SELECT * FROM laboratory_settings WHERE id=$1 AND is_published=true AND is_active=true", [req.params.id]);
-    if (!lab.rows[0]) return res.status(404).json({ error: "Laboratoire introuvable." });
-    const analyses = await pool.query(
-      `SELECT *
-       FROM laboratory_analyses
-       WHERE company_id=$1 AND is_available=true
-       ORDER BY name ASC`,
-      [lab.rows[0].company_id]
-    );
-    res.json({ laboratory: lab.rows[0], analyses: analyses.rows });
-  } catch (error) {
-    console.error("ERREUR PUBLIC LAB DETAIL :", error);
-    res.status(500).json({ error: "Erreur dÃ©tail laboratoire" });
-  }
-});
-
-app.post("/laboratory/public/results/verify", async (req, res) => {
-  try {
-    const { result_code = "", verifier = "" } = req.body || {};
-    const result = await pool.query(
-      `SELECT c.*, p.full_name AS patient_name, p.phone AS patient_phone,
-              p.birth_date, ls.lab_name, ls.phone AS lab_phone, ls.email AS lab_email,
-              ls.address AS lab_address
-       FROM laboratory_cases c
-       LEFT JOIN laboratory_patients p ON p.id=c.patient_id
-       LEFT JOIN laboratory_settings ls ON ls.company_id=c.company_id
-       WHERE c.result_code=$1 AND c.result_published=true
-       LIMIT 1`,
-      [String(result_code).trim()]
-    );
-    const row = result.rows[0];
-    const verifierText = String(verifier || "").trim().toLowerCase();
-    const accepted =
-      row &&
-      (String(row.patient_phone || "").trim().toLowerCase() === verifierText ||
-        String(row.birth_date || "").slice(0, 10).toLowerCase() === verifierText);
-    await pool.query(
-      `INSERT INTO laboratory_result_access_logs
-       (company_id, case_id, result_code, verifier, success, ip_address, user_agent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [
-        row?.company_id || null,
-        row?.id || null,
-        result_code,
-        verifier,
-        Boolean(accepted),
-        req?.headers?.["x-forwarded-for"] || req?.ip || "",
-        req?.headers?.["user-agent"] || ""
-      ]
-    );
-    if (!accepted) return res.status(403).json({ error: "Code rÃ©sultat ou vÃ©rification incorrect." });
-    const analyses = await pool.query("SELECT * FROM laboratory_case_analyses WHERE case_id=$1 ORDER BY id ASC", [row.id]);
-    res.json({ result: row, analyses: analyses.rows });
-  } catch (error) {
-    console.error("ERREUR VERIFY LAB RESULT :", error);
-    res.status(500).json({ error: "Erreur consultation rÃ©sultat laboratoire" });
-  }
-});
-
-/* ============================================================
-   NAVIGATION PUBLIQUE CLIENT â€” MaliLink
-   Le client voit ce que les entreprises publient : vÃ©hicules
-   disponibles, biens immobiliers, restaurants et leurs menus.
-   Lecture seule, Ã©lÃ©ments disponibles uniquement, scopÃ© tenant.
-============================================================ */
-
-app.get("/public/vehicles", async (req, res) => {
-  try {
-    const tenantId = getTenantFromRequest(req);
-    const { q = "", type = "" } = req.query;
-    const values = [tenantId];
-    let where = `WHERE c.tenant_id=$1 AND v.statut='disponible'`;
-    if (q) {
-      values.push(`%${q}%`);
-      where += ` AND (v.marque ILIKE $${values.length} OR v.modele ILIKE $${values.length} OR c.name ILIKE $${values.length})`;
-    }
-    if (type === "location") where += " AND (v.prix_location_jour > 0 OR v.prix_location_mois > 0)";
-    if (type === "vente") where += " AND v.prix_vente > 0";
-    const result = await pool.query(
-      `SELECT v.id, v.company_id, v.marque, v.modele, v.annee, v.couleur,
-              v.carburant, v.prix_vente, v.prix_location_jour,
-              v.prix_location_mois, v.images, c.name AS company_name
-       FROM vehicles v
-       JOIN companies c ON c.id=v.company_id
-       ${where}
-       ORDER BY v.updated_at DESC
-       LIMIT 100`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR PUBLIC VEHICLES :", error.message);
-    res.status(500).json({ error: "Erreur vÃ©hicules publics" });
-  }
-});
-
-app.get("/public/properties", async (req, res) => {
-  try {
-    const tenantId = getTenantFromRequest(req);
-    const { q = "", type = "", city = "" } = req.query;
-    const values = [tenantId];
-    let where = `WHERE c.tenant_id=$1 AND p.status='disponible'`;
-    if (q) {
-      values.push(`%${q}%`);
-      where += ` AND (p.title ILIKE $${values.length} OR p.description ILIKE $${values.length} OR c.name ILIKE $${values.length})`;
-    }
-    if (city) {
-      values.push(`%${city}%`);
-      where += ` AND p.city ILIKE $${values.length}`;
-    }
-    if (type) {
-      values.push(type);
-      where += ` AND p.type=$${values.length}`;
-    }
-    const result = await pool.query(
-      `SELECT p.id, p.company_id, p.type, p.title, p.description, p.address,
-              p.city, p.surface, p.rooms_count, p.price_sale, p.price_rent_day,
-              p.price_rent_month, p.images, c.name AS company_name
-       FROM properties p
-       JOIN companies c ON c.id=p.company_id
-       ${where}
-       ORDER BY p.updated_at DESC
-       LIMIT 100`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR PUBLIC PROPERTIES :", error.message);
-    res.status(500).json({ error: "Erreur biens immobiliers publics" });
-  }
-});
-
-app.get("/public/restaurants", async (req, res) => {
-  try {
-    const tenantId = getTenantFromRequest(req);
-    const { q = "" } = req.query;
-    const values = [tenantId];
-    let where = `WHERE c.tenant_id=$1`;
-    if (q) {
-      values.push(`%${q}%`);
-      where += ` AND c.name ILIKE $${values.length}`;
-    }
-    const result = await pool.query(
-      `SELECT c.id AS company_id, c.name AS company_name, c.address, c.phone,
-              COUNT(m.id)::int AS menu_count,
-              MIN(m.price) AS min_price, MAX(m.price) AS max_price
-       FROM companies c
-       JOIN restaurant_menu_items m ON m.company_id=c.id AND m.is_available=true
-       ${where}
-       GROUP BY c.id, c.name, c.address, c.phone
-       ORDER BY c.name ASC
-       LIMIT 100`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR PUBLIC RESTAURANTS :", error.message);
-    res.status(500).json({ error: "Erreur restaurants publics" });
-  }
-});
-
-app.get("/public/restaurants/:companyId/menu", async (req, res) => {
-  try {
-    const tenantId = getTenantFromRequest(req);
-    const companyId = Number(req.params.companyId);
-    const company = await pool.query(
-      `SELECT id, name, address, phone FROM companies WHERE id=$1 AND tenant_id=$2`,
-      [companyId, tenantId]
-    );
-    if (!company.rows[0]) {
-      return res.status(404).json({ error: "Restaurant introuvable." });
-    }
-    const menu = await pool.query(
-      `SELECT id, name, description, category, price, image, preparation_time
-       FROM restaurant_menu_items
-       WHERE company_id=$1 AND is_available=true
-       ORDER BY category ASC, name ASC`,
-      [companyId]
-    );
-    res.json({ restaurant: company.rows[0], menu: menu.rows });
-  } catch (error) {
-    console.error("ERREUR PUBLIC RESTAURANT MENU :", error.message);
-    res.status(500).json({ error: "Erreur menu restaurant" });
-  }
-});
-
-/* Demande client â†’ entreprise (location, achat, rÃ©servation, commande).
-   CrÃ©e une notification pour les admins de l'entreprise concernÃ©e :
-   le client agit, l'entreprise voit la demande dans /notifications. */
-app.post("/public/business-requests", authenticateToken, async (req, res) => {
-  try {
-    const {
-      company_id,
-      module = "",
-      item_id = null,
-      item_label = "",
-      request_type = "demande",
-      message = "",
-      phone = ""
-    } = req.body || {};
-
-    const allowedModules = ["automobile", "immobilier", "hotel", "restaurant"];
-    if (!allowedModules.includes(String(module))) {
-      return res.status(400).json({ error: "Module de demande invalide." });
-    }
-    const companyId = Number(company_id);
-    if (!companyId) {
-      return res.status(400).json({ error: "Entreprise obligatoire." });
-    }
-    const cleanMessage = String(message || "").slice(0, 1000);
-    const cleanLabel = String(item_label || "").slice(0, 200);
-
-    // Le JWT ne contient ni le nom complet ni le tÃ©lÃ©phone : on lit le
-    // profil rÃ©el du client pour que l'entreprise puisse le rappeler.
-    const requester = await pool.query(
-      `SELECT fullname, phone, email FROM users WHERE id=$1 LIMIT 1`,
-      [req.user.id]
-    );
-    const requesterRow = requester.rows[0] || {};
-    const cleanPhone = String(phone || requesterRow.phone || "").slice(0, 40);
-
-    const tenantId = getTenantFromRequest(req);
-    const company = await pool.query(
-      `SELECT id, name FROM companies WHERE id=$1 AND tenant_id=$2`,
-      [companyId, tenantId]
-    );
-    if (!company.rows[0]) {
-      return res.status(404).json({ error: "Entreprise introuvable." });
-    }
-
-    const admins = await pool.query(
-      `SELECT id FROM users
-       WHERE company_id=$1 AND role IN ('admin','direction','directeur') AND is_active=true
-       LIMIT 5`,
-      [companyId]
-    );
-
-    const clientName =
-      requesterRow.fullname ||
-      (String(requesterRow.email || "").includes("@pending.") ? "" : requesterRow.email) ||
-      "Client MaliLink";
-    const title = `Nouvelle demande client â€” ${module}`;
-    const body =
-      `${clientName} (${cleanPhone || "tÃ©lÃ©phone non fourni"}) : ` +
-      `${request_type}${cleanLabel ? ` â€” ${cleanLabel}` : ""}` +
-      `${cleanMessage ? ` | Message : ${cleanMessage}` : ""}`;
-
-    for (const admin of admins.rows) {
-      await createNotification({
-        user_id: admin.id,
-        title,
-        message: body,
-        type: "demande_client",
-        company_id: companyId,
-        related_entity_type: module,
-        related_entity_id: item_id ? Number(item_id) : null
-      });
-    }
-
-    res.status(201).json({
-      success: true,
-      message: "Votre demande a Ã©tÃ© envoyÃ©e. Lâ€™entreprise vous contactera rapidement."
-    });
-  } catch (error) {
-    console.error("ERREUR BUSINESS REQUEST :", error.message);
-    res.status(500).json({ error: "Erreur envoi de la demande. RÃ©essayez." });
-  }
-});
-
-app.get("/marketplace/cart", authenticateToken, async (req, res) => {
-  try {
-    res.json(await getMarketplaceCartPayload(req.user));
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE CART :", error);
-    res.status(500).json({ error: "Erreur panier marketplace" });
-  }
-});
-
-app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
-  try {
-    const { marketplace_product_id, quantity = 1 } = req.body || {};
-    const qty = Math.max(Number(quantity || 1), 1);
-    const productResult = await pool.query(
-      `SELECT mp.*, p.stock, p.id AS base_product_id,
-              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS effective_price,
-              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS effective_available
-       FROM marketplace_products mp
-       LEFT JOIN products p ON p.id=mp.product_id
-       WHERE mp.id=$1
-         AND (mp.status='published' OR mp.is_published=true)
-       LIMIT 1`,
-      [marketplace_product_id]
-    );
-    const product = productResult.rows[0];
-    if (!product) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    const buyerRole = normalizeRole(req.user?.role);
-    if (buyerRole !== "customer" && req.user.company_id && Number(req.user.company_id) === Number(product.company_id)) {
-      return res.status(400).json({ error: "Une entreprise ne peut pas acheter ses propres produits marketplace." });
-    }
-    const availableStock = Number(product.effective_available || 0);
-    if (availableStock < qty) {
-      return res.status(400).json({ error: "Stock insuffisant pour ce produit." });
-    }
-
-    const cart = await getOrCreateMarketplaceCart(pool, req.user);
-    const existing = await pool.query(
-      `SELECT * FROM marketplace_cart_items
-       WHERE cart_id=$1 AND marketplace_product_id=$2
-       LIMIT 1`,
-      [cart.id, product.id]
-    );
-    if (existing.rows[0]) {
-      const nextQty = Number(existing.rows[0].quantity || 0) + qty;
-      if (availableStock < nextQty) {
-        return res.status(400).json({ error: "Stock insuffisant pour cette quantitÃ©." });
-      }
-      await pool.query(
-        `UPDATE marketplace_cart_items
-         SET quantity=$1,
-             unit_price=$2,
-             total_price=$1::numeric*$2::numeric,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$3`,
-        [nextQty, Number(product.effective_price || 0), existing.rows[0].id]
-      );
-    } else {
-      await pool.query(
-        `INSERT INTO marketplace_cart_items
-         (cart_id, marketplace_product_id, vendor_company_id, product_id,
-          quantity, unit_price, total_price)
-         VALUES ($1,$2,$3,$4,$5,$6,$5::numeric*$6::numeric)`,
-        [cart.id, product.id, product.company_id, product.product_id, qty, Number(product.effective_price || 0)]
-      );
-    }
-
-    res.status(201).json(await getMarketplaceCartPayload(req.user));
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE CART ADD :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur ajout panier marketplace" });
-  }
-});
-
-app.delete("/marketplace/cart/items/:id", authenticateToken, async (req, res) => {
-  try {
-    const cart = await getOrCreateMarketplaceCart(pool, req.user);
-    await pool.query(
-      "DELETE FROM marketplace_cart_items WHERE id=$1 AND cart_id=$2",
-      [req.params.id, cart.id]
-    );
-    res.json(await getMarketplaceCartPayload(req.user));
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE CART DELETE :", error);
-    res.status(500).json({ error: "Erreur suppression panier marketplace" });
-  }
-});
-
-app.post("/marketplace/orders", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const {
-      customer_name = req.user.fullname || req.user.email || "",
-      customer_email = req.user.email || "",
-      customer_phone = req.user.phone || "",
-      delivery_address = "",
-      delivery_method = "Retrait sur place",
-      delivery_fee = 0,
-      delivery_city = "",
-      delivery_neighborhood = "",
-      delivery_phone = "",
-      delivery_note = "",
-      payment_method = "EspÃ¨ces",
-      notes = ""
-    } = req.body || {};
-    const cart = await getOrCreateMarketplaceCart(client, req.user);
-    const itemsResult = await client.query(
-      "SELECT * FROM marketplace_cart_items WHERE cart_id=$1 ORDER BY id ASC",
-      [cart.id]
-    );
-    if (itemsResult.rows.length === 0) return res.status(400).json({ error: "Panier vide." });
-
-    await client.query("BEGIN");
-    const groups = itemsResult.rows.reduce((acc, item) => {
-      const key = String(item.vendor_company_id || 0);
-      acc[key] = acc[key] || [];
-      acc[key].push(item);
-      return acc;
-    }, {});
-    const orders = [];
-
-    for (const [vendorCompanyId, rows] of Object.entries(groups)) {
-      const subtotal = rows.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
-      const deliveryFee = Math.max(Number(delivery_fee || 0), 0);
-      const totalAmount = subtotal + deliveryFee;
-      const orderNumber = await nextAccountingNumber(
-        client,
-        "marketplace_orders",
-        "order_number",
-        "MKP",
-        Number(vendorCompanyId || 0)
-      );
-      const orderResult = await client.query(
-        `INSERT INTO marketplace_orders
-         (order_number, customer_user_id, buyer_user_id, buyer_company_id,
-          vendor_company_id, seller_company_id,
-          customer_name, customer_email, customer_phone, delivery_address,
-          delivery_method, delivery_city, delivery_neighborhood, delivery_phone,
-          delivery_note,
-          order_type, status, payment_status, payment_method, subtotal,
-          delivery_fee, total_amount, amount_paid, amount_due, notes)
-         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'En attente','En attente',$15,$16,$17,$18,0,$18,$19)
-         RETURNING *`,
-        [
-          orderNumber,
-          req.user.id,
-          req.user.company_id || null,
-          Number(vendorCompanyId || 0),
-          customer_name,
-          customer_email,
-          customer_phone,
-          delivery_address,
-          delivery_method,
-          delivery_city,
-          delivery_neighborhood,
-          delivery_phone || customer_phone,
-          delivery_note,
-          req.user.company_id ? "B2B" : "B2C",
-          payment_method,
-          subtotal,
-          deliveryFee,
-          totalAmount,
-          notes
-        ]
-      );
-      const order = orderResult.rows[0];
-      await client.query(
-        `INSERT INTO marketplace_payments
-         (order_id, company_id, amount, currency, method, status,
-          provider_reference, created_by)
-         VALUES ($1,$2,$3,'FCFA',$4,'En attente',$5,$6)`,
-        [
-          order.id,
-          Number(vendorCompanyId || 0),
-          totalAmount,
-          payment_method,
-          orderNumber,
-          req.user.id
-        ]
-      );
-      for (const item of rows) {
-        const product = await client.query(
-          "SELECT reference, name FROM products WHERE id=$1 LIMIT 1",
-          [item.product_id]
-        );
-        await client.query(
-          `INSERT INTO marketplace_order_items
-           (order_id, marketplace_product_id, vendor_company_id, product_id,
-            product_reference, product_name, quantity, unit_price, total_price)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-          [
-            order.id,
-            item.marketplace_product_id,
-            item.vendor_company_id,
-            item.product_id,
-            product.rows[0]?.reference || "",
-            product.rows[0]?.name || "",
-            item.quantity,
-            item.unit_price,
-            item.total_price
-          ]
-        );
-      }
-      const vendorUsers = await client.query(
-        `SELECT id
-         FROM users
-         WHERE company_id=$1
-           AND LOWER(COALESCE(role,'')) IN ('admin','super_admin','marketplace_vendor','marketplace_admin','responsable_entrepot')
-         LIMIT 20`,
-        [Number(vendorCompanyId || 0)]
-      );
-      for (const vendorUser of vendorUsers.rows) {
-        await createNotification({
-          user_id: vendorUser.id,
-          title: "Nouvelle commande marketplace",
-          message: `Commande ${order.order_number} Ã  traiter.`,
-          type: "marketplace_order_pending",
-          company_id: Number(vendorCompanyId || 0),
-          priority: "high",
-          related_entity_type: "marketplace_order",
-          related_entity_id: order.id,
-          action_url: "/vendor/orders",
-          created_by: req.user.id
-        });
-      }
-      await createNotification({
-        user_id: req.user.id,
-        title: "Commande marketplace crÃ©Ã©e",
-        message: `Votre commande ${order.order_number} a Ã©tÃ© envoyÃ©e au vendeur.`,
-        type: "marketplace_order_created",
-        company_id: req.user.company_id || Number(vendorCompanyId || 0),
-        related_entity_type: "marketplace_order",
-        related_entity_id: order.id,
-        action_url: req.user.company_id ? `/marketplace/orders/${order.id}` : `/client/orders/${order.id}`,
-        created_by: req.user.id
-      });
-      orders.push(order);
-    }
-
-    await client.query("DELETE FROM marketplace_cart_items WHERE cart_id=$1", [cart.id]);
-    await client.query("UPDATE marketplace_carts SET status='ordered', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [cart.id]);
-    await client.query("COMMIT");
-    res.status(201).json({ orders });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR MARKETPLACE ORDER CREATE :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur crÃ©ation commande marketplace" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/marketplace/orders/my", authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT o.*, c.name AS vendor_name
-       FROM marketplace_orders o
-       LEFT JOIN companies c ON c.id=COALESCE(o.seller_company_id, o.vendor_company_id)
-       WHERE o.customer_user_id=$1
-          OR ($2::int IS NOT NULL AND o.buyer_company_id=$2)
-       ORDER BY o.id DESC`,
-      [req.user.id, req.user.company_id || null]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE MY ORDERS :", error);
-    res.status(500).json({ error: "Erreur commandes marketplace" });
-  }
-});
-
-app.get("/marketplace/orders", authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT o.*, c.name AS vendor_name
-       FROM marketplace_orders o
-       LEFT JOIN companies c ON c.id=COALESCE(o.seller_company_id, o.vendor_company_id)
-       WHERE o.customer_user_id=$1
-          OR o.buyer_user_id=$1
-          OR ($2::int IS NOT NULL AND o.buyer_company_id=$2)
-       ORDER BY o.id DESC`,
-      [req.user.id, req.user.company_id || null]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE ORDERS :", error);
-    res.status(500).json({ error: "Erreur commandes marketplace" });
-  }
-});
-
-app.get("/marketplace/orders/:id", authenticateToken, async (req, res) => {
-  try {
-    const orderResult = await pool.query(
-      `SELECT o.*, c.name AS vendor_name
-       FROM marketplace_orders o
-       LEFT JOIN companies c ON c.id=o.vendor_company_id
-       WHERE o.id=$1
-         AND (
-           o.customer_user_id=$2
-           OR o.buyer_user_id=$2
-           OR COALESCE(o.seller_company_id, o.vendor_company_id)=$3
-           OR o.buyer_company_id=$3
-           OR $4::boolean=true
-         )
-       LIMIT 1`,
-      [req.params.id, req.user.id, req.user.company_id || null, req.user.is_super_admin === true]
-    );
-    const order = orderResult.rows[0];
-    if (!order) return res.status(404).json({ error: "Commande marketplace introuvable" });
-    const items = await pool.query("SELECT * FROM marketplace_order_items WHERE order_id=$1 ORDER BY id ASC", [order.id]);
-    const payments = await pool.query("SELECT * FROM marketplace_payments WHERE order_id=$1 ORDER BY id DESC", [order.id]);
-    res.json({ order, items: items.rows, payments: payments.rows });
-  } catch (error) {
-    console.error("ERREUR MARKETPLACE ORDER DETAIL :", error);
-    res.status(500).json({ error: "Erreur dÃ©tail commande marketplace" });
-  }
-});
-
-app.get("/marketplace/vendor/products", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s vendeur marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
-              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
-              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
-              COALESCE(mp.published_quantity, mp.available_stock, 0) AS published_quantity,
-              COALESCE(mp.available_quantity, mp.available_stock, 0) AS available_quantity,
-              p.reference, p.name AS product_name, p.stock
-       FROM marketplace_products mp
-       LEFT JOIN products p ON p.id=mp.product_id
-       WHERE mp.company_id=$1
-       ORDER BY mp.id DESC`,
-      [companyId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR VENDOR PRODUCTS :", error);
-    res.status(500).json({ error: "Erreur produits vendeur marketplace" });
-  }
-});
-
-app.post("/marketplace/vendor/products", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s vendeur marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      product_id,
-      title,
-      public_title,
-      description = "",
-      public_description = "",
-      category = "",
-      price = 0,
-      public_price = 0,
-      published_quantity,
-      available_stock,
-      image_url = "",
-      images = [],
-      status = "published",
-      is_b2b = true,
-      is_b2c = true
-    } = req.body || {};
-    const product = await pool.query("SELECT * FROM products WHERE id=$1 AND company_id=$2", [product_id, companyId]);
-    if (!product.rows[0]) return res.status(404).json({ error: "Produit source introuvable dans cette entreprise." });
-    if (product.rows[0].is_sellable === false) {
-      return res.status(400).json({ error: "Ce produit nâ€™est pas marquÃ© comme vendable." });
-    }
-    const sourceStock = Number(product.rows[0].stock || 0);
-    const quantityToPublish = Number(published_quantity ?? available_stock ?? sourceStock);
-    if (quantityToPublish <= 0 || quantityToPublish > sourceStock) {
-      return res.status(400).json({ error: "La quantitÃ© publiÃ©e doit Ãªtre supÃ©rieure Ã  0 et infÃ©rieure ou Ã©gale au stock disponible." });
-    }
-    const finalPrice = Number(public_price || price || product.rows[0].sale_price || product.rows[0].price || 0);
-    const finalTitle = public_title || title || product.rows[0].name;
-    const finalDescription = public_description || description || "";
-    const finalStatus = status === "draft" || status === "brouillon" ? "draft" : "published";
-    const result = await pool.query(
-      `INSERT INTO marketplace_products
-       (company_id, product_id, title, public_title, description, public_description,
-        category, price, public_price, image_url, images, available_stock,
-        published_quantity, available_quantity, sold_quantity, status,
-        is_published, is_b2b, is_b2c, created_by)
-       VALUES ($1,$2,$3,$3,$4,$4,$5,$6,$6,$7,$8::jsonb,$9,$9,$9,0,$10,$11,$12,$13,$14)
-       RETURNING *`,
-      [
-        companyId,
-        product_id,
-        finalTitle,
-        finalDescription,
-        category || product.rows[0].category || "",
-        finalPrice,
-        image_url || product.rows[0].image_url || "",
-        JSON.stringify(Array.isArray(images) ? images : []),
-        quantityToPublish,
-        finalStatus,
-        finalStatus === "published",
-        is_b2b !== false,
-        is_b2c !== false,
-        req.user.id
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATE VENDOR PRODUCT :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur publication produit marketplace" });
-  }
-});
-
-app.put("/marketplace/vendor/products/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s vendeur marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      title,
-      public_title,
-      description = "",
-      public_description = "",
-      category = "",
-      price = 0,
-      public_price = 0,
-      published_quantity,
-      available_stock,
-      image_url = "",
-      status = "published",
-      is_b2b = true,
-      is_b2c = true
-    } = req.body || {};
-    const existing = await pool.query(
-      `SELECT mp.*, p.stock
-       FROM marketplace_products mp
-       LEFT JOIN products p ON p.id=mp.product_id
-       WHERE mp.id=$1 AND mp.company_id=$2`,
-      [req.params.id, companyId]
-    );
-    if (!existing.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    const nextPublishedQuantity = Number(published_quantity ?? available_stock ?? existing.rows[0].published_quantity ?? existing.rows[0].available_stock ?? 0);
-    if (nextPublishedQuantity > Number(existing.rows[0].stock || 0)) {
-      return res.status(400).json({ error: "La quantitÃ© publiÃ©e dÃ©passe le stock disponible." });
-    }
-    const nextAvailable = Math.max(nextPublishedQuantity - Number(existing.rows[0].sold_quantity || 0), 0);
-    const finalStatus = status === "draft" || status === "brouillon" ? "draft" : "published";
-    const result = await pool.query(
-      `UPDATE marketplace_products
-       SET title=$1, public_title=$1, description=$2, public_description=$2,
-           category=$3, price=$4, public_price=$4, image_url=$5,
-           published_quantity=$6, available_quantity=$7, available_stock=$7,
-           status=$8, is_published=$9, is_b2b=$10, is_b2c=$11,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$12 AND company_id=$13
-       RETURNING *`,
-      [
-        public_title || title || existing.rows[0].title,
-        public_description || description,
-        category,
-        Number(public_price || price || 0),
-        image_url,
-        nextPublishedQuantity,
-        nextAvailable,
-        finalStatus,
-        finalStatus === "published",
-        is_b2b !== false,
-        is_b2c !== false,
-        req.params.id,
-        companyId
-      ]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR UPDATE VENDOR PRODUCT :", error);
-    res.status(500).json({ error: "Erreur modification produit marketplace" });
-  }
-});
-
-app.delete("/marketplace/vendor/products/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s vendeur marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `UPDATE marketplace_products
-       SET status='inactive', is_published=false, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$1 AND company_id=$2
-       RETURNING *`,
-      [req.params.id, companyId]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    res.json({ message: "Produit marketplace dÃ©sactivÃ©.", product: result.rows[0] });
-  } catch (error) {
-    console.error("ERREUR DELETE VENDOR PRODUCT :", error);
-    res.status(500).json({ error: "Erreur dÃ©sactivation produit marketplace" });
-  }
-});
-
-app.get("/marketplace/vendor/orders", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s vendeur marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const result = await pool.query(
-      `SELECT *
-       FROM marketplace_orders
-       WHERE vendor_company_id=$1
-       ORDER BY id DESC`,
-      [companyId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR VENDOR ORDERS :", error);
-    res.status(500).json({ error: "Erreur commandes vendeur marketplace" });
-  }
-});
-
-app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s vendeur marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const requestedStatus = normalizeMarketplaceOrderStatus(req.body?.status);
-    const requestedPaymentStatus = normalizeMarketplacePaymentStatus(req.body?.payment_status);
-    await client.query("BEGIN");
-    const orderCheck = await client.query(
-      "SELECT * FROM marketplace_orders WHERE id=$1 AND vendor_company_id=$2 FOR UPDATE",
-      [req.params.id, companyId]
-    );
-    if (!orderCheck.rows[0]) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Commande marketplace introuvable" });
-    }
-    if (isMarketplaceClosedStatus(orderCheck.rows[0].status) && req.user.is_super_admin !== true) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Commande clÃ´turÃ©e. Seul le super admin peut la modifier." });
-    }
-    let result;
-    if (
-      requestedPaymentStatus === "PayÃ©" ||
-      requestedStatus === "Paiement confirmÃ©"
-    ) {
-      result = await finalizeMarketplaceOrder(client, req.params.id, req.user);
-      if (requestedStatus && requestedStatus !== "Paiement confirmÃ©") {
-        const statusUpdate = await client.query(
-          `UPDATE marketplace_orders
-           SET status=$1::text,
-               closed_at=CASE WHEN $1::text='ClÃ´turÃ©e' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$2
-           RETURNING *`,
-          [requestedStatus === "LivrÃ©e" ? "ClÃ´turÃ©e" : requestedStatus, req.params.id]
-        );
-        result = { ...result, ...statusUpdate.rows[0] };
-      }
-    } else {
-      const finalStatus = requestedStatus === "LivrÃ©e" ? "ClÃ´turÃ©e" : requestedStatus;
-      const update = await client.query(
-        `UPDATE marketplace_orders
-         SET status=COALESCE(NULLIF($1::text,''), status::text),
-             payment_status=COALESCE(NULLIF($2::text,''), payment_status::text),
-             vendor_message=COALESCE(NULLIF($3::text,''), vendor_message::text),
-             closed_at=CASE WHEN $1::text='ClÃ´turÃ©e' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$4
-         RETURNING *`,
-        [finalStatus || "", requestedPaymentStatus || "", req.body?.vendor_message || "", req.params.id]
-      );
-      result = update.rows[0];
-    }
-    await createNotification({
-      user_id: result.customer_user_id,
-      title: "Statut commande marketplace",
-      message: `La commande ${result.order_number} est maintenant ${result.status}.`,
-      type: "marketplace_order_status",
-      company_id: result.buyer_company_id || result.vendor_company_id,
-      related_entity_type: "marketplace_order",
-      related_entity_id: result.id,
-      action_url: result.buyer_company_id ? `/marketplace/orders/${result.id}` : `/client/orders/${result.id}`,
-      created_by: req.user.id
-    });
-    await client.query("COMMIT");
-    res.json(result);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR VENDOR ORDER STATUS :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur statut commande marketplace" });
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/marketplace/vendor/orders/:id/payments", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "AccÃ¨s paiement marketplace refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const amount = Number(req.body?.amount || 0);
-    if (amount <= 0) return res.status(400).json({ error: "Montant paiement obligatoire." });
-
-    await client.query("BEGIN");
-    const orderResult = await client.query(
-      `SELECT *
-       FROM marketplace_orders
-       WHERE id=$1 AND vendor_company_id=$2
-       FOR UPDATE`,
-      [req.params.id, companyId]
-    );
-    const order = orderResult.rows[0];
-    if (!order) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Commande marketplace introuvable" });
-    }
-    if (isMarketplaceClosedStatus(order.status) && req.user.is_super_admin !== true) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Commande clÃ´turÃ©e. Paiement impossible sans super admin." });
-    }
-
-    const reference =
-      req.body?.provider_reference ||
-      `${order.order_number}-PAY-${Date.now().toString().slice(-6)}`;
-    await client.query(
-      `INSERT INTO marketplace_payments
-       (order_id, company_id, amount, currency, method, status,
-        provider_reference, notes, paid_at, created_by)
-       VALUES ($1,$2,$3,'FCFA',$4,'PayÃ©',$5,$6,CURRENT_TIMESTAMP,$7)`,
-      [
-        order.id,
-        companyId,
-        amount,
-        req.body?.method || order.payment_method || "EspÃ¨ces",
-        reference,
-        req.body?.notes || "Paiement partiel marketplace",
-        req.user.id
-      ]
-    );
-
-    const updated = await refreshMarketplaceOrderPaymentState(client, order.id);
-    await client.query("COMMIT");
-    res.status(201).json({
-      success: true,
-      message: updated.amount_due <= 0 ? "Commande payÃ©e entiÃ¨rement." : "Paiement partiel enregistrÃ©.",
-      order: updated
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR MARKETPLACE PARTIAL PAYMENT :", error);
-    res.status(500).json({ error: error.detail || error.message || "Erreur paiement marketplace" });
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/marketplace/orders/:id/receive", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const companyId = req.user.company_id;
-    if (!companyId) return res.status(403).json({ error: "RÃ©ception rÃ©servÃ©e aux comptes entreprise." });
-    await client.query("BEGIN");
-    const orderResult = await client.query(
-      `SELECT *
-       FROM marketplace_orders
-       WHERE id=$1 AND buyer_company_id=$2 AND UPPER(order_type)='B2B'
-       FOR UPDATE`,
-      [req.params.id, companyId]
-    );
-    const order = orderResult.rows[0];
-    if (!order) throw new Error("Commande B2B introuvable pour cette entreprise.");
-    if (order.stock_entry_created === true) throw new Error("EntrÃ©e stock dÃ©jÃ  crÃ©Ã©e pour cette commande.");
-    const items = await client.query("SELECT * FROM marketplace_order_items WHERE order_id=$1", [order.id]);
-    for (const item of items.rows) {
-      const productRef = item.product_reference || `MKP-${item.product_id}`;
-      const productName = item.product_name || "Produit marketplace";
-      let product = await client.query(
-        "SELECT * FROM products WHERE company_id=$1 AND reference=$2 LIMIT 1",
-        [companyId, productRef]
-      );
-      if (!product.rows[0]) {
-        product = await client.query(
-          `INSERT INTO products
-           (company_id, reference, name, category, stock, status, unit, sale_price, is_active)
-           VALUES ($1,$2,$3,'Achat marketplace',0,'Disponible','piÃ¨ce',$4,true)
-           RETURNING *`,
-          [companyId, productRef, productName, Number(item.unit_price || 0)]
-        );
-      }
-      await client.query(
-        "UPDATE products SET stock=COALESCE(stock,0)+$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2",
-        [Number(item.quantity || 0), product.rows[0].id]
-      );
-      await client.query(
-        `INSERT INTO stock_movements
-         (type, product_reference, product_name, quantity, source_warehouse,
-          destination_warehouse, reason, status, company_id, created_by,
-          created_by_name, created_by_role, product_id, approval_status,
-          original_quantity, final_quantity)
-         VALUES ('EntrÃ©e',$1,$2,$3,$4,$5,$6,'ValidÃ©',$7,$8,$9,$10,$11,'ValidÃ©',$3,$3)`,
-        [
-          productRef,
-          productName,
-          Number(item.quantity || 0),
-          "Marketplace",
-          req.body?.destination_warehouse || "Stock acheteur",
-          `RÃ©ception commande marketplace ${order.order_number}`,
-          companyId,
-          req.user.id,
-          req.user.email || req.user.fullname || "Acheteur marketplace",
-          req.user.role || "admin",
-          product.rows[0].id
-        ]
-      );
-    }
-    await client.query(
-      "UPDATE marketplace_orders SET stock_entry_created=true, status='received', updated_at=CURRENT_TIMESTAMP WHERE id=$1",
-      [order.id]
-    );
-    await client.query("COMMIT");
-    res.json({ success: true, message: "EntrÃ©e stock crÃ©Ã©e cÃ´tÃ© acheteur." });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR MARKETPLACE RECEIVE :", error);
-    res.status(500).json({ error: error.message || "Erreur rÃ©ception marketplace" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/super-admin/marketplace", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "AccÃ¨s super admin marketplace refusÃ©." });
-    const [products, orders, vendors, customers] = await Promise.all([
-      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_products"),
-      pool.query("SELECT COUNT(*)::int AS total, COALESCE(SUM(total_amount),0)::numeric AS amount FROM marketplace_orders"),
-      pool.query("SELECT COUNT(DISTINCT company_id)::int AS total FROM marketplace_products"),
-      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_profiles WHERE profile_type='customer'")
-    ]);
-    res.json({
-      products: products.rows[0],
-      orders: orders.rows[0],
-      vendors: vendors.rows[0],
-      customers: customers.rows[0]
-    });
-  } catch (error) {
-    console.error("ERREUR SUPER ADMIN MARKETPLACE :", error);
-    res.status(500).json({ error: "Erreur overview marketplace" });
-  }
-});
-
-app.get("/super-admin/marketplace/orders", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "AccÃ¨s super admin marketplace refusÃ©." });
-    const result = await pool.query("SELECT * FROM marketplace_orders ORDER BY id DESC LIMIT 200");
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur commandes marketplace super admin" });
-  }
-});
-
-app.get("/super-admin/marketplace/vendors", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "AccÃ¨s super admin marketplace refusÃ©." });
-    const result = await pool.query(
-      `SELECT c.id, c.name, COUNT(mp.id)::int AS products_count
-       FROM companies c
-       LEFT JOIN marketplace_products mp ON mp.company_id=c.id
-       GROUP BY c.id, c.name
-       ORDER BY c.name ASC`
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur vendeurs marketplace super admin" });
-  }
-});
-
-app.get("/super-admin/marketplace/customers", authenticateToken, async (req, res) => {
-  try {
-    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "AccÃ¨s super admin marketplace refusÃ©." });
-    const result = await pool.query("SELECT * FROM marketplace_profiles WHERE profile_type='customer' ORDER BY id DESC LIMIT 200");
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur clients marketplace super admin" });
-  }
-});
-
-/* MODULES METIERS : AUTOMOBILE / IMMOBILIER / RESTAURANT */
-function canViewBusinessModule(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "directeur" ||
-    role === "direction" ||
-    role === "comptable" ||
-    role === "caissier" ||
-    role === "vendeur" ||
-    role === "serveur" ||
-    role === "cuisine" ||
-    role === "magasinier" ||
-    role === "employe" ||
-    role === "employÃ©"
-  );
-}
-
-function canManageBusinessModule(user) {
-  const role = normalizeRole(user?.role);
-  return (
-    user?.is_super_admin === true ||
-    role === "super_admin" ||
-    role === "admin" ||
-    role === "directeur" ||
-    role === "direction" ||
-    role === "comptable" ||
-    role === "caissier" ||
-    role === "vendeur" ||
-    role === "serveur" ||
-    role === "cuisine"
-  );
-}
-
-function getBusinessCompanyScope(req, alias = "") {
-  const { companyId, shouldFilterByCompany } = getCompanyFilter(req);
-  const prefix = alias ? `${alias}.` : "";
-  const values = [];
-  let clause = "";
-
-  if (shouldFilterByCompany) {
-    values.push(companyId);
-    clause = `WHERE ${prefix}company_id=$1`;
-  }
-
-  return { companyId, shouldFilterByCompany, clause, values };
-}
-
-async function recordBusinessPayment(client, {
-  companyId,
-  amount,
-  category,
-  sourceType,
-  sourceId,
-  description,
-  partnerName = "",
-  user = {},
-  documentType = "ReÃ§u"
-}) {
-  const amountValue = Number(amount || 0);
-  if (!companyId || amountValue <= 0) return null;
-
-  const transactionNumber = await nextAccountingNumber(
-    client,
-    "accounting_transactions",
-    "transaction_number",
-    "METIER",
-    companyId
-  );
-
-  const transaction = await client.query(
-    `INSERT INTO accounting_transactions
-     (company_id, transaction_number, transaction_type, source_type, source_id,
-      amount, currency, direction, category, partner_name, description, status,
-      source_label, destination_label, created_by, validated_by, validated_at)
-     VALUES ($1,$2,'encaissement_metier',$3,$4,$5,'FCFA','entrÃ©e',$6,$7,$8,
-             'validÃ©',$9,'TrÃ©sorerie',$10,$10,CURRENT_TIMESTAMP)
-     RETURNING *`,
-    [
-      companyId,
-      transactionNumber,
-      sourceType,
-      sourceId,
-      amountValue,
-      category,
-      partnerName,
-      description,
-      category,
-      user?.id || null
-    ]
-  );
-
-  const documentNumber = await nextAccountingNumber(
-    client,
-    "documents",
-    "document_number",
-    "DOC-METIER",
-    companyId
-  );
-
-  await client.query(
-    `INSERT INTO documents
-     (document_type, document_number, client_name, total_amount, observation,
-      created_by, company_id, related_entity_type, related_entity_id, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ValidÃ©')`,
-    [
-      documentType,
-      documentNumber,
-      partnerName,
-      amountValue,
-      description,
-      user?.email || user?.fullname || "Triangle WMS",
-      companyId,
-      sourceType,
-      sourceId
-    ]
-  );
-
-  return transaction.rows[0];
-}
-
-app.get("/automobile/dashboard", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s automobile refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const vehicleFilter = clause || "";
-    const rentalFilter = clause || "";
-    const salesFilter = clause || "";
-    const [vehicles, rentals, sales] = await Promise.all([
-      pool.query(`SELECT COUNT(*)::int AS total,
-                         COUNT(*) FILTER (WHERE statut='disponible')::int AS disponibles,
-                         COUNT(*) FILTER (WHERE statut='louÃ©' OR statut='loue')::int AS loues,
-                         COUNT(*) FILTER (WHERE statut='vendu')::int AS vendus
-                  FROM vehicles ${vehicleFilter}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total,
-                         COALESCE(SUM(total_amount),0)::numeric AS total_amount,
-                         COALESCE(SUM(paid_amount),0)::numeric AS paid_amount
-                  FROM vehicle_rentals ${rentalFilter}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total,
-                         COALESCE(SUM(sale_price),0)::numeric AS sale_amount,
-                         COALESCE(SUM(amount_paid),0)::numeric AS paid_amount,
-                         COALESCE(SUM(remaining_amount),0)::numeric AS remaining_amount
-                  FROM vehicle_sales ${salesFilter}`, values)
-    ]);
-    res.json({ vehicles: vehicles.rows[0], rentals: rentals.rows[0], sales: sales.rows[0] });
-  } catch (error) {
-    console.error("ERREUR AUTOMOBILE DASHBOARD :", error);
-    res.status(500).json({ error: "Erreur dashboard automobile" });
-  }
-});
-
-app.get("/automobile/vehicles", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s automobile refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const result = await pool.query(`SELECT * FROM vehicles ${clause} ORDER BY id DESC LIMIT 200`, values);
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur lecture vÃ©hicules" });
-  }
-});
-
-app.post("/automobile/vehicles", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s modification automobile refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      product_id, marque, modele, immatriculation, numero_chassis, annee,
-      couleur, kilometrage, carburant, statut = "disponible",
-      boite_vitesse, nombre_places, etat_vehicule,
-      prix_vente, prix_location_jour, prix_location_semaine,
-      prix_location_mois, disponibilite,
-      is_sellable, is_rentable, publish_on_marketplace
-    } = req.body || {};
-    const result = await pool.query(
-      `INSERT INTO vehicles
-       (company_id, product_id, marque, modele, immatriculation, numero_chassis,
-        annee, couleur, kilometrage, carburant, statut, prix_vente,
-        prix_location_jour, prix_location_semaine, prix_location_mois,
-        boite_vitesse, nombre_places, etat_vehicule, disponibilite,
-        is_sellable, is_rentable, publish_on_marketplace, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
-       RETURNING *`,
-      [
-        companyId, product_id || null, marque || "", modele || "",
-        immatriculation || "", numero_chassis || "", annee || null,
-        couleur || "", Number(kilometrage || 0), carburant || "", statut,
-        Number(prix_vente || 0), Number(prix_location_jour || 0),
-        Number(prix_location_semaine || 0), Number(prix_location_mois || 0),
-        boite_vitesse || "", Number(nombre_places || 0), etat_vehicule || "",
-        disponibilite || statut || "disponible",
-        toBooleanFlag(is_sellable, true),
-        toBooleanFlag(is_rentable, false),
-        toBooleanFlag(publish_on_marketplace, false),
-        req.user.id
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATION VEHICULE :", error);
-    res.status(500).json({ error: "Erreur crÃ©ation vÃ©hicule" });
-  }
-});
-
-app.put("/automobile/vehicles/:id", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s modification automobile refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const isSuper = isSuperAdminUser(req.user);
-    const fields = req.body || {};
-    const result = await pool.query(
-      `UPDATE vehicles SET
-         marque=COALESCE($1,marque), modele=COALESCE($2,modele),
-         immatriculation=COALESCE($3,immatriculation), numero_chassis=COALESCE($4,numero_chassis),
-         annee=COALESCE($5,annee), couleur=COALESCE($6,couleur),
-         kilometrage=COALESCE($7,kilometrage), carburant=COALESCE($8,carburant),
-         statut=COALESCE($9,statut), prix_vente=COALESCE($10,prix_vente),
-         prix_location_jour=COALESCE($11,prix_location_jour),
-         prix_location_mois=COALESCE($12,prix_location_mois),
-         updated_at=CURRENT_TIMESTAMP
-       WHERE id=$13 ${isSuper && !companyId ? "" : "AND company_id=$14"}
-       RETURNING *`,
-      [
-        fields.marque ?? null, fields.modele ?? null, fields.immatriculation ?? null,
-        fields.numero_chassis ?? null, fields.annee ?? null, fields.couleur ?? null,
-        fields.kilometrage ?? null, fields.carburant ?? null, fields.statut ?? null,
-        fields.prix_vente ?? null, fields.prix_location_jour ?? null,
-        fields.prix_location_mois ?? null, req.params.id, companyId
-      ]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: "VÃ©hicule introuvable" });
-    res.json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur modification vÃ©hicule" });
-  }
-});
-
-app.get("/automobile/rentals", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s automobile refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req, "r");
-    const result = await pool.query(
-      `SELECT r.*, v.marque, v.modele, v.immatriculation
-       FROM vehicle_rentals r
-       LEFT JOIN vehicles v ON v.id=r.vehicle_id
-       ${clause}
-       ORDER BY r.id DESC LIMIT 200`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur locations vÃ©hicules" });
-  }
-});
-
-app.post("/automobile/rentals", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s location vÃ©hicule refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { vehicle_id, client_name, client_phone, start_date, end_date, price_per_day, total_amount, deposit_amount, paid_amount } = req.body || {};
-    await client.query("BEGIN");
-    const rental = await client.query(
-      `INSERT INTO vehicle_rentals
-       (company_id, vehicle_id, client_name, client_phone, start_date, end_date,
-        price_per_day, total_amount, deposit_amount, paid_amount, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       RETURNING *`,
-      [
-        companyId, vehicle_id || null, client_name || "", client_phone || "",
-        start_date || null, end_date || null, Number(price_per_day || 0),
-        Number(total_amount || 0), Number(deposit_amount || 0),
-        Number(paid_amount || 0), Number(paid_amount || 0) > 0 ? "actif" : "en_attente",
-        req.user.id
-      ]
-    );
-    if (vehicle_id) {
-      await client.query("UPDATE vehicles SET statut='louÃ©', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [vehicle_id, companyId]);
-    }
-    if (Number(paid_amount || 0) > 0) {
-      await recordBusinessPayment(client, {
-        companyId,
-        amount: paid_amount,
-        category: "Location vÃ©hicule",
-        sourceType: "vehicle_rental",
-        sourceId: rental.rows[0].id,
-        description: `Paiement location vÃ©hicule ${rental.rows[0].id}`,
-        partnerName: client_name || "",
-        user: req.user,
-        documentType: "ReÃ§u location vÃ©hicule"
-      });
-    }
-    await client.query("COMMIT");
-    res.status(201).json(rental.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR LOCATION VEHICULE :", error);
-    res.status(500).json({ error: error.message || "Erreur location vÃ©hicule" });
-  } finally {
-    client.release();
-  }
-});
-
-app.put("/automobile/rentals/:id/status", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s location vÃ©hicule refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { status } = req.body || {};
-    const result = await pool.query(
-      `UPDATE vehicle_rentals SET status=$1, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2 AND ($3::int IS NULL OR company_id=$3)
-       RETURNING *`,
-      [status || "terminÃ©", req.params.id, companyId]
-    );
-    if (result.rows[0]?.vehicle_id && ["terminÃ©", "termine", "annulÃ©", "annule"].includes(String(status || "").toLowerCase())) {
-      await pool.query("UPDATE vehicles SET statut='disponible', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [result.rows[0].vehicle_id]);
-    }
-    res.json(result.rows[0] || {});
-  } catch (error) {
-    res.status(500).json({ error: "Erreur statut location vÃ©hicule" });
-  }
-});
-
-app.get("/automobile/sales", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s automobile refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req, "s");
-    const result = await pool.query(
-      `SELECT s.*, v.marque, v.modele, v.immatriculation
-       FROM vehicle_sales s
-       LEFT JOIN vehicles v ON v.id=s.vehicle_id
-       ${clause}
-       ORDER BY s.id DESC LIMIT 200`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur ventes vÃ©hicules" });
-  }
-});
-
-app.post("/automobile/sales", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s vente vÃ©hicule refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { vehicle_id, client_name, client_phone, sale_price, amount_paid, payment_plan } = req.body || {};
-    const remaining = Math.max(Number(sale_price || 0) - Number(amount_paid || 0), 0);
-    await client.query("BEGIN");
-    const sale = await client.query(
-      `INSERT INTO vehicle_sales
-       (company_id, vehicle_id, client_name, client_phone, sale_price,
-        amount_paid, remaining_amount, payment_plan, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING *`,
-      [
-        companyId, vehicle_id || null, client_name || "", client_phone || "",
-        Number(sale_price || 0), Number(amount_paid || 0), remaining,
-        payment_plan || "comptant", remaining > 0 ? "partiel" : "payÃ©", req.user.id
-      ]
-    );
-    if (vehicle_id && remaining <= 0) {
-      await client.query("UPDATE vehicles SET statut='vendu', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [vehicle_id, companyId]);
-    }
-    if (Number(amount_paid || 0) > 0) {
-      await recordBusinessPayment(client, {
-        companyId,
-        amount: amount_paid,
-        category: "Vente vÃ©hicule",
-        sourceType: "vehicle_sale",
-        sourceId: sale.rows[0].id,
-        description: `Paiement vente vÃ©hicule ${sale.rows[0].id}`,
-        partnerName: client_name || "",
-        user: req.user,
-        documentType: "ReÃ§u vente vÃ©hicule"
-      });
-    }
-    await client.query("COMMIT");
-    res.status(201).json(sale.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR VENTE VEHICULE :", error);
-    res.status(500).json({ error: error.message || "Erreur vente vÃ©hicule" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/immobilier/dashboard", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s immobilier refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const [propertiesResult, rentals, sales, reservations] = await Promise.all([
-      pool.query(`SELECT COUNT(*)::int AS total,
-                         COUNT(*) FILTER (WHERE status='disponible')::int AS disponibles,
-                         COUNT(*) FILTER (WHERE status='louÃ©' OR status='loue')::int AS loues,
-                         COUNT(*) FILTER (WHERE status='vendu')::int AS vendus
-                  FROM properties ${clause}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total, COALESCE(SUM(paid_amount),0)::numeric AS paid_amount FROM property_rentals ${clause}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total, COALESCE(SUM(amount_paid),0)::numeric AS paid_amount, COALESCE(SUM(remaining_amount),0)::numeric AS remaining_amount FROM property_sales ${clause}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total, COALESCE(SUM(paid_amount),0)::numeric AS paid_amount FROM hotel_reservations ${clause}`, values)
-    ]);
-    res.json({ properties: propertiesResult.rows[0], rentals: rentals.rows[0], sales: sales.rows[0], reservations: reservations.rows[0] });
-  } catch (error) {
-    res.status(500).json({ error: "Erreur dashboard immobilier" });
-  }
-});
-
-app.get("/immobilier/properties", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s immobilier refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const result = await pool.query(`SELECT * FROM properties ${clause} ORDER BY id DESC LIMIT 200`, values);
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur lecture biens" });
-  }
-});
-
-app.post("/immobilier/properties", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s modification immobilier refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const {
-      type, title, description, address, city, neighborhood, surface,
-      rooms_count, beds_count, guests_count, price_sale, price_rent_day,
-      price_rent_month, price_night, status,
-      is_sellable, is_rentable, is_bookable, publish_on_marketplace
-    } = req.body || {};
-    const result = await pool.query(
-      `INSERT INTO properties
-       (company_id, type, title, description, address, city, surface,
-        rooms_count, price_sale, price_rent_day, price_rent_month, status,
-        neighborhood, beds_count, guests_count, price_night,
-        is_sellable, is_rentable, is_bookable, publish_on_marketplace, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-       RETURNING *`,
-      [
-        companyId, type || "maison", title || "", description || "",
-        address || "", city || "", Number(surface || 0), Number(rooms_count || 0),
-        Number(price_sale || 0), Number(price_rent_day || 0),
-        Number(price_rent_month || 0), status || "disponible",
-        neighborhood || "", Number(beds_count || 0), Number(guests_count || 0),
-        Number(price_night || 0), toBooleanFlag(is_sellable, true),
-        toBooleanFlag(is_rentable, false), toBooleanFlag(is_bookable, false),
-        toBooleanFlag(publish_on_marketplace, false), req.user.id
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error("ERREUR CREATION BIEN :", error);
-    res.status(500).json({ error: "Erreur crÃ©ation bien immobilier" });
-  }
-});
-
-app.get("/immobilier/rentals", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s immobilier refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req, "r");
-    const result = await pool.query(
-      `SELECT r.*, p.title, p.type, p.address
-       FROM property_rentals r
-       LEFT JOIN properties p ON p.id=r.property_id
-       ${clause}
-       ORDER BY r.id DESC LIMIT 200`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur locations immobiliÃ¨res" });
-  }
-});
-
-app.post("/immobilier/rentals", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s location immobilier refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { property_id, client_name, client_phone, start_date, end_date, total_amount, deposit_amount, paid_amount } = req.body || {};
-    await client.query("BEGIN");
-    const rental = await client.query(
-      `INSERT INTO property_rentals
-       (company_id, property_id, client_name, client_phone, start_date, end_date,
-        total_amount, deposit_amount, paid_amount, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       RETURNING *`,
-      [
-        companyId, property_id || null, client_name || "", client_phone || "",
-        start_date || null, end_date || null, Number(total_amount || 0),
-        Number(deposit_amount || 0), Number(paid_amount || 0),
-        Number(paid_amount || 0) > 0 ? "actif" : "en_attente", req.user.id
-      ]
-    );
-    if (property_id) {
-      await client.query("UPDATE properties SET status='louÃ©', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [property_id, companyId]);
-    }
-    if (Number(paid_amount || 0) > 0) {
-      await recordBusinessPayment(client, {
-        companyId,
-        amount: paid_amount,
-        category: "Location immobiliÃ¨re",
-        sourceType: "property_rental",
-        sourceId: rental.rows[0].id,
-        description: `Paiement location immobiliÃ¨re ${rental.rows[0].id}`,
-        partnerName: client_name || "",
-        user: req.user,
-        documentType: "ReÃ§u location immobiliÃ¨re"
-      });
-    }
-    await client.query("COMMIT");
-    res.status(201).json(rental.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: error.message || "Erreur location immobiliÃ¨re" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/immobilier/sales", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s immobilier refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req, "s");
-    const result = await pool.query(
-      `SELECT s.*, p.title, p.type, p.address
-       FROM property_sales s
-       LEFT JOIN properties p ON p.id=s.property_id
-       ${clause}
-       ORDER BY s.id DESC LIMIT 200`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur ventes immobiliÃ¨res" });
-  }
-});
-
-app.post("/immobilier/sales", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s vente immobilier refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { property_id, client_name, client_phone, sale_price, amount_paid, payment_plan } = req.body || {};
-    const remaining = Math.max(Number(sale_price || 0) - Number(amount_paid || 0), 0);
-    await client.query("BEGIN");
-    const sale = await client.query(
-      `INSERT INTO property_sales
-       (company_id, property_id, client_name, client_phone, sale_price,
-        amount_paid, remaining_amount, payment_plan, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING *`,
-      [
-        companyId, property_id || null, client_name || "", client_phone || "",
-        Number(sale_price || 0), Number(amount_paid || 0), remaining,
-        payment_plan || "comptant", remaining > 0 ? "partiel" : "payÃ©", req.user.id
-      ]
-    );
-    if (property_id && remaining <= 0) {
-      await client.query("UPDATE properties SET status='vendu', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [property_id, companyId]);
-    }
-    if (Number(amount_paid || 0) > 0) {
-      await recordBusinessPayment(client, {
-        companyId,
-        amount: amount_paid,
-        category: "Vente immobiliÃ¨re",
-        sourceType: "property_sale",
-        sourceId: sale.rows[0].id,
-        description: `Paiement vente immobiliÃ¨re ${sale.rows[0].id}`,
-        partnerName: client_name || "",
-        user: req.user,
-        documentType: "ReÃ§u vente immobiliÃ¨re"
-      });
-    }
-    await client.query("COMMIT");
-    res.status(201).json(sale.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: error.message || "Erreur vente immobiliÃ¨re" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/immobilier/hotel/reservations", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s hÃ´tel refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req, "r");
-    const result = await pool.query(
-      `SELECT r.*, p.title
-       FROM hotel_reservations r
-       LEFT JOIN properties p ON p.id=r.property_id
-       ${clause}
-       ORDER BY r.id DESC LIMIT 200`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur rÃ©servations hÃ´tel" });
-  }
-});
-
-app.post("/immobilier/hotel/reservations", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s rÃ©servation hÃ´tel refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { property_id, room_number, client_name, client_phone, checkin_date, checkout_date, nights, price_per_night, total_amount, paid_amount, status } = req.body || {};
-    await client.query("BEGIN");
-    const reservation = await client.query(
-      `INSERT INTO hotel_reservations
-       (company_id, property_id, room_number, client_name, client_phone,
-        checkin_date, checkout_date, nights, price_per_night, total_amount,
-        paid_amount, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       RETURNING *`,
-      [
-        companyId, property_id || null, room_number || "", client_name || "",
-        client_phone || "", checkin_date || null, checkout_date || null,
-        Number(nights || 1), Number(price_per_night || 0),
-        Number(total_amount || 0), Number(paid_amount || 0),
-        status || "confirmÃ©", req.user.id
-      ]
-    );
-    if (property_id) {
-      await client.query("UPDATE properties SET status='rÃ©servÃ©', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [property_id, companyId]);
-    }
-    if (Number(paid_amount || 0) > 0) {
-      await recordBusinessPayment(client, {
-        companyId,
-        amount: paid_amount,
-        category: "RÃ©servation hÃ´tel",
-        sourceType: "hotel_reservation",
-        sourceId: reservation.rows[0].id,
-        description: `Paiement rÃ©servation hÃ´tel ${reservation.rows[0].id}`,
-        partnerName: client_name || "",
-        user: req.user,
-        documentType: "Facture hÃ´tel"
-      });
-    }
-    await client.query("COMMIT");
-    res.status(201).json(reservation.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: error.message || "Erreur rÃ©servation hÃ´tel" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/restaurant/dashboard", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s restaurant refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const [tables, menu, orders, calls] = await Promise.all([
-      pool.query(`SELECT COUNT(*)::int AS total,
-                         COUNT(*) FILTER (WHERE status='libre')::int AS libres,
-                         COUNT(*) FILTER (WHERE status='occupÃ©e' OR status='occupee')::int AS occupees
-                  FROM restaurant_tables ${clause}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total FROM restaurant_menu_items ${clause}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total,
-                         COALESCE(SUM(total_amount),0)::numeric AS total_amount,
-                         COUNT(*) FILTER (WHERE order_status='prÃ©paration' OR order_status='preparation')::int AS preparation
-                  FROM restaurant_orders ${clause}`, values),
-      pool.query(`SELECT COUNT(*)::int AS total FROM restaurant_call_requests ${clause}`, values)
-    ]);
-    res.json({ tables: tables.rows[0], menu: menu.rows[0], orders: orders.rows[0], calls: calls.rows[0] });
-  } catch (error) {
-    res.status(500).json({ error: "Erreur dashboard restaurant" });
-  }
-});
-
-app.get("/restaurant/tables", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s restaurant refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const result = await pool.query(`SELECT * FROM restaurant_tables ${clause} ORDER BY id DESC LIMIT 200`, values);
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur tables restaurant" });
-  }
-});
-
-app.post("/restaurant/tables", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s modification restaurant refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { table_number, status = "libre" } = req.body || {};
-    const result = await pool.query(
-      `INSERT INTO restaurant_tables (company_id, table_number, qr_code, status, created_by)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING *`,
-      [
-        companyId,
-        table_number || "",
-        `/restaurant/public/${companyId}/table/{{id}}`,
-        status,
-        req.user.id
-      ]
-    );
-    const qrCode = `/restaurant/public/${companyId}/table/${result.rows[0].id}`;
-    const updated = await pool.query("UPDATE restaurant_tables SET qr_code=$1 WHERE id=$2 RETURNING *", [qrCode, result.rows[0].id]);
-    res.status(201).json(updated.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur crÃ©ation table" });
-  }
-});
-
-app.get("/restaurant/menu-items", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s restaurant refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req);
-    const result = await pool.query(`SELECT * FROM restaurant_menu_items ${clause} ORDER BY id DESC LIMIT 200`, values);
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur menu restaurant" });
-  }
-});
-
-app.post("/restaurant/menu-items", authenticateToken, async (req, res) => {
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s modification restaurant refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { product_id, name, description, category, price, image, is_available = true, preparation_time, publish_on_marketplace } = req.body || {};
-    const result = await pool.query(
-      `INSERT INTO restaurant_menu_items
-       (company_id, product_id, name, description, category, price, image,
-        is_available, preparation_time, publish_on_marketplace, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       RETURNING *`,
-      [
-        companyId, product_id || null, name || "", description || "",
-        category || "", Number(price || 0), image || "",
-        toBooleanFlag(is_available ?? true, true), Number(preparation_time || 0),
-        toBooleanFlag(publish_on_marketplace, false), req.user.id
-      ]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur crÃ©ation plat" });
-  }
-});
-
-app.get("/restaurant/orders", authenticateToken, async (req, res) => {
-  try {
-    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s restaurant refusÃ©." });
-    const { clause, values } = getBusinessCompanyScope(req, "o");
-    const result = await pool.query(
-      `SELECT o.*, t.table_number
-       FROM restaurant_orders o
-       LEFT JOIN restaurant_tables t ON t.id=o.table_id
-       ${clause}
-       ORDER BY o.id DESC LIMIT 200`,
-      values
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur commandes restaurant" });
-  }
-});
-
-app.post("/restaurant/orders", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s commande restaurant refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { table_id, customer_name, customer_phone, items = [], payment_status = "pending", order_status = "nouvelle" } = req.body || {};
-    await client.query("BEGIN");
-    let total = 0;
-    const cleanItems = Array.isArray(items) ? items : [];
-    for (const item of cleanItems) {
-      total += Number(item.quantity || 1) * Number(item.unit_price || item.price || 0);
-    }
-    const order = await client.query(
-      `INSERT INTO restaurant_orders
-       (company_id, table_id, customer_name, customer_phone, total_amount,
-        payment_status, order_status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING *`,
-      [companyId, table_id || null, customer_name || "", customer_phone || "", total, payment_status, order_status, req.user.id]
-    );
-    for (const item of cleanItems) {
-      const qty = Number(item.quantity || 1);
-      const unitPrice = Number(item.unit_price || item.price || 0);
-      await client.query(
-        `INSERT INTO restaurant_order_items
-         (order_id, menu_item_id, quantity, unit_price, total_price, notes)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [order.rows[0].id, item.menu_item_id || item.id || null, qty, unitPrice, qty * unitPrice, item.notes || ""]
-      );
-    }
-    if (table_id) {
-      await client.query("UPDATE restaurant_tables SET status='occupÃ©e', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [table_id, companyId]);
-    }
-    await createNotification({
-      title: "Nouvelle commande restaurant",
-      message: `Commande table ${table_id || "-"} reÃ§ue.`,
-      type: "restaurant_order",
-      company_id: companyId,
-      related_entity_type: "restaurant_order",
-      related_entity_id: order.rows[0].id,
-      action_url: "/restaurant/commandes",
-      created_by: req.user.id
-    });
-    await client.query("COMMIT");
-    res.status(201).json(order.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("ERREUR COMMANDE RESTAURANT :", error);
-    res.status(500).json({ error: error.message || "Erreur commande restaurant" });
-  } finally {
-    client.release();
-  }
-});
-
-app.put("/restaurant/orders/:id/status", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "AccÃ¨s commande restaurant refusÃ©." });
-    const companyId = getEffectiveCompanyId(req);
-    const { order_status, payment_status } = req.body || {};
-    await client.query("BEGIN");
-    const result = await client.query(
-      `UPDATE restaurant_orders
-       SET order_status=COALESCE($1,order_status),
-           payment_status=COALESCE($2,payment_status),
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$3 AND company_id=$4
-       RETURNING *`,
-      [order_status || null, payment_status || null, req.params.id, companyId]
-    );
-    if (!result.rows[0]) throw new Error("Commande restaurant introuvable.");
-    if (["paid", "payÃ©", "paye"].includes(String(payment_status || "").toLowerCase())) {
-      await recordBusinessPayment(client, {
-        companyId,
-        amount: result.rows[0].total_amount,
-        category: "Restaurant",
-        sourceType: "restaurant_order",
-        sourceId: result.rows[0].id,
-        description: `Paiement commande restaurant ${result.rows[0].id}`,
-        partnerName: result.rows[0].customer_name || "",
-        user: req.user,
-        documentType: "Ticket restaurant"
-      });
-    }
-    await client.query("COMMIT");
-    res.json(result.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: error.message || "Erreur statut commande restaurant" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/restaurant/public/:companyId/table/:tableId", async (req, res) => {
-  try {
-    const companyId = Number(req.params.companyId);
-    const tableId = Number(req.params.tableId);
-    const [table, menu] = await Promise.all([
-      pool.query("SELECT id, table_number, status FROM restaurant_tables WHERE id=$1 AND company_id=$2", [tableId, companyId]),
-      pool.query("SELECT id, name, description, category, price, image, preparation_time FROM restaurant_menu_items WHERE company_id=$1 AND is_available=true ORDER BY category ASC, name ASC", [companyId])
-    ]);
-    if (!table.rows[0]) return res.status(404).json({ error: "Table introuvable" });
-    res.json({ table: table.rows[0], menu: menu.rows });
-  } catch (error) {
-    res.status(500).json({ error: "Erreur menu public restaurant" });
-  }
-});
-
-app.post("/restaurant/public/:companyId/table/:tableId/orders", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const companyId = Number(req.params.companyId);
-    const tableId = Number(req.params.tableId);
-    const { customer_name, customer_phone, items = [] } = req.body || {};
-    const cleanItems = Array.isArray(items) ? items : [];
-    if (cleanItems.length === 0) return res.status(400).json({ error: "Panier vide." });
-    await client.query("BEGIN");
-    let total = 0;
-    const itemRows = [];
-    for (const item of cleanItems) {
-      const menuItem = await client.query(
-        "SELECT * FROM restaurant_menu_items WHERE id=$1 AND company_id=$2 AND is_available=true",
-        [item.menu_item_id || item.id, companyId]
-      );
-      if (!menuItem.rows[0]) throw new Error("Plat introuvable.");
-      const qty = Number(item.quantity || 1);
-      const unitPrice = Number(menuItem.rows[0].price || 0);
-      total += qty * unitPrice;
-      itemRows.push({ id: menuItem.rows[0].id, quantity: qty, unit_price: unitPrice, notes: item.notes || "" });
-    }
-    const order = await client.query(
-      `INSERT INTO restaurant_orders
-       (company_id, table_id, customer_name, customer_phone, total_amount,
-        payment_status, order_status)
-       VALUES ($1,$2,$3,$4,$5,'pending','nouvelle')
-       RETURNING *`,
-      [companyId, tableId, customer_name || "", customer_phone || "", total]
-    );
-    for (const item of itemRows) {
-      await client.query(
-        `INSERT INTO restaurant_order_items
-         (order_id, menu_item_id, quantity, unit_price, total_price, notes)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [order.rows[0].id, item.id, item.quantity, item.unit_price, item.quantity * item.unit_price, item.notes]
-      );
-    }
-    await client.query("UPDATE restaurant_tables SET status='occupÃ©e', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [tableId, companyId]);
-    await createNotification({
-      title: "Nouvelle commande QR table",
-      message: `Commande publique table ${tableId} reÃ§ue.`,
-      type: "restaurant_order",
-      company_id: companyId,
-      related_entity_type: "restaurant_order",
-      related_entity_id: order.rows[0].id,
-      action_url: "/restaurant/commandes"
-    });
-    await client.query("COMMIT");
-    res.status(201).json(order.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    res.status(500).json({ error: error.message || "Erreur commande publique restaurant" });
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/restaurant/public/:companyId/table/:tableId/call", async (req, res) => {
-  try {
-    const { message = "Appel serveur" } = req.body || {};
-    const result = await pool.query(
-      `INSERT INTO restaurant_call_requests (company_id, table_id, message)
-       VALUES ($1,$2,$3)
-       RETURNING *`,
-      [Number(req.params.companyId), Number(req.params.tableId), message]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: "Erreur appel serveur" });
-  }
-});
-
-/* HISTORIQUE INVENTAIRE SAAS */
-app.get("/inventory-history", authenticateToken, async (req, res) => {
-  try {
-    const { companyId, shouldFilterByCompany } = getCompanyFilter(req);
-
-    let query = `
-      SELECT * FROM inventory_history
-    `;
-
-    let values = [];
-
-    if (shouldFilterByCompany) {
-      query += ` WHERE company_id = $1 `;
-      values.push(companyId);
-    }
-
-    query += ` ORDER BY id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur historique inventaire SaaS"
-    });
-  }
-});
-
-/* ENTREPÃ”TS SAAS JWT */
-app.get("/warehouses", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = `
-      SELECT * FROM warehouses
-    `;
-
-    let values = [];
-
-    if (!isSuperAdmin) {
-      query += ` WHERE company_id = $1 `;
-      values.push(companyId);
-    }
-
-    /* Un bureau ou un siÃ¨ge crÃ©Ã© pour y rattacher des camÃ©ras n'est pas un
-       lieu de stock : il n'apparaÃ®t pas dans les listes du stock, sauf
-       demande explicite (?tous=1). */
-    if (req.query.tous !== "1") {
-      query += values.length ? ` AND ` : ` WHERE `;
-      query += ` COALESCE(is_stock_visible, TRUE) = TRUE `;
-    }
-
-    query += ` ORDER BY id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur lecture entrepÃ´ts SaaS"
-    });
-  }
-});
-
-app.post("/warehouses", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    if (!isSuperAdmin) {
-      const limits = await getCompanyPlanLimits(companyId);
-
-      const countResult = await pool.query(
-        "SELECT COUNT(*) FROM warehouses WHERE company_id = $1",
-        [companyId]
-      );
-
-      const currentWarehouses = Number(countResult.rows[0].count);
-      const maxWarehouses = Number(limits?.max_warehouses || 0);
-
-      if (maxWarehouses > 0 && currentWarehouses >= maxWarehouses) {
-        return res.status(403).json({
-          error:
-            "Limite entrepÃ´ts atteinte pour votre formule. Veuillez passer Ã  une formule supÃ©rieure."
-        });
-      }
-    }
-
-    const { code, name, location, manager, racks_count, status } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO warehouses
-      (
-        code,
-        name,
-        location,
-        manager,
-        racks_count,
-        status,
-        company_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *`,
-      [
-        code,
-        name,
-        location || "",
-        manager || "",
-        Number(racks_count || 0),
-        status || "Actif",
-        companyId
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur ajout entrepÃ´t"
-    });
-  }
-});
-
-app.put("/warehouses/:id", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const { id } = req.params;
-    const { code, name, location, manager, racks_count, status } = req.body;
-
-    let query = `
-      UPDATE warehouses
-      SET code=$1, name=$2, location=$3, manager=$4, racks_count=$5, status=$6
-      WHERE id=$7
-    `;
-
-    const values = [
-      code,
-      name,
-      location || "",
-      manager || "",
-      Number(racks_count || 0),
-      status || "Actif",
-      id
-    ];
-
-    if (!isSuperAdmin) {
-      query += ` AND company_id=$8`;
-      values.push(companyId);
-    }
-
-    query += ` RETURNING *`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur modification entrepÃ´t" });
-  }
-});
-
-app.delete("/warehouses/:id", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = "DELETE FROM warehouses WHERE id=$1";
-    const values = [req.params.id];
-
-    if (!isSuperAdmin) {
-      query += " AND company_id=$2";
-      values.push(companyId);
-    }
-
-    query += " RETURNING *";
-
-    const result = await pool.query(query, values);
-
-    res.json({
-      message: "EntrepÃ´t supprimÃ©",
-      warehouse: result.rows[0]
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur suppression entrepÃ´t" });
-  }
-});
-/* EMPLACEMENTS */
-app.get("/locations", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const result = await pool.query(
-      `SELECT
-        locations.*,
-        warehouses.name AS warehouse_name,
-        COALESCE(locations.product_reference, products.reference, '') AS product_reference,
-        COALESCE(locations.product_name, products.name, '') AS product_name
-       FROM locations
-       LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
-       LEFT JOIN products ON locations.product_id = products.id
-       ${isSuperAdmin ? "" : "WHERE locations.company_id=$1"}
-       ORDER BY locations.id DESC`
-      , isSuperAdmin ? [] : [companyId]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture emplacements" });
-  }
-});
-
-app.post("/locations", authenticateToken, async (req, res) => {
-  try {
-    const {
-      warehouse_id,
-      zone,
-      rayon,
-      etagere,
-      status,
-      product_id,
-      product_reference,
-      product_name,
-      rayon_code,
-      case_code,
-      level_code,
-      bin_code,
-      bin_mode,
-      bin_group,
-      company_id
-    } = req.body;
-
-    const warehouseResult = await pool.query(
-      "SELECT * FROM warehouses WHERE id=$1",
-      [warehouse_id]
-    );
-
-    const warehouse = warehouseResult.rows[0];
-
-    if (!warehouse)
-      return res.status(404).json({ error: "EntrepÃ´t introuvable" });
-
-    const emplacement_code = `${warehouse.code}-${zone}-${rayon}-${etagere}`;
-    const qr_code = await QRCode.toDataURL(emplacement_code);
-
-    const result = await pool.query(
-      `INSERT INTO locations
-      (
-        warehouse_id,
-        warehouse_code,
-        zone,
-        rayon,
-        etagere,
-        emplacement_code,
-        qr_code,
-        status,
-        product_id,
-        product_reference,
-        product_name,
-        rayon_code,
-        case_code,
-        level_code,
-        bin_code,
-        bin_mode,
-        bin_group,
-        company_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-      RETURNING *`,
-      [
-        warehouse_id,
-        warehouse.code,
-        zone,
-        rayon,
-        etagere,
-        emplacement_code,
-        qr_code,
-        status || "Disponible",
-        product_id || null,
-        product_reference || "",
-        product_name || "",
-        rayon_code || zone || "",
-        case_code || rayon || "",
-        level_code || etagere || "",
-        bin_code || "",
-        bin_mode || "single",
-        bin_group || "",
-        company_id || req.user.company_id || warehouse.company_id || null
-      ]
-    );
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "CrÃ©ation emplacement",
-      "Emplacements",
-      `Emplacement crÃ©Ã© : ${emplacement_code}`
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur ajout emplacement" });
-  }
-});
-
-app.delete("/locations/:id", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const values = [req.params.id];
-    let query = "DELETE FROM locations WHERE id=$1";
-
-    if (!isSuperAdmin) {
-      values.push(companyId);
-      query += " AND company_id=$2";
-    }
-
-    await pool.query(query, values);
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Suppression emplacement",
-      "Emplacements",
-      `Emplacement supprimÃ© ID : ${req.params.id}`
-    );
-
-    res.json({ message: "Emplacement supprimÃ©" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur suppression emplacement" });
-  }
-});
-
-app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-    let code = decodeURIComponent(req.params.code || "").trim();
-
-    try {
-      const parsedUrl = new URL(code);
-      const productMatch = parsedUrl.pathname.match(/\/scan\/product\/([^/]+)/);
-      code = parsedUrl.searchParams.get("location") || (productMatch ? productMatch[1] : code);
-      code = decodeURIComponent(code);
-    } catch {}
-
-    code = code.replace(/^Ref\s+/i, "").trim();
-    const normalizedCode = normalizeProductLookupCode(code);
-
-    const values = isSuperAdmin ? [code] : [code, companyId];
-
-    const locationResult = await pool.query(
-      `SELECT locations.*, warehouses.name AS warehouse_name
-       FROM locations
-       LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
-       WHERE locations.emplacement_code=$1 ${
-         isSuperAdmin ? "" : "AND locations.company_id=$2"
-       }
-       LIMIT 1`,
-      values
-    );
-
-    if (locationResult.rows.length > 0) {
-      const location = locationResult.rows[0];
-
-      const productsResult = await pool.query(
-        `SELECT *
-         FROM products
-         WHERE (
-           location_id=$1
-           OR location_code=$2
-           OR reference=$3
-         )
-         ${isSuperAdmin ? "" : "AND company_id=$4"}
-         ORDER BY id DESC`,
-        isSuperAdmin
-          ? [location.id, location.emplacement_code, location.product_reference || ""]
-          : [
-              location.id,
-              location.emplacement_code,
-              location.product_reference || "",
-              companyId
-            ]
-      );
-
-      const movementsResult = await pool.query(
-        `SELECT *
-         FROM stock_movements
-         WHERE (
-           location_code=$1
-           OR reason ILIKE $2
-           OR product_reference = ANY($3::text[])
-         )
-         ${isSuperAdmin ? "" : "AND company_id=$4"}
-         ORDER BY id DESC
-         LIMIT 20`,
-        isSuperAdmin
-          ? [
-              location.emplacement_code,
-              `%${location.emplacement_code}%`,
-              productsResult.rows.map((product) => product.reference)
-            ]
-          : [
-              location.emplacement_code,
-              `%${location.emplacement_code}%`,
-              productsResult.rows.map((product) => product.reference),
-              companyId
-            ]
-      );
-
-      return res.json({
-        type: "location",
-        code,
-        location,
-        products: productsResult.rows,
-        movements: movementsResult.rows,
-        alerts: productsResult.rows
-          .filter(
-            (product) =>
-              Number(product.stock || 0) <= Number(product.minimum_stock || 0)
-          )
-          .map((product) => ({
-            product_reference: product.reference,
-            product_name: product.name,
-            stock: product.stock,
-            minimum_stock: product.minimum_stock,
-            type: Number(product.stock || 0) <= 0 ? "out_of_stock" : "low_stock"
-          }))
-      });
-    }
-
-    const productValues = isSuperAdmin ? [code, normalizedCode] : [code, normalizedCode, companyId];
-    const productResult = await pool.query(
-      `SELECT products.*, locations.emplacement_code, locations.rayon_code,
-              locations.case_code, locations.level_code, locations.bin_code,
-              locations.bin_mode, locations.warehouse_code
-       FROM products
-       LEFT JOIN locations ON products.location_id = locations.id
-       WHERE (
-         products.reference ILIKE $1
-         OR products.barcode ILIKE $1
-         OR products.sku ILIKE $1
-         OR products.qr_code ILIKE $1
-         OR regexp_replace(lower(regexp_replace(COALESCE(products.reference,''), '^ref\\s*[-_]*\\s*', '', 'i')), '[^a-z0-9]', '', 'g') = $2
-         OR regexp_replace(lower(COALESCE(products.barcode,'')), '[^a-z0-9]', '', 'g') = $2
-         OR regexp_replace(lower(COALESCE(products.sku,'')), '[^a-z0-9]', '', 'g') = $2
-         OR regexp_replace(lower(COALESCE(products.qr_code,'')), '[^a-z0-9]', '', 'g') = $2
-       )
-       ${isSuperAdmin ? "" : "AND products.company_id=$3"}
-       LIMIT 1`,
-      productValues
-    );
-
-    if (productResult.rows.length > 0) {
-      const product = productResult.rows[0];
-      const batchesResult = await pool.query(
-        `SELECT *
-         FROM product_batches
-         WHERE product_id=$1
-         ${isSuperAdmin ? "" : "AND company_id=$2"}
-         ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
-         LIMIT 20`,
-        isSuperAdmin ? [product.id] : [product.id, companyId]
-      );
-      const movementsResult = await pool.query(
-        `SELECT *
-         FROM stock_movements
-         WHERE product_reference=$1
-         ${isSuperAdmin ? "" : "AND company_id=$2"}
-         ORDER BY id DESC
-         LIMIT 20`,
-        isSuperAdmin ? [product.reference] : [product.reference, companyId]
-      );
-
-      return res.json({
-        type: "product",
-        code,
-        product: {
-          ...product,
-          qr_url: productQrUrl(req, product),
-          effective_sale_price: getEffectivePosPrice(product)
-        },
-        batches: batchesResult.rows,
-        movements: movementsResult.rows,
-        alerts:
-          Number(product.stock || 0) <= Number(product.minimum_stock || 0)
-            ? [
-                {
-                  product_reference: product.reference,
-                  product_name: product.name,
-                  stock: product.stock,
-                  minimum_stock: product.minimum_stock,
-                  type:
-                    Number(product.stock || 0) <= 0
-                      ? "out_of_stock"
-                      : "low_stock"
-                }
-              ]
-            : []
-      });
-    }
-
-    const userResult = await pool.query(
-      `SELECT id, fullname, email, role, badge_code, company_id
-       FROM users
-       WHERE (badge_code=$1 OR CAST(id AS TEXT)=$1)
-       ${isSuperAdmin ? "" : "AND company_id=$2"}
-       LIMIT 1`,
-      values
-    );
-
-    if (userResult.rows.length > 0) {
-      const employee = userResult.rows[0];
-      const todayResult = await pool.query(
-        `SELECT *
-         FROM attendance_records
-         WHERE user_id=$1 AND work_date=CURRENT_DATE
-         LIMIT 1`,
-        [employee.id]
-      );
-      const historyResult = await pool.query(
-        `SELECT *
-         FROM attendance_history
-         WHERE user_id=$1
-         ORDER BY id DESC
-         LIMIT 10`,
-        [employee.id]
-      );
-
-      return res.json({
-        type: "employee",
-        code,
-        employee,
-        today: todayResult.rows[0] || null,
-        history: historyResult.rows
-      });
-    }
-
-    res.status(404).json({
-      error: "QR code introuvable",
-      code
-    });
-  } catch (error) {
-    console.error("ERREUR RESOLUTION SCAN :", error);
-    res.status(500).json({ error: "Erreur rÃ©solution QR code" });
-  }
-});
-
-/* ACTIVITÃ‰S */
-app.get("/activities", authenticateToken, async (req, res) => {
-  try {
-    const companyId = getEffectiveCompanyId(req);
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const hasCompanyColumn = await columnExists("user_activities", "company_id");
-    const shouldFilterByCompany = hasCompanyColumn && (!isSuperAdmin || Boolean(companyId));
-    const result = await pool.query(
-      `SELECT * FROM user_activities
-       ${shouldFilterByCompany ? "WHERE company_id=$1" : ""}
-       ORDER BY id DESC`,
-      shouldFilterByCompany ? [companyId] : []
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture activitÃ©s" });
-  }
-});
-
-/* ALERTES */
-app.get("/alerts", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const stockFaible = await pool.query(
-      `SELECT reference, name, stock, minimum_stock, warehouse, location_code
-       FROM products
-       WHERE stock > 0 AND stock <= minimum_stock
-       ${isSuperAdmin ? "" : "AND company_id=$1"}
-       ORDER BY stock ASC`
-      , isSuperAdmin ? [] : [companyId]
-    );
-
-    const rupture = await pool.query(
-      `SELECT reference, name, stock, minimum_stock, warehouse, location_code
-       FROM products
-       WHERE stock <= 0
-       ${isSuperAdmin ? "" : "AND company_id=$1"}
-       ORDER BY name ASC`
-      , isSuperAdmin ? [] : [companyId]
-    );
-
-    const validations = await pool.query(
-      `SELECT id, type, product_reference, product_name, quantity, status,
-              location_code, source_warehouse, destination_warehouse, created_at
-       FROM stock_movements
-       WHERE status = 'En attente'
-       ${isSuperAdmin ? "" : "AND company_id=$1"}
-       ORDER BY id DESC`
-      , isSuperAdmin ? [] : [companyId]
-    );
-
-    const refuses = await pool.query(
-      `SELECT id, type, product_reference, product_name, quantity, status,
-              location_code, source_warehouse, destination_warehouse, created_at
-       FROM stock_movements
-       WHERE status = 'RefusÃ©'
-       ${isSuperAdmin ? "" : "AND company_id=$1"}
-       ORDER BY id DESC`
-      , isSuperAdmin ? [] : [companyId]
-    );
-
-    res.json({
-      stock_faible: stockFaible.rows,
-      rupture_stock: rupture.rows,
-      validations_en_attente: validations.rows,
-      mouvements_refuses: refuses.rows,
-      totals: {
-        stock_faible: stockFaible.rows.length,
-        rupture_stock: rupture.rows.length,
-        validations_en_attente: validations.rows.length,
-        mouvements_refuses: refuses.rows.length
-      }
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture alertes" });
-  }
-});
-
-function normalizeSearchText(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\s+/g, "");
-}
-
-function searchableColumn(column) {
-  return `(
-    COALESCE(${column}::text,'') ILIKE $1
-    OR regexp_replace(
-      translate(lower(COALESCE(${column}::text,'')),
-        'Ã Ã¡Ã¢Ã£Ã¤Ã¥Ã¨Ã©ÃªÃ«Ã¬Ã­Ã®Ã¯Ã²Ã³Ã´ÃµÃ¶Ã¹ÃºÃ»Ã¼Ã§Ã±',
-        'aaaaaaeeeeiiiiooooouuuucn'
-      ),
-      '\\s+', '', 'g'
-    ) LIKE $2
-  )`;
-}
-
-async function handleGlobalSearch(req, res) {
-  try {
-    const q = req.query.q;
-
-    if (!q || String(q).trim() === "") {
-      return res.json({
-        products: [],
-        stockMovements: [],
-        movements: [],
-        inventories: [],
-        documents: [],
-        sales: [],
-        receipts: [],
-        partners: [],
-        users: [],
-        locations: [],
-        totals: {
-          products: 0,
-          stockMovements: 0,
-          movements: 0,
-          inventories: 0,
-          documents: 0,
-          sales: 0,
-          receipts: 0,
-          partners: 0,
-          users: 0,
-          locations: 0
-        }
-      });
-    }
-
-    const search = `%${String(q).trim()}%`;
-    const compactSearch = `%${normalizeSearchText(q)}%`;
-    const companyId = req.user?.company_id || null;
-    const isSuperAdmin = req.user?.is_super_admin === true || normalizeRole(req.user?.role) === "super_admin";
-    const values = [search, compactSearch];
-    const companyValues = isSuperAdmin ? values : [...values, companyId];
-    const productCompanyClause = isSuperAdmin ? "" : "AND products.company_id=$3";
-    const movementCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
-    const inventoryCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
-    const documentCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
-    const locationCompanyClause = isSuperAdmin ? "" : "AND locations.company_id=$3";
-    const salesCompanyClause = isSuperAdmin ? "" : "AND s.company_id=$3";
-    const receiptsCompanyClause = isSuperAdmin ? "" : "AND r.company_id=$3";
-    const partnersCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
-
-    const products = await pool.query(
-      `SELECT products.*, locations.emplacement_code
-       FROM products
-       LEFT JOIN locations ON products.location_id = locations.id
-       WHERE (
-          ${searchableColumn("products.reference")}
-          OR ${searchableColumn("products.name")}
-          OR ${searchableColumn("products.category")}
-          OR ${searchableColumn("products.warehouse")}
-          OR ${searchableColumn("products.location_code")}
-          OR ${searchableColumn("products.barcode")}
-          OR ${searchableColumn("products.sku")}
-          OR ${searchableColumn("products.qr_code")}
-          OR ${searchableColumn("locations.emplacement_code")}
-       )
-       ${productCompanyClause}
-       ORDER BY products.id DESC`,
-      companyValues
-    );
-
-    const stockMovements = await pool.query(
-      `SELECT *
-       FROM stock_movements
-       WHERE (
-          ${searchableColumn("product_reference")}
-          OR ${searchableColumn("product_name")}
-          OR ${searchableColumn("type")}
-          OR ${searchableColumn("source_warehouse")}
-          OR ${searchableColumn("destination_warehouse")}
-          OR ${searchableColumn("reason")}
-          OR ${searchableColumn("status")}
-          OR ${searchableColumn("created_by_name")}
-          OR ${searchableColumn("location_code")}
-       )
-       ${movementCompanyClause}
-       ORDER BY id DESC`,
-      companyValues
-    );
-
-    const inventories = await pool.query(
-      `SELECT *
-       FROM inventory_history
-       WHERE (
-          ${searchableColumn("product_reference")}
-          OR ${searchableColumn("product_name")}
-          OR ${searchableColumn("warehouse")}
-          OR ${searchableColumn("location_code")}
-          OR ${searchableColumn("user_name")}
-          OR ${searchableColumn("status")}
-          OR ${searchableColumn("observation")}
-       )
-       ${inventoryCompanyClause}
-       ORDER BY id DESC`,
-      companyValues
-    );
-
-    const documents = canAccessDirectionModule(req.user)
-      ? await pool.query(
-          `SELECT *
-           FROM documents
-           WHERE (
-              ${searchableColumn("document_type")}
-              OR ${searchableColumn("document_number")}
-              OR ${searchableColumn("client_name")}
-              OR ${searchableColumn("client_phone")}
-              OR ${searchableColumn("client_address")}
-              OR ${searchableColumn("observation")}
-              OR ${searchableColumn("created_by")}
-           )
-           ${documentCompanyClause}
-           ORDER BY id DESC`,
-          companyValues
-        )
-      : { rows: [] };
-
-    const locations = await pool.query(
-      `SELECT locations.*, warehouses.name AS warehouse_name
-       FROM locations
-       LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
-       WHERE (
-          ${searchableColumn("locations.emplacement_code")}
-          OR ${searchableColumn("locations.warehouse_code")}
-          OR ${searchableColumn("locations.zone")}
-          OR ${searchableColumn("locations.rayon")}
-          OR ${searchableColumn("locations.etagere")}
-          OR ${searchableColumn("locations.rayon_code")}
-          OR ${searchableColumn("locations.case_code")}
-          OR ${searchableColumn("locations.level_code")}
-          OR ${searchableColumn("locations.bin_code")}
-          OR ${searchableColumn("locations.product_reference")}
-          OR ${searchableColumn("locations.product_name")}
-          OR ${searchableColumn("warehouses.name")}
-       )
-       ${locationCompanyClause}
-       ORDER BY locations.id DESC`,
-      companyValues
-    );
-
-    const sales = await pool.query(
-      `SELECT s.*
-       FROM sales s
-       LEFT JOIN sale_items si ON si.sale_id=s.id
-       WHERE (
-          ${searchableColumn("s.sale_number")}
-          OR ${searchableColumn("s.customer_name")}
-          OR ${searchableColumn("s.customer_phone")}
-          OR ${searchableColumn("s.payment_method")}
-          OR ${searchableColumn("s.payment_status")}
-          OR ${searchableColumn("s.status")}
-          OR ${searchableColumn("s.created_by_name")}
-          OR ${searchableColumn("si.product_reference")}
-          OR ${searchableColumn("si.product_name")}
-          OR ${searchableColumn("si.barcode")}
-          OR ${searchableColumn("si.lot_number")}
-       )
-       ${salesCompanyClause}
-       GROUP BY s.id
-       ORDER BY s.id DESC`,
-      companyValues
-    );
-
-    const receipts = await pool.query(
-      `SELECT r.*
-       FROM receipts r
-       WHERE (
-          ${searchableColumn("r.receipt_number")}
-          OR ${searchableColumn("r.payment_method")}
-          OR ${searchableColumn("r.payment_status")}
-          OR ${searchableColumn("r.status")}
-          OR ${searchableColumn("r.receipt_data")}
-       )
-       ${receiptsCompanyClause}
-       ORDER BY r.id DESC`,
-      companyValues
-    );
-
-    const partners = await pool.query(
-      `SELECT *
-       FROM partners
-       WHERE (
-          ${searchableColumn("type")}
-          OR ${searchableColumn("name")}
-          OR ${searchableColumn("phone")}
-          OR ${searchableColumn("email")}
-          OR ${searchableColumn("address")}
-          OR ${searchableColumn("city")}
-          OR ${searchableColumn("contact_person")}
-          OR ${searchableColumn("nif")}
-          OR ${searchableColumn("rccm")}
-       )
-       ${partnersCompanyClause}
-       ORDER BY id DESC`,
-      companyValues
-    );
-
-    const users = canAccessAdminSettings(req.user)
-      ? await pool.query(
-          `SELECT id, fullname, email, role, company_id, warehouse_id, is_active, created_at
-           FROM users
-           WHERE (
-              ${searchableColumn("fullname")}
-              OR ${searchableColumn("email")}
-              OR ${searchableColumn("role")}
-              OR ${searchableColumn("badge_code")}
-           )
-           ${isSuperAdmin ? "" : "AND company_id=$3"}
-           ORDER BY id DESC`,
-          companyValues
-        )
-      : { rows: [] };
-
-    res.json({
-      products: products.rows,
-      stockMovements: stockMovements.rows,
-      movements: stockMovements.rows,
-      inventories: inventories.rows,
-      documents: documents.rows,
-      sales: sales.rows,
-      receipts: receipts.rows,
-      partners: partners.rows,
-      users: users.rows,
-      locations: locations.rows,
-      totals: {
-        products: products.rows.length,
-        stockMovements: stockMovements.rows.length,
-        movements: stockMovements.rows.length,
-        inventories: inventories.rows.length,
-        documents: documents.rows.length,
-        sales: sales.rows.length,
-        receipts: receipts.rows.length,
-        partners: partners.rows.length,
-        users: users.rows.length,
-        locations: locations.rows.length
-      }
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur recherche globale"
-    });
-  }
-}
-
-/* RECHERCHE GLOBALE INTELLIGENTE */
-app.get("/global-search", authenticateToken, handleGlobalSearch);
-app.get("/search", authenticateToken, handleGlobalSearch);
-
-/* CHAT INTERNE & NOTIFICATIONS */
-
-/* CONVERSATIONS SAAS */
-app.get("/chat/conversations/:userId", authenticateToken, async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = `
-      SELECT c.*
-      FROM conversations c
-      INNER JOIN conversation_participants cp
-      ON c.id = cp.conversation_id
-      WHERE cp.user_id = $1
-    `;
-
-    let values = [userId];
-
-    if (!isSuperAdmin) {
-      query += ` AND c.company_id = $2 `;
-      values.push(companyId);
-    }
-
-    query += ` ORDER BY c.id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur conversations SaaS"
-    });
-  }
-});
-
-app.post("/chat/conversations", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-
-    const { title, type, created_by, participants } = req.body;
-
-    const existingConversation = await pool.query(
-      `
-  SELECT c.*
-  FROM conversations c
-  INNER JOIN conversation_participants cp1
-    ON c.id = cp1.conversation_id
-  INNER JOIN conversation_participants cp2
-    ON c.id = cp2.conversation_id
-  WHERE cp1.user_id = $1
-    AND cp2.user_id = $2
-    AND c.type = 'private'
-  LIMIT 1
-  `,
-      [created_by, participants[1]]
-    );
-
-    if (existingConversation.rows.length > 0) {
-      return res.json(existingConversation.rows[0]);
-    }
-
-    const conversationResult = await pool.query(
-      `INSERT INTO conversations
-       (title, type, created_by, company_id)
-       VALUES ($1,$2,$3,$4)
-       RETURNING *`,
-      [title, type || "private", created_by, companyId]
-    );
-
-    const conversation = conversationResult.rows[0];
-
-    for (const userId of participants || []) {
-      await pool.query(
-        `INSERT INTO conversation_participants
-         (conversation_id, user_id)
-         VALUES ($1,$2)`,
-        [conversation.id, userId]
-      );
-    }
-
-    res.status(201).json(conversation);
-  } catch (error) {
-    console.error("ERREUR CREATION CONVERSATION :", error);
-    res.status(500).json({
-      error: "Erreur crÃ©ation conversation"
-    });
-  }
-});
-
-/* MESSAGES SAAS */
-app.get(
-  "/chat/messages/:conversationId",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const { conversationId } = req.params;
-
-      const companyId = req.user.company_id;
-      const isSuperAdmin = req.user.is_super_admin === true;
-
-      let query = `
-      SELECT 
-        m.*, 
-        u.fullname AS sender_name, 
-        u.role AS sender_role, 
-        u.profile_image_url
-      FROM messages m
-      LEFT JOIN users u ON m.sender_id = u.id
-      WHERE m.conversation_id = $1
-    `;
-
-      let values = [conversationId];
-
-      if (!isSuperAdmin) {
-        query += ` AND m.company_id = $2 `;
-        values.push(companyId);
-      }
-
-      query += ` ORDER BY m.id ASC`;
-
-      const result = await pool.query(query, values);
-
-      res.json(result.rows);
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({
-        error: "Erreur lecture messages SaaS"
-      });
-    }
-  }
-);
-
-app.post("/chat/messages", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-
-    const {
-      conversation_id,
-      sender_id,
-      receiver_id,
-      content,
-      message_type,
-      audio_url
-    } = req.body;
-
-    const messageResult = await pool.query(
-      `INSERT INTO messages
-       (
-        conversation_id,
-        sender_id,
-        receiver_id,
-        content,
-        message_type,
-        audio_url,
-        company_id
-       )
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING *`,
-      [
-        conversation_id,
-        sender_id,
-        receiver_id || null,
-        content || "",
-        message_type || "text",
-        audio_url || "",
-        companyId
-      ]
-    );
-
-    const message = messageResult.rows[0];
-
-    if (receiver_id) {
-      await pool.query(
-        `INSERT INTO notifications
-         (user_id, title, message, type, company_id, related_entity_type,
-          related_entity_id, action_url, created_by, assigned_to)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [
-          receiver_id,
-          message_type === "audio" ? "Nouveau vocal" : "Nouveau message",
-          message_type === "audio"
-            ? "Vous avez reÃ§u un message vocal."
-            : "Vous avez reÃ§u un nouveau message interne.",
-          message_type === "audio" ? "chat_audio" : "chat_message",
-          companyId,
-          "conversation",
-          conversation_id,
-          `/chat?conversation=${conversation_id}`,
-          sender_id,
-          receiver_id
-        ]
-      );
-    }
-
-    res.status(201).json(message);
-  } catch (error) {
-    console.error("ERREUR ENVOI MESSAGE :", error);
-    res.status(500).json({
-      error: "Erreur envoi message"
-    });
-  }
-});
-
-app.put("/chat/messages/:id/read", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = `
-      UPDATE messages
-      SET is_read = true
-      WHERE id = $1
-    `;
-
-    let values = [req.params.id];
-
-    if (!isSuperAdmin) {
-      query += ` AND company_id = $2 `;
-      values.push(companyId);
-    }
-
-    query += ` RETURNING *`;
-
-    const updated = await pool.query(query, values);
-
-    res.json(updated.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur lecture message"
-    });
-  }
-});
-
-app.get("/notifications/:userId", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const requestedUserId = Number(req.params.userId);
-
-    if (!isSuperAdmin && requestedUserId !== Number(req.user.id)) {
-      return res.status(403).json({
-        error: "AccÃ¨s refusÃ© aux notifications d'un autre utilisateur."
-      });
-    }
-
-    let query = `
-      SELECT *
-      FROM notifications
-      WHERE (user_id = $1 OR assigned_to = $1)
-    `;
-
-    let values = [req.params.userId];
-
-    if (!isSuperAdmin) {
-      query += ` AND company_id = $2 `;
-      values.push(companyId);
-    }
-
-    query += ` ORDER BY id DESC`;
-
-    const result = await pool.query(query, values);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur lecture notifications"
-    });
-  }
-});
-
-app.put("/notifications/:id/read", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    let query = `
-      UPDATE notifications
-      SET is_read = true, status = 'read'
-      WHERE id = $1
-    `;
-
-    let values = [req.params.id];
-
-    if (!isSuperAdmin) {
-      query += ` AND company_id = $2 `;
-      values.push(companyId);
-    }
-
-    query += ` RETURNING *`;
-
-    const updated = await pool.query(query, values);
-
-    res.json(updated.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur notification lue"
-    });
-  }
-});
-
-app.post("/meetings", authenticateToken, async (req, res) => {
-  try {
-    if (!canCreateMeeting(req.user)) {
-      return res.status(403).json({
-        error: "Vous n'avez pas l'autorisation de crÃ©er une rÃ©union."
-      });
-    }
-
-    const companyId = req.user.company_id;
-    const { title, conversation_id, participants = [] } = req.body;
-    const roomName = `triangle-wms-${companyId || "global"}-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)}`;
-    const meetingUrl = `https://meet.jit.si/${roomName}`;
-
-    const meetingResult = await pool.query(
-      `INSERT INTO meetings
-       (title, room_name, meeting_url, conversation_id, created_by, company_id)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING *`,
-      [
-        title || "RÃ©union Triangle WMS",
-        roomName,
-        meetingUrl,
-        conversation_id || null,
-        req.user.id,
-        companyId || null
-      ]
-    );
-
-    const meeting = meetingResult.rows[0];
-    const participantIds = Array.from(
-      new Set([req.user.id, ...participants.map((id) => Number(id)).filter(Boolean)])
-    );
-
-    for (const participantId of participantIds) {
-      await pool.query(
-        `INSERT INTO meeting_participants (meeting_id, user_id)
-         VALUES ($1,$2)
-         ON CONFLICT (meeting_id, user_id) DO NOTHING`,
-        [meeting.id, participantId]
-      );
-
-      if (participantId !== Number(req.user.id)) {
-        await createNotification({
-          user_id: participantId,
-          title: "Invitation rÃ©union",
-          message: `${req.user.email || "Un utilisateur"} vous invite Ã  une rÃ©union.`,
-          type: "meeting_invitation",
-          company_id: companyId,
-          priority: "high",
-          related_entity_type: "meeting",
-          related_entity_id: meeting.id,
-          action_url: meetingUrl,
-          created_by: req.user.id,
-          assigned_to: participantId
-        });
-      }
-    }
-
-    res.status(201).json({
-      ...meeting,
-      participants: participantIds
-    });
-  } catch (error) {
-    console.error("ERREUR CREATION REUNION :", error);
-    res.status(500).json({ error: "Erreur crÃ©ation rÃ©union" });
-  }
-});
-
-app.get("/meetings", authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-
-    const result = await pool.query(
-      `SELECT m.*
-       FROM meetings m
-       LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id
-       WHERE ($1::boolean = true OR m.company_id=$2)
-       AND ($1::boolean = true OR mp.user_id=$3 OR m.created_by=$3)
-       ORDER BY m.id DESC`,
-      [isSuperAdmin, companyId, req.user.id]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("ERREUR LECTURE REUNIONS :", error);
-    res.status(500).json({ error: "Erreur lecture rÃ©unions" });
-  }
-});
-/* POINTAGE INTELLIGENT */
-app.get("/attendance/schedule-groups", authenticateToken, async (req, res) => {
-  try {
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const result = await pool.query(
-      `SELECT *
-       FROM schedule_groups
-       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
-       ORDER BY id ASC`,
-      isSuperAdmin ? [] : [req.user.company_id]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture groupes horaires" });
-  }
-});
-
-/* ATTENDANCE TODAY - AFFICHAGE POINTAGE */
-app.get("/attendance/today", authenticateToken, async (req, res) => {
-  try {
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const result = await pool.query(`
-      SELECT
-        u.id AS user_id,
-        u.fullname,
-        u.role,
-        u.badge_code,
-
-        s.schedule_group,
-        s.salary_type,
-        s.hourly_rate,
-        s.daily_salary AS setting_daily_salary,
-        s.monthly_salary,
-        s.start_time,
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíÛm5×”èµ©hºÚn¶X§zÍXÛÛœÝ^™\ÜÈH™\]Z\™J™^™\ÜÈŠNÂ˜ÛÛœÝÛÜœÈH™\]Z\™J˜ÛÜœÈŠNÂ˜ÛÛœÝÈÛÛHH™\]Z\™JœÈŠNÂ˜ÛÛœÝÝH™\]Z\™JšœÛÛÙXÚÙ[ˆŠNÂ˜ÛÛœÝ˜Üž\H™\]Z\™J˜˜Üž\œÈŠNÂ˜ÛÛœÝTÛÙHH™\]Z\™Jœ\˜ÛÙHŠNÂ˜ÛÛœÝ][\ˆH™\]Z\™J›][\ˆŠNÂ˜ÛÛœÝ]H™\]Z\™Jœ]ŠNÂ˜ÛÛœÝœÈH™\]Z\™J™œÈŠNÂ˜ÛÛœÝÜž\ÈH™\]Z\™J˜Üž\ÈŠNÂ˜ÛÛœÝ›Ù[XZ[\ˆH™\]Z\™J››Ù[XZ[\ˆŠNÂ‹ÊˆÛÛ˜]X›XÈHØ][ÙÝYHˆ\ÝH›[˜ÚH\ÈÚ[\È[™^X›\Ëˆ
+‹Â˜ÛÛœÝX›XÐØ][ÙÈH™\]Z\™J‹‹ÜÙ\šXÙ\ËÜX›XËXØ][ÙÈŠNÂœ™\]Z\™J™Ý[ˆŠK˜ÛÛ™šYÊ
+NÂ‚›]ÙX”\ÚH[ÂžHÂˆÙX”\ÚH™\]Z\™JÙX‹\\ÚŠNÂŸHØ]Ú
+\œ›ÜŠHÂˆÙX”\ÚH[ÂŸB‚˜ÛÛœÝ\H^™\ÜÊ
+NÂ‚˜ÛÛœÝ[ÝÙYÜšYÚ[œÈHÂˆ›ØÙ\ÜË™[‹‘”“Ó•S‘ÕT“ˆ›ØÙ\ÜË™[‹”P“P×ÐTÑWÕT“ˆšÎ‹ËÝšX[™Û]Û\Ü›Ë˜ÛÛH‹ˆšÎ‹ËÝÝÝËšX[™Û]Û\Ü›Ë˜ÛÛH‹ˆšÎ‹ËÛX[[[šÙÛØ˜[˜ÛÛH‹ˆšÎ‹ËÝÝÝË›X[[[šÙÛØ˜[˜ÛÛH‹ˆšÎ‹ËÚYš^X[X‹˜ÛÛH‹ˆšÎ‹ËÝÝÝËšYš^X[X‹˜ÛÛH‹ˆš‹ËÛØØ[ÜÝŒÌÌ‹ˆš‹ËÌLËŒŒŒNŒÌÌ‹ˆšÎ‹ËØYšXKšX[™Û]Û\Ü›Ë˜ÛÛH‹ˆšÎ‹ËÛX[[[šËšX[™Û]Û\Ü›Ë˜ÛÛH‹ˆš‹ËÛØØ[ÜÝŒÌ‚—K™š[\Š›ÛÛX[ŠNÂ‚˜\™\ØX›Jž\ÝÙ\™YXžHŠNÂ‚˜\\ÙJ
+™\K™\Ë™^
+HOˆÂˆ™\ËœÙ]XY\Š–PÛÛ[U\KSÜ[ÛœÈ‹››ÜÛšY™ˆŠNÂˆ™\ËœÙ]XY\Š–Qœ˜[YKSÜ[ÛœÈ‹‘S–HŠNÂˆ™\ËœÙ]XY\Š”™Y™\œ™\‹TÛXÞH‹œÝšXÝ[ÜšYÚ[‹]Ú[‹XÜ›ÜÜË[ÜšYÚ[ˆŠNÂˆ™\ËœÙ]XY\Š”\›Z\ÜÚ[ÛœËTÛXÞH‹˜Ø[Y\˜OJÙ[ŠKZXÜ›ÜÛ™OJÙ[ŠKÙ[ÛØØ][ÛJÙ[ŠHŠNÂˆYˆ
+›ØÙ\ÜË™[‹““ÑWÑS•ˆOOHœ›ÙXÝ[ÛˆŠHÂˆ™\ËœÙ]XY\Š”ÝšXÝU˜[œÜÜTÙXÝ\š]H‹›X^XYÙOLÌMLÍŒÈ[˜ÛYTÝX‘ÛXZ[œÈŠNÂˆBˆ™^
+
+NÂŸJNÂ‚˜\\ÙJˆÛÜœÊÂˆÜšYÚ[ŠÜšYÚ[‹Ø[˜XÚÊHÂˆËÈ™\]pê\ÈØ[œÈ[‹]0êHÜšYÚ[ˆ
+›ÞH™^šœËÙ\™]\‹pè\Ù\™]\‹\È[Øš[\ÊHˆ]]Üš\ðêY\Ë‚ˆYˆ
+[ÜšYÚ[ŠH™]\›ˆØ[˜XÚÊ[YJNÂˆYˆ
+[ÝÙYÜšYÚ[œËš[˜ÛY\ÊÜšYÚ[ŠJH™]\›ˆØ[˜XÚÊ[YJNÂˆËÈÜšYÚ[™\ÈØØ[ÜÝ[ˆ0ê]™[Ü[Y[
+ÜÈ˜\šXX›\ÈˆÌÌŒÌÌ‹‹ŠBˆYˆ
+›ØÙ\ÜË™[‹““ÑWÑS•ˆOOHœ›ÙXÝ[Ûˆˆ	‰ˆ×šÏÎ—×ÊØØ[ÜÝL×ŒŒŒJJ—
+ÊOÉË\Ý
+ÜšYÚ[ŠJHÂˆ™]\›ˆØ[˜XÚÊ[YJNÂˆBˆËÈÜšYÚ[™H[˜ÛÛ›YHˆ\È	Ù[‹]0ê\ÈÓÔ”È
+H˜]šYØ]]\ˆ›Ü]Y\˜JKØ[œÈ\œ™]\ˆÙ\™]\‹‚ˆ™]\›ˆØ[˜XÚÊ[˜[ÙJNÂˆKˆÜ™Y[X[ÎˆYBˆJBŠB‚˜\\ÙJ^™\ÜËšœÛÛŠÈ[Z]ˆŒ[XˆˆJJNÂ‚˜\\ÙJ
+™\K™\Ë™^
+HOˆÂˆYˆ
+™\K\›œÝ\ÕÚ]
+‹Ø\KÈŠJHÂˆ™\K\›H™\K\›œÛXÙJ
+NÂˆB‚ˆ™^
+
+NÂŸJNÂ‚˜ÛÛœÝÈÙ[œÚ]]™T›Ý]\Ô˜]S[Z]HH™\]Z\™J‹‹ÛZY]Ø\™KÜ˜]S[Z]ŠNÂ˜\\ÙJÙ[œÚ]]™T›Ý]\Ô˜]S[Z]
+NÂ‚˜\\ÙJ™\]Z\™U[˜[
+NÂ‚šYˆ
+YœË™^\ÝÔÞ[˜Ê\ØYÈŠJHÂˆœË›ZÙ\”Þ[˜Ê\ØYÈŠNÂŸB‚˜ÛÛœÝ›ÙXÝ\ØY\ˆH]š›Ú[Š×Ù\›˜[YK\ØYÈ‹œ›ÙXÝÈŠNÂ˜ÛÛœÝX›Ü˜]ÜžU\ØY\ˆH]š›Ú[Š×Ù\›˜[YK\ØYÈ‹›X›Ü˜]ÜžHŠNÂ‚šYˆ
+YœË™^\ÝÔÞ[˜Ê›ÙXÝ\ØY\ŠJHÂˆœË›ZÙ\”Þ[˜Ê›ÙXÝ\ØY\‹È™XÝ\œÚ]™NˆYHJNÂŸB‚šYˆ
+YœË™^\ÝÔÞ[˜ÊX›Ü˜]ÜžU\ØY\ŠJHÂˆœË›ZÙ\”Þ[˜ÊX›Ü˜]ÜžU\ØY\‹È™XÝ\œÚ]™NˆYHJNÂŸB‚˜\\ÙJ‹Ý\ØYÈ‹^™\ÜËœÝ]XÊ]š›Ú[Š×Ù\›˜[YK\ØYÈŠJJNÂ‚˜ÛÛœÝÝÜ˜YÙHH][\‹™\ÚÔÝÜ˜YÙJÂˆ\Ý[˜][ÛŽˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆØŠ[\ØYËÈŠNÂˆKˆš[[˜[YNˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆÛÛœÝ^H]™^˜[YJš[K›ÜšYÚ[˜[˜[YHˆŠKÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝ˜\ÙS˜[YHH]ˆ˜˜\Ù[˜[YJš[K›ÜšYÚ[˜[˜[YH\ØY‹^
+Bˆœ™\XÙJ×ÊËÙË‹HŠBˆœ™\XÙJÖ×˜K^KVŒNKW×KÙËˆŠNÂˆÛÛœÝ[š\]YS˜[YHH	Ñ]K››ÝÊ
+_KIØÜž\Ëœ˜[™ÛPž]\ÊŠKÔÝš[™Êš^Š_KIØ˜\ÙS˜[YH\ØYŸIÙ^XÂˆØŠ[[š\]YS˜[YJNÂˆBŸJNÂ‚˜ÛÛœÝ[ÝÙY\ØYZ[YU\\ÈH™]ÈÙ]
+Âˆš[XYÙKÚœYÈ‹ˆš[XYÙKÚœÈ‹ˆš[XYÙKÜ™È‹ˆš[XYÙKÝÙXœ‹ˆ˜\XØ][Û‹Üˆ‹ˆ˜]Y[ËÛ\YÈ‹ˆ˜]Y[ËÛ\È‹ˆ˜]Y[ËÛ\‹ˆ˜]Y[ËÝØ]ˆ‹ˆ˜]Y[ËÝÙX›H‹ˆ˜]Y[ËÛÙÙÈ‚—JNÂ‚˜ÛÛœÝ›ØÚÙY\ØY^[œÚ[ÛœÈH™]ÈÙ]
+Âˆ‹œ‹ˆ‹™^H‹ˆ‹šœÈ‹ˆ‹›ZœÈ‹ˆ‹˜ÚœÈ‹ˆ‹œÚ‹ˆ‹˜˜]‹ˆ‹˜ÛY‹ˆ‹œÌH‹ˆ‹š[‹ˆ‹šH‹ˆ‹œÝ™È‚—JNÂ‚™[˜Ý[ÛˆÙXÝ\™U\ØYš[Qš[\Š™\Kš[KØŠHÂˆÛÛœÝ^H]™^˜[YJš[K›ÜšYÚ[˜[˜[YHˆŠKÓÝÙ\Ø\ÙJ
+NÂ‚ˆYˆ
+›ØÚÙY\ØY^[œÚ[ÛœËš\Ê^
+JHÂˆ™]\›ˆØŠ™]È\œ›ÜŠ•\HHšXÚY\ˆ[\™]Ý\ˆ\È˜Z\ÛÛœÈHðêXÝ\š]0êKˆŠJNÂˆB‚ˆYˆ
+X[ÝÙY\ØYZ[YU\\Ëš\Êš[K›Z[Y]\JJHÂˆ™]\›ˆØŠ™]È\œ›ÜŠ‘›Ü›X]HšXÚY\ˆ›Ûˆ]]Üš\ðêKˆŠJNÂˆB‚ˆØŠ[YJNÂŸB‚˜ÛÛœÝ\ØYH][\ŠÂˆÝÜ˜YÙKˆ[Z]ÎˆÈš[TÚ^™NˆL
+ˆL
+ˆLKˆš[Qš[\ŽˆÙXÝ\™U\ØYš[Qš[\‚ŸJNÂ‚˜ÛÛœÝ›ÙXÝ[XYÙTÝÜ˜YÙHH][\‹™\ÚÔÝÜ˜YÙJÂˆ\Ý[˜][ÛŽˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆØŠ[›ÙXÝ\ØY\ŠNÂˆKˆš[[˜[YNˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆÛÛœÝ^H]™^˜[YJš[K›ÜšYÚ[˜[˜[YHˆŠKÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝ˜\ÙS˜[YHH]ˆ˜˜\Ù[˜[YJš[K›ÜšYÚ[˜[˜[YHœ›ÙXÝ‹^
+Bˆœ™\XÙJ×ÊËÙË‹HŠBˆœ™\XÙJÖ×˜K^KVŒNKW×KÙËˆŠNÂˆØŠ[	Ñ]K››ÝÊ
+_KIØ˜\ÙS˜[YHœ›ÙXÝŸIÙ^X
+NÂˆBŸJNÂ‚˜ÛÛœÝ\ØY›ÙXÝ[XYÙHH][\ŠÂˆÝÜ˜YÙNˆ›ÙXÝ[XYÙTÝÜ˜YÙKˆ[Z]ÎˆÈš[TÚ^™NˆH
+ˆL
+ˆLKˆš[Qš[\Žˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆÛÛœÝ[ÝÙYH™]ÈÙ]
+Èš[XYÙKÚœYÈ‹š[XYÙKÚœÈ‹š[XYÙKÜ™È‹š[XYÙKÝÙXœ—JNÂˆYˆ
+X[ÝÙYš\Êš[K›Z[Y]\JJHÂˆ™]\›ˆØŠ™]È\œ›ÜŠ‘›Ü›X][XYÙH›Ûˆ]]Üš\ðêKˆ][\Ù^ˆœËœYË™ÈÝHÙXœˆŠJNÂˆB‚ˆØŠ[YJNÂˆBŸJNÂ‚˜ÛÛœÝX›Ü˜]ÜžT™\Ý[ÝÜ˜YÙHH][\‹™\ÚÔÝÜ˜YÙJÂˆ\Ý[˜][ÛŽˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆØŠ[X›Ü˜]ÜžU\ØY\ŠNÂˆKˆš[[˜[YNˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆÛÛœÝ^H]™^˜[YJš[K›ÜšYÚ[˜[˜[YHˆŠKÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝ˜\ÙS˜[YHH]ˆ˜˜\Ù[˜[YJš[K›ÜšYÚ[˜[˜[YHœ™\Ý[][X›Ü˜]Ú\™H‹^
+Bˆœ™\XÙJ×ÊËÙË‹HŠBˆœ™\XÙJÖ×˜K^KVŒNKW×KÙËˆŠNÂˆØŠ[	Ñ]K››ÝÊ
+_KIØÜž\Ëœ˜[™ÛPž]\ÊŠKÔÝš[™Êš^Š_KIØ˜\ÙS˜[YHœ™\Ý[]ŸIÙ^X
+NÂˆBŸJNÂ‚˜ÛÛœÝ\ØYX›Ü˜]ÜžT™\Ý[H][\ŠÂˆÝÜ˜YÙNˆX›Ü˜]ÜžT™\Ý[ÝÜ˜YÙKˆ[Z]ÎˆÈš[TÚ^™NˆL
+ˆL
+ˆLKˆš[Qš[\Žˆ[˜Ý[Ûˆ
+™\Kš[KØŠHÂˆÛÛœÝ[ÝÙYH™]ÈÙ]
+È˜\XØ][Û‹Üˆ‹š[XYÙKÚœYÈ‹š[XYÙKÚœÈ‹š[XYÙKÜ™È‹š[XYÙKÝÙXœ—JNÂˆYˆ
+X[ÝÙYš\Êš[K›Z[Y]\JJHÂˆ™]\›ˆØŠ™]È\œ›ÜŠ‘›Ü›X]°ê\Ý[]›Ûˆ]]Üš\ðêKˆ][\Ù^ˆ‹”Ë‘ÈÝHÑP”ˆŠJNÂˆB‚ˆØŠ[YJNÂˆBŸJNÂ‚‹ËÈÛÛÜÝÜ™TÔS8 %\˜[pê™\ÈVPÒUTÈ
+\ÙH\˜Ú\ÜÙ[Y[[Û0êYH[ˆÚ\™ÙJK‚‹ËÈ˜[]\œÈÝ\˜Ú\™ÙXX›\È\ˆ˜\šXX›\È	Ù[š\›Û›™[Y[‚‹ËÈ×ÔÓÓÓPV
+0êY˜]]Œ
+H8 %ÛÛ›™^[ÛœÈÚ[][[°êY\ÈX^\ˆ[œÝ[˜ÙK‚‹ËÈÚÚ\ÚHÝ\ˆ[š\ˆŒLÈ][\Ø]]\œÈÝ\ˆ[™H[œÝ[˜ÙHÈ]™XÈÐ›Ý[˜Ù\ˆ]‹ËÈ\ÚY]\œÈ[œÝ[˜Ù\È
+LÊÊKØ\™\ˆX^0åÈ˜—Ú[œÝ[˜Ù\ÈX^ØÛÛ›™XÝ[ÛœÈË‚‹ËÈ×ÒQWÕSQSÕUÓTÈ
+0êY˜]]Ì
+H8 %™\›YH[™HÛÛ›™^[Ûˆ[˜XÝ]™H\°êÈÌË‚‹ËÈ×ÐÓÓ“‘PÕSÓ—ÕSQSÕUÓTÈ
+0êY˜]]L
+H8 %0êXÚXÈÚH]XÝ[™HÛÛ›™^[Ûˆ[ˆHÂ‹ËÈ
+0ê]š]H\È™\]pê\È]ZH[™[]X[™H˜\ÙH\ÝØ]\°êYJK‚˜ÛÛœÝÛÛ[š[™ÈHÂˆX^ˆ[X™\Š›ØÙ\ÜË™[‹”×ÔÓÓÓPVŒ
+KˆYU[Y[Ý]Z[\Îˆ[X™\Š›ØÙ\ÜË™[‹”×ÒQWÕSQSÕUÓTÈÌ
+KˆÛÛ›™XÝ[Û•[Y[Ý]Z[\Îˆ[X™\Š›ØÙ\ÜË™[‹”×ÐÓÓ“‘PÕSÓ—ÕSQSÕUÓTÈL
+BŸNÂ˜ÛÛœÝÛÛH›ØÙ\ÜË™[‹‘UPTÑWÕT“ˆÈ™]ÈÛÛ
+ÈÛÛ›™XÝ[Û”Ýš[™Îˆ›ØÙ\ÜË™[‹‘UPTÑWÕT“‹‹œÛÛ[š[™ÈJBˆˆ™]ÈÛÛ
+Âˆ\Ù\ŽˆœÛÝ[^[X[™YX[È‹ˆÜÝˆ›ØØ[ÜÝ‹ˆ]X˜\ÙNˆšX[™ÛWÝÛ\×Ùˆ‹ˆ\ÜÝÛÜ™ˆˆ‹ˆÜˆMÌ‹ˆ‹‹œÛÛ[š[™ÂˆJNÂ‹ËÈ[™H\œ™]\ˆÝ\ˆ[ˆÛY[[˜XÝYˆ™HÚ]\È[\ˆH›ØÙ\ÜË‚œÛÛ›ÛŠ™\œ›Üˆ‹
+\œŠHOˆÛÛœÛÛK™\œ›ÜŠ¸¦¨;î#ÈÜÈÛÛH\œ™]\ˆÛY[[˜XÝYˆˆ‹\œ‹›Y\ÜØYÙJJNÂ‚šYˆ
+\›ØÙ\ÜË™[‹’•ÕÔÑPÔ‘U	‰ˆ›ØÙ\ÜË™[‹““ÑWÑS•ˆOOHœ›ÙXÝ[ÛˆŠHÂˆÛÛœÛÛK™\œ›ÜŠˆ‘T”‘UTˆÑPÕT’UHUSNˆ•ÕÔÑPÔ‘UXœÙ[HšXÚY\ˆ™[‹ˆˆ
+Âˆ“HÙ\™]\ˆ™Y\ÙHH0ê[X\œ™\ˆ[ˆ›ÙXÝ[ÛˆØ[œÈÙXÜ™]•Õˆˆ
+ÂˆZ›Ý]^ˆ•ÕÔÑPÔ‘UO˜[]\ˆ[0êX]Ú\™H›ÜOˆ[œÈ˜XÚÙ[™Ë™[ˆZ\È™Y0ê[X\œ™^‹ˆ‚ˆ
+NÂˆ›ØÙ\ÜË™^]
+JNÂŸB‚˜ÛÛœÝ•ÕÔÑPÔ‘UH›ØÙ\ÜË™[‹’•ÕÔÑPÔ‘UšX[™ÛWÝÛ\×ÜÙXÜ™]ÚÙ^HŽÂ˜ÛÛœÝÔ–TÔ“ÕS‘ÈHLŽÂ‚‹ËÈ°ê\šYšXØ][Ûˆ\ÈÙXÜ™]ÈÙ[œÚX›\È]H0ê[X\œ˜YÙH
+\ÙH
+Hˆ]™\][ˆ]‹‹ËÈ›Ü]YHH0ê[X\œ˜YÙH[ˆ›ÙXÝ[ÛˆÚH[ˆÙXÜ™]Üš]\]YH\ÝXœÙ[Ù˜ZX›K‚œ™\]Z\™J‹‹ØÛÛ™šYËÙ[‹YÝX\™ŠK™[™›Ü˜ÙQ[Š
+NÂ‚˜ÛÛœÝÕTT—ÐQRS—ÑSPRSÈH™]ÈÙ]
+Âˆ™X[ÙØÚYÛXZ[˜ÛÛH‚—JNÂ‚˜ÛÛœÝSQÕSS•ÈH™]ÈÙ]
+ÈšX[™ÛH‹›X[[[šÈ‹šYš^XH—JNÂ‚™[˜Ý[Ûˆ›Ü›X[^™U[˜[Y
+˜[YJHÂˆÛÛœÝ›Ü›X[^™YHÝš[™Ê˜[YHˆŠBˆš[J
+BˆÓÝÙ\Ø\ÙJ
+Bˆœ™\XÙJÖ×˜K^ŒNWËWKÙËˆŠNÂˆ™]\›ˆSQÕSS•Ëš\Ê›Ü›X[^™Y
+HÈ›Ü›X[^™YˆˆŽÂŸB‚™[˜Ý[ÛˆÙ][˜[œ›ÛT™\]Y\Ý
+™\JHÂˆÛÛœÝ˜]ÒXY\•[˜[Bˆ™\OËšXY\œÏË–Èž][˜[ZY—Hˆ™\OËšXY\œÏË–ÈžX\\›ÙXÝ—Hˆ™\OËšXY\œÏË–Èž\›ÙXÝZY—Hˆ™\OËœ]Y\žOË[˜[ÚYÂˆÛÛœÝXY\•[˜[H›Ü›X[^™U[˜[Y
+˜]ÒXY\•[˜[
+NÂ‚ˆYˆ
+XY\•[˜[
+H™]\›ˆXY\•[˜[ÂˆYˆ
+˜]ÒXY\•[˜[
+H™]\›ˆ—×Ú[˜[Y×ÈŽÂ‚ˆÛÛœÝÜÝHÝš[™Êˆ™\OËšXY\œÏËšÜÝˆ™\OËšXY\œÏË–ÈžY›ÜØ\™YZÜÝ—Hˆ™\OËšÜÝ˜[YHˆˆ‚ˆ
+BˆœÜ]
+‹ŠVÌBˆœÜ]
+ŽˆŠVÌBˆÓÝÙ\Ø\ÙJ
+NÂ‚ˆYˆ
+ÜÝš[˜ÛY\Ê›X[[[šÙÛØ˜[˜ÛÛHŠHÜÝš[˜ÛY\Ê›X[[[šËšX[™Û]Û\Ü›Ë˜ÛÛHŠJHÂˆ™]\›ˆ›X[[[šÈŽÂˆBˆYˆ
+ÜÝš[˜ÛY\ÊšYš^X[X‹˜ÛÛHŠHÜÝš[˜ÛY\Ê˜YšXKšX[™Û]Û\Ü›Ë˜ÛÛHŠJHÂˆ™]\›ˆšYš^XHŽÂˆBˆ™]\›ˆ›Ü›X[^™U[˜[Y
+›ØÙ\ÜË™[‹‘QUSÕSS•ÒQ
+HšX[™ÛHŽÂŸB‚™[˜Ý[Ûˆ™\]Z\™U[˜[
+™\K™\Ë™^
+HÂˆÛÛœÝ[˜[YHÙ][˜[œ›ÛT™\]Y\Ý
+™\JNÂˆYˆ
+USQÕSS•Ëš\Ê[˜[Y
+JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•[˜[[˜[YKˆˆJNÂˆB‚ˆ™\K[˜[ÚYH[˜[YÂˆ™\Ë›ØØ[Ë[˜[ÚYH[˜[YÂˆ™^
+
+NÂŸB‚™[˜Ý[Ûˆ\œÙPÛÛÚÚYRXY\Š™\JHÂˆ™]\›ˆÝš[™Ê™\OËšXY\œÏË˜ÛÛÚÚYHˆŠBˆœÜ]
+ŽÈŠBˆ›X\
+
+\
+HOˆ\š[J
+JBˆ™š[\Š›ÛÛX[ŠBˆœ™YXÙJ
+ÛÛÚÚY\Ë\
+HOˆÂˆÛÛœÝÙ\\˜]Ü’[™^H\š[™^ÙŠHŠNÂˆYˆ
+Ù\\˜]Ü’[™^OOHLJH™]\›ˆÛÛÚÚY\ÎÂˆÛÛœÝÙ^HHXÛÙUT’PÛÛ\Û™[
+\œÛXÙJÙ\\˜]Ü’[™^
+Kš[J
+JNÂˆÛÛœÝ˜[YHHXÛÙUT’PÛÛ\Û™[
+\œÛXÙJÙ\\˜]Ü’[™^
+ÈJKš[J
+JNÂˆÛÛÚÚY\ÖÚÙ^WHH˜[YNÂˆ™]\›ˆÛÛÚÚY\ÎÂˆKßJNÂŸB‚™[˜Ý[ÛˆÙ]]]ÚÙ[‘œ›ÛT™\]Y\Ý
+™\JHÂˆÛÛœÝ]]XY\ˆH™\OËšXY\œÏË˜]]Üš^˜][ÛˆˆŽÂˆÛÛœÝ™X\™\•ÚÙ[ˆH]]XY\‹œÝ\ÕÚ]
+™X\™\ˆŠHÈ]]XY\‹œÜ]
+ˆŠVÌWHˆˆŽÂˆYˆ
+™X\™\•ÚÙ[ŠH™]\›ˆ™X\™\•ÚÙ[ŽÂ‚ˆÛÛœÝÛÛÚÚY\ÈH\œÙPÛÛÚÚYRXY\Š™\JNÂˆ™]\›ˆÛÛÚÚY\Ë˜]]ÝÚÙ[ˆÛÛÚÚY\ËšX[™ÛWØ]]ÝÚÙ[ˆˆŽÂŸB‚™[˜Ý[ÛˆÙ]ÙXÝ\™P]]ÛÛÚÚY\Ê™\K™\ËÚÙ[‹[˜[Y
+HÂˆÛÛœÝÙXÝ\™HBˆ™\OËœÙXÝ\™HOOHYHˆÝš[™Ê™\OËšXY\œÏË–ÈžY›ÜØ\™Y\›ÝÈ—HˆŠKš[˜ÛY\ÊšÈŠHˆ›ØÙ\ÜË™[‹““ÑWÑS•ˆOOHœ›ÙXÝ[ÛˆŽÂˆÛÛœÝÜ[ÛœÈHÂˆÛ›NˆYKˆÙXÝ\™KˆØ[YTÚ]Nˆ›^‹ˆ]ˆ‹È‹ˆX^YÙNˆ
+ˆŒ
+ˆŒ
+ˆLˆNÂ‚ˆ™\Ë˜ÛÛÚÚYJ˜]]ÝÚÙ[ˆ‹ÚÙ[‹Ü[ÛœÊNÂˆ™\Ë˜ÛÛÚÚYJ[˜[ÚY‹[˜[YÜ[ÛœÊNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÛÛ\[žP™[Û™ÜÕÕ[˜[
+ÛÛ\[žRY[˜[Y
+HÂˆYˆ
+XÛÛ\[žRY][˜[Y
+H™]\›ˆYNÂˆYˆ
+J]ØZ]ÛÛ[[‘^\ÝÊ˜ÛÛ\[šY\È‹[˜[ÚYŠJJH™]\›ˆYNÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕ[˜[ÚY”“ÓHÛÛ\[šY\ÈÒT‘HYIHSRUH‹ˆØÛÛ\[žRYBˆ
+NÂˆÛÛœÝÛÛ\[žU[˜[H›Ü›X[^™U[˜[Y
+™\Ý[œ›ÝÜÖÌOË[˜[ÚY
+HšX[™ÛHŽÂˆ™]\›ˆÛÛ\[žU[˜[OOH[˜[YÂŸB‚™[˜Ý[ÛˆÙ]ÛÛ\[žQš[\Š™\JHÂˆÛÛœÝ\Ù\’\ÔÝ\\YZ[ˆBˆ™\K\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›Ü›X[^™T›ÛJ™\K\Ù\Ëœ›ÛJHOOHœÝ\\—ØYZ[ˆŽÂˆÛÛœÝÛÛ\[žRYH\Ù\’\ÔÝ\\YZ[‚ˆÈÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JBˆˆ™\K\Ù\Ë˜ÛÛ\[žWÚY[Â‚ˆ™]\›ˆÂˆÛÛ\[žRYˆ\ÔÝ\\YZ[Žˆ\Ù\’\ÔÝ\\YZ[‹ˆÚÝ[š[\žPÛÛ\[žNˆ]\Ù\’\ÔÝ\\YZ[ˆ›ÛÛX[ŠÛÛ\[žRY
+BˆNÂŸB‚™[˜Ý[Ûˆ\ÔÝ\\YZ[•\Ù\Š\Ù\ŠHÂˆ™]\›ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJHOOHœÝ\\—ØYZ[ˆŽÂŸB‚™[˜Ý[ÛˆÙ]™\]Y\ÝYXÝ]™PÛÛ\[žRY
+™\JHÂˆÛÛœÝ˜]ÈBˆ™\OËšXY\œÏË–ÈžXXÝ]™KXÛÛ\[žKZY—Hˆ™\OËšXY\œÏË–ÈžXÛÛ\[žKZY—Hˆ™\OË˜›ÙOË˜ÛÛ\[žWÚYˆ™\OË˜›ÙOË˜XÝ]™WØÛÛ\[žWÚYˆ™\OËœ]Y\žOË˜XÝ]™WØÛÛ\[žWÚYÂˆÛÛœÝ[Y\šXÈH[X™\Š˜]ÊNÂˆ™]\›ˆ[X™\‹š\Ò[YÙ\Š[Y\šXÊH	‰ˆ[Y\šXÈˆÈ[Y\šXÈˆ[ÂŸB‚™[˜Ý[ÛˆÙ]Y™™XÝ]™PÛÛ\[žRY
+™\K˜[˜XÚÈH[
+HÂˆYˆ
+\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠJHÂˆ™]\›ˆÙ]™\]Y\ÝYXÝ]™PÛÛ\[žRY
+™\JH[X™\Š™\K\Ù\Ë˜ÛÛ\[žWÚY
+H˜[˜XÚÈ[ÂˆBˆ™]\›ˆ[X™\Š™\K\Ù\Ë˜ÛÛ\[žWÚY
+H˜[˜XÚÈ[ÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]ÛÛ\[žTÙ][™ÜÑ›ÜÛÛ\[žJÛY[Ü”ÛÛÛÛ\[žRY
+HÂˆÛÛœÝ™\Ý[H]ØZ]ÛY[Ü”ÛÛœ]Y\žJˆÑSPÕ
+‚ˆ”“ÓHÛÛ\[žWÜÙ][™ÜÂˆÒT‘H
+	NŽš[TÈ•SÔˆÛÛ\[žWÚYIJBˆÔ‘Tˆ–HÐTÑHÒSˆÛÛ\[žWÚYIHSˆSÑHHS‘YTÐÂˆSRUXˆØÛÛ\[žRY[Bˆ
+NÂ‚ˆ™]\›ˆ™\Ý[œ›ÝÜÖÌH[ÂŸB‚™[˜Ý[Ûˆ›Ü›X[^™T›ÛJ›ÛJHÂˆ™]\›ˆÝš[™Ê›ÛHˆŠKÓÝÙ\Ø\ÙJ
+NÂŸB‚™[˜Ý[Ûˆ\ÐYZ[•\Ù\Š\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›ÛHOOH˜YZ[ˆˆ›ÛHOOHœÝ\\—ØYZ[ˆ‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[XØÙ\ÜÐYZ[”Ù][™ÜÊ\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›ÛHOOHœÝ\\—ØYZ[ˆˆ›ÛHOOH˜YZ[ˆŽÂŸB‚™[˜Ý[ÛˆØ[XØÙ\ÜÑ\™XÝ[Û“[Ù[J\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆØ[XØÙ\ÜÐYZ[”Ù][™ÜÊ\Ù\ŠHˆ›ÛHOOH™\™XÝ]\ˆˆˆ›ÛHOOH™\™XÝ[Ûˆ‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[•˜[Y]TÝØÚÓ[Ý™[Y[
+\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›ÛHOOH˜YZ[ˆˆˆ›ÛHOOHœÝ\\—ØYZ[ˆˆˆ›ÛHOOH˜ÚY—Ù[™\Ýˆˆ›ÛHOOH˜ÚYˆ	Ù[™\0íˆˆ›ÛHOOH˜ÚYˆ	Ù[™\Ý‚ˆ
+NÂŸB‚™[˜Ý[Ûˆ\Ô™XYÛ›T›ÛJ\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ›ÛHOOH™\™XÝ[Ûˆˆ›ÛHOOH˜ÛY[ŽÂŸB‚™[˜Ý[ÛˆØ[•šY]Ð[Ø[\šY\Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›ÛHOOHœÝ\\—ØYZ[ˆˆ›ÛHOOH™\™XÝ[ÛˆŽÂŸB‚™[˜Ý[ÛˆØ[Ü™X]SYY][™Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›ÛHOOHœÝ\\—ØYZ[ˆˆˆ›ÛHOOH˜YZ[ˆˆˆ›ÛHOOHœ™\ÜÛœØX›WÙ[™\Ýˆˆ›ÛHOOH˜ÚY—Ù[™\Ýˆˆ›ÛHOOH™\™XÝ[Ûˆ‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[•\ÙTÜÊ\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›ÛHOOHœÝ\\—ØYZ[ˆˆˆ›ÛHOOH˜YZ[ˆˆˆ›ÛHOOH˜ØZ\ÜÚY\ˆˆˆ›ÛHOOH™[™]\ˆ‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[“X[˜YÙPØZ\ÜÙ\Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›ÛHOOHœÝ\\—ØYZ[ˆˆ›ÛHOOH˜YZ[ˆŽÂŸB‚™[˜Ý[ÛˆØ[•šY]ÐXØÛÝ[[™Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›ÛHOOHœÝ\\—ØYZ[ˆˆˆ›ÛHOOH˜YZ[ˆˆˆ›ÛHOOH˜ÛÛ\X›Hˆˆ›ÛHOOH™\™XÝ[Ûˆˆˆ›ÛHOOH™\™XÝ]\ˆ‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[“X[˜YÙPXØÛÝ[[™Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›ÛHOOHœÝ\\—ØYZ[ˆˆˆ›ÛHOOH˜YZ[ˆˆˆ›ÛHOOH˜ÛÛ\X›H‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[\›Ý™PXØÛÝ[[™Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ
+ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYHˆ›ÛHOOHœÝ\\—ØYZ[ˆˆˆ›ÛHOOH˜YZ[ˆˆˆ›ÛHOOH™\™XÝ[Ûˆˆˆ›ÛHOOH™\™XÝ]\ˆ‚ˆ
+NÂŸB‚™[˜Ý[ÛˆØ[Y\ÝÜÔšXÙJ\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›ÛHOOHœÝ\\—ØYZ[ˆˆ›ÛHOOH˜YZ[ˆŽÂŸB‚™[˜Ý[ÛˆÙ]Y™™XÝ]™TÜÔšXÙJ›ÙXÝ
+HÂˆÛÛœÝØ[™Y]\ÈHÂˆ›ÙXÝœØ[WÜšXÙKˆ›ÙXÝœ\›XXÞWÜšXÙKˆ›ÙXÝÚÛ\Ø[WÜšXÙKˆ›ÙXÝœšXÙBˆNÂ‚ˆ›Üˆ
+ÛÛœÝØ[™Y]HÙˆØ[™Y]\ÊHÂˆÛÛœÝ˜[YHH[X™\ŠØ[™Y]H
+NÂˆYˆ
+˜[YHˆ
+H™]\›ˆ˜[YNÂˆB‚ˆ™]\›ˆÂŸB‚™[˜Ý[Ûˆ›Ü›X[^™T›ÙXÝÛÚÝ\ÛÙJ˜[YJHÂˆ™]\›ˆÝš[™Ê˜[YHˆŠBˆš[J
+Bˆœ™\XÙJ×šÏÎ—×Ö×‹×J×ÜØØ[—Ü›ÙXÝËÚKˆŠBˆœ™\XÙJ×”™Y—Ê–ËW×J—Ê‹ÚKˆŠBˆœ™\XÙJÖ×˜K^KVŒNWKÙËˆŠBˆÓÝÙ\Ø\ÙJ
+NÂŸB‚™[˜Ý[ÛˆÜ[Û˜[[X™\Š˜[YJHÂˆYˆ
+˜[YHOOHˆˆ˜[YHOOH[˜[YHOOH[™Yš[™Y
+H™]\›ˆ[ÂˆÛÛœÝ[X™\ˆH[X™\Š˜[YJNÂˆ™]\›ˆ[X™\‹š\Ñš[š]J[X™\ŠHÈ[X™\ˆˆ[ÂŸB‚™[˜Ý[Ûˆ\Ð˜Üž\\Ú
+˜[YJHÂˆ™]\›ˆ×—	–ØXžWW	ÌŸW	Ë\Ý
+Ýš[™Ê˜[YHˆŠJNÂŸB‚™[˜Ý[Ûˆ˜[Y]T\ÜÝÛÜ™Ý™[™Ý
+\ÜÝÛÜ™
+HÂˆÛÛœÝ˜[YHHÝš[™Ê\ÜÝÛÜ™ˆŠNÂˆYˆ
+˜[YK›[™Ý
+HÂˆ™]\›ˆ“H[ÝH\ÜÙHÚ]ÛÛ[š\ˆ]H[Ú[œÈØ\˜XÝ0ê™\ËˆŽÂˆB‚ˆYˆ
+KÖÐKV˜K^—KË\Ý
+˜[YJHKÖÌNWKË\Ý
+˜[YJJHÂˆ™]\›ˆ“H[ÝH\ÜÙHÚ]ÛÛ[š\ˆ]H[Ú[œÈ[™H]™H][ˆÚY™œ™KˆŽÂˆB‚ˆ™]\›ˆˆŽÂŸB‚˜\Þ[˜È[˜Ý[Ûˆ\Ú\ÜÝÛÜ™
+\ÜÝÛÜ™
+HÂˆ™]\›ˆ˜Üž\š\Ú
+Ýš[™Ê\ÜÝÛÜ™
+KÔ–TÔ“ÕS‘ÊNÂŸB‚˜\Þ[˜È[˜Ý[Ûˆ™\šYžT\ÜÝÛÜ™
+[œ]\ÜÝÛÜ™ÝÜ™Y\ÜÝÛÜ™
+HÂˆYˆ
+\Ð˜Üž\\Ú
+ÝÜ™Y\ÜÝÛÜ™
+JHÂˆ™]\›ˆ˜Üž\˜ÛÛ\\™JÝš[™Ê[œ]\ÜÝÛÜ™ˆŠKÝÜ™Y\ÜÝÛÜ™
+NÂˆB‚ˆ™]\›ˆÝš[™Ê[œ]\ÜÝÛÜ™ˆŠHOOHÝš[™ÊÝÜ™Y\ÜÝÛÜ™ˆŠNÂŸB‚™[˜Ý[Ûˆ^[Y[Üž\ÒÙ^J
+HÂˆ™]\›ˆÜž\Âˆ˜Ü™X]R\Ú
+œÚLMˆŠBˆ\]J›ØÙ\ÜË™[‹”VSQS•ÔÑUS‘Ô×ÔÑPÔ‘U›ØÙ\ÜË™[‹’•ÕÔÑPÔ‘UšX[™ÛK]Û\Ë\^[Y[\ÙXÜ™]ŠBˆ™YÙ\Ý
+
+NÂŸB‚™[˜Ý[Ûˆ[˜Üž\^[Y[ÙXÜ™]
+˜[YJHÂˆYˆ
+]˜[YJH™]\›ˆˆŽÂˆÛÛœÝ]ˆHÜž\Ëœ˜[™ÛPž]\ÊLŠNÂˆÛÛœÝÚ\\ˆHÜž\Ë˜Ü™X]PÚ\\š]Š˜Y\ËLM‹YØÛH‹^[Y[Üž\ÒÙ^J
+K]ŠNÂˆÛÛœÝ[˜Üž\YHY™™\‹˜ÛÛ˜Ø]
+ØÚ\\‹\]JÝš[™Ê˜[YJK]ŽŠKÚ\\‹™š[˜[
+
+WJNÂˆÛÛœÝYÈHÚ\\‹™Ù]]]YÊ
+NÂˆ™]\›ˆ	Ú]‹ÔÝš[™Êš^Š_N‰ÝYËÔÝš[™Êš^Š_N‰Ù[˜Üž\YÔÝš[™Êš^Š_XÂŸB‚™[˜Ý[ÛˆXÜž\^[Y[ÙXÜ™]
+˜[YJHÂˆYˆ
+]˜[YHTÝš[™Ê˜[YJKš[˜ÛY\ÊŽˆŠJH™]\›ˆˆŽÂˆžHÂˆÛÛœÝÚ]’^YÒ^[˜Üž\Y^HHÝš[™Ê˜[YJKœÜ]
+ŽˆŠNÂˆÛÛœÝXÚ\\ˆHÜž\Ë˜Ü™X]QXÚ\\š]Šˆ˜Y\ËLM‹YØÛH‹ˆ^[Y[Üž\ÒÙ^J
+KˆY™™\‹™œ›ÛJ]’^š^ŠBˆ
+NÂˆXÚ\\‹œÙ]]]YÊY™™\‹™œ›ÛJYÒ^š^ŠJNÂˆ™]\›ˆY™™\‹˜ÛÛ˜Ø]
+ÂˆXÚ\\‹\]JY™™\‹™œ›ÛJ[˜Üž\Y^š^ŠJKˆXÚ\\‹™š[˜[
+
+BˆJKÔÝš[™Ê]ŽŠNÂˆHØ]ÚÂˆ™]\›ˆˆŽÂˆBŸB‚™[˜Ý[ÛˆX\ÚÔÙXÜ™]
+˜[YJHÂˆYˆ
+]˜[YJH™]\›ˆˆŽÂˆ™]\›ˆ¸ (¸ (¸ (¸ (¸ (¸ (¸ (¸ (ˆŽÂŸB‚™[˜Ý[ÛˆÛØÚX[ÚÙ[Üž\ÒÙ^J
+HÂˆ™]\›ˆÜž\Âˆ˜Ü™X]R\Ú
+œÚLMˆŠBˆ\]J›ØÙ\ÜË™[‹”ÓÐÒPSÐUUÔÑPÔ‘U›ØÙ\ÜË™[‹’•ÕÔÑPÔ‘UšX[™ÛK]Û\Ë\ÛØÚX[\ÙXÜ™]ŠBˆ™YÙ\Ý
+
+NÂŸB‚™[˜Ý[Ûˆ[˜Üž\ÛØÚX[ÚÙ[Š˜[YJHÂˆYˆ
+]˜[YJH™]\›ˆˆŽÂˆÛÛœÝ]ˆHÜž\Ëœ˜[™ÛPž]\ÊLŠNÂˆÛÛœÝÚ\\ˆHÜž\Ë˜Ü™X]PÚ\\š]Š˜Y\ËLM‹YØÛH‹ÛØÚX[ÚÙ[Üž\ÒÙ^J
+K]ŠNÂˆÛÛœÝ[˜Üž\YHY™™\‹˜ÛÛ˜Ø]
+ØÚ\\‹\]JÝš[™Ê˜[YJK]ŽŠKÚ\\‹™š[˜[
+
+WJNÂˆÛÛœÝYÈHÚ\\‹™Ù]]]YÊ
+NÂˆ™]\›ˆ	Ú]‹ÔÝš[™Êš^Š_N‰ÝYËÔÝš[™Êš^Š_N‰Ù[˜Üž\YÔÝš[™Êš^Š_XÂŸB‚™[˜Ý[ÛˆÛØÚX[›ÝšY\ÛÛ™šYÊ›ÝšY\ŠHÂˆÛÛœÝ\\›HX›XÐ\\›
+
+NÂˆÛÛœÝØ[˜XÚÕ\›H	Ø\\›KØ\KØ]]ÜÛØÚX[ÉÜ›ÝšY\ŸKØØ[˜XÚØÂˆÛÛœÝÛÛ™šYÜÈHÂˆÛÛÙÛNˆÂˆX™[ˆ‘ÛÛÙÛH‹ˆÛY[Yˆ›ØÙ\ÜË™[‹‘ÓÓÑÓWÐÓQS•ÒQˆÛY[ÙXÜ™]ˆ›ØÙ\ÜË™[‹‘ÓÓÑÓWÐÓQS•ÔÑPÔ‘Uˆ]]\›ˆšÎ‹ËØXØÛÝ[Ë™ÛÛÙÛK˜ÛÛKÛËÛØ]]‹ÝŒ‹Ø]]‹ˆÚÙ[•\›ˆšÎ‹ËÛØ]]‹™ÛÛÙÛX\\Ë˜ÛÛKÝÚÙ[ˆ‹ˆ\Ù\’[™›Õ\›ˆšÎ‹ËÛÜ[šYÛÛ›™XÝ™ÛÛÙÛX\\Ë˜ÛÛKÝŒKÝ\Ù\š[™›È‹ˆØÛÜNˆœ›Ùš[H[XZ[‹ˆØ[˜XÚÕ\›ˆKˆ˜XÙX›ÛÚÎˆÂˆX™[ˆ‘˜XÙX›ÛÚÈ‹ˆÛY[Yˆ›ØÙ\ÜË™[‹‘PÑP“ÓÒ×ÐÓQS•ÒQˆÛY[ÙXÜ™]ˆ›ØÙ\ÜË™[‹‘PÑP“ÓÒ×ÐÓQS•ÔÑPÔ‘Uˆ]]\›ˆšÎ‹ËÝÝÝË™˜XÙX›ÛÚË˜ÛÛKÝŒNKŒÙX[ÙËÛØ]]‹ˆÚÙ[•\›ˆšÎ‹ËÙÜ˜\™˜XÙX›ÛÚË˜ÛÛKÝŒNKŒÛØ]]ØXØÙ\Ü×ÝÚÙ[ˆ‹ˆ\Ù\’[™›Õ\›ˆšÎ‹ËÙÜ˜\™˜XÙX›ÛÚË˜ÛÛKÛYOÙšY[ÏZYš\œÝÛ˜[YK\ÝÛ˜[YK˜[YK[XZ[XÝ\™H‹ˆØÛÜNˆœX›X×Ü›Ùš[H[XZ[‹ˆØ[˜XÚÕ\›ˆKˆ[œÝYÜ˜[NˆÂˆX™[ˆ’[œÝYÜ˜[H‹ˆÛY[Yˆ›ØÙ\ÜË™[‹’S”ÕQÔSWÐÓQS•ÒQˆÛY[ÙXÜ™]ˆ›ØÙ\ÜË™[‹’S”ÕQÔSWÐÓQS•ÔÑPÔ‘Uˆ]]\›ˆ›ØÙ\ÜË™[‹’S”ÕQÔSWÐUUÕT“ˆ‹ˆÚÙ[•\›ˆ›ØÙ\ÜË™[‹’S”ÕQÔSWÕÒÑS—ÕT“ˆ‹ˆ\Ù\’[™›Õ\›ˆ›ØÙ\ÜË™[‹’S”ÕQÔSWÕTÑT’S‘“×ÕT“ˆ‹ˆØÛÜNˆ\Ù\—Ü›Ùš[H‹ˆØ[˜XÚÕ\›ˆKˆZÝÚÎˆÂˆX™[ˆ•ZÕÚÈ‹ˆÛY[Yˆ›ØÙ\ÜË™[‹•RÕÒ×ÐÓQS•ÒQˆÛY[ÙXÜ™]ˆ›ØÙ\ÜË™[‹•RÕÒ×ÐÓQS•ÔÑPÔ‘Uˆ]]\›ˆ›ØÙ\ÜË™[‹•RÕÒ×ÐUUÕT“ˆ‹ˆÚÙ[•\›ˆ›ØÙ\ÜË™[‹•RÕÒ×ÕÒÑS—ÕT“ˆ‹ˆ\Ù\’[™›Õ\›ˆ›ØÙ\ÜË™[‹•RÕÒ×ÕTÑT’S‘“×ÕT“ˆ‹ˆØÛÜNˆ\Ù\‹š[™›Ë˜˜\ÚXÈ‹ˆØ[˜XÚÕ\›ˆBˆNÂ‚ˆ™]\›ˆÛÛ™šYÜÖÜ›ÝšY\—H[ÂŸB‚™[˜Ý[ÛˆÛØÚX[›ÝšY\‘[˜X›Y
+›ÝšY\ŠHÂˆÛÛœÝÛÛ™šYÈHÛØÚX[›ÝšY\ÛÛ™šYÊ›ÝšY\ŠNÂˆ™]\›ˆ›ÛÛX[ŠÛÛ™šYÏË˜ÛY[Y	‰ˆÛÛ™šYÏË˜ÛY[ÙXÜ™]	‰ˆÛÛ™šYÏË˜]]\›	‰ˆÛÛ™šYÏËÚÙ[•\›	‰ˆÛÛ™šYÏË\Ù\’[™›Õ\›
+NÂŸB‚™[˜Ý[Ûˆ›Ü›X[^™TÛØÚX[›Ùš[J›ÝšY\‹˜]Ô›Ùš[JHÂˆYˆ
+›ÝšY\ˆOOH™ÛÛÙÛHŠHÂˆ™]\›ˆÂˆ›ÝšY\—Ý\Ù\—ÚYˆÝš[™Ê˜]Ô›Ùš[KœÝXˆˆŠKˆ[XZ[ˆ˜]Ô›Ùš[K™[XZ[ˆ‹ˆ[XZ[Ý™\šYšYYˆ˜]Ô›Ùš[K™[XZ[Ý™\šYšYYOOHYKˆ˜[YNˆ˜]Ô›Ùš[K›˜[YHÜ˜]Ô›Ùš[K™Ú]™[—Û˜[YK˜]Ô›Ùš[K™˜[Z[WÛ˜[YWK™š[\Š›ÛÛX[ŠKš›Ú[ŠˆŠKˆš\œÝÛ˜[YNˆ˜]Ô›Ùš[K™Ú]™[—Û˜[YHˆ‹ˆ\ÝÛ˜[YNˆ˜]Ô›Ùš[K™˜[Z[WÛ˜[YHˆ‹ˆ]˜]\—Ý\›ˆ˜]Ô›Ùš[KœXÝ\™Hˆ‚ˆNÂˆB‚ˆYˆ
+›ÝšY\ˆOOH™˜XÙX›ÛÚÈŠHÂˆ™]\›ˆÂˆ›ÝšY\—Ý\Ù\—ÚYˆÝš[™Ê˜]Ô›Ùš[KšYˆŠKˆ[XZ[ˆ˜]Ô›Ùš[K™[XZ[ˆ‹ˆ[XZ[Ý™\šYšYYˆ›ÛÛX[Š˜]Ô›Ùš[K™[XZ[
+Kˆ˜[YNˆ˜]Ô›Ùš[K›˜[YHÜ˜]Ô›Ùš[K™š\œÝÛ˜[YK˜]Ô›Ùš[K›\ÝÛ˜[YWK™š[\Š›ÛÛX[ŠKš›Ú[ŠˆŠKˆš\œÝÛ˜[YNˆ˜]Ô›Ùš[K™š\œÝÛ˜[YHˆ‹ˆ\ÝÛ˜[YNˆ˜]Ô›Ùš[K›\ÝÛ˜[YHˆ‹ˆ]˜]\—Ý\›ˆ˜]Ô›Ùš[KœXÝ\™OË™]OË\›ˆ‚ˆNÂˆB‚ˆ™]\›ˆÂˆ›ÝšY\—Ý\Ù\—ÚYˆÝš[™Ê˜]Ô›Ùš[KšY˜]Ô›Ùš[KœÝXˆ˜]Ô›Ùš[K›Ü[—ÚY˜]Ô›Ùš[K[š[Û—ÚYˆŠKˆ[XZ[ˆ˜]Ô›Ùš[K™[XZ[ˆ‹ˆ[XZ[Ý™\šYšYYˆ›ÛÛX[Š˜]Ô›Ùš[K™[XZ[Ý™\šYšYY˜]Ô›Ùš[K™[XZ[
+Kˆ˜[YNˆ˜]Ô›Ùš[K›˜[YH˜]Ô›Ùš[K™\Ü^WÛ˜[YH˜]Ô›Ùš[K\Ù\›˜[YHˆ‹ˆš\œÝÛ˜[YNˆ˜]Ô›Ùš[K™š\œÝÛ˜[YHˆ‹ˆ\ÝÛ˜[YNˆ˜]Ô›Ùš[K›\ÝÛ˜[YHˆ‹ˆ]˜]\—Ý\›ˆ˜]Ô›Ùš[KœXÝ\™H˜]Ô›Ùš[K˜]˜]\—Ý\›ˆ‚ˆNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆZ[ÙÚ[”™\ÜÛœÙQ›Ü•\Ù\Š\Ù\’Y
+HÂˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕKŠ‹ˆË›˜[YHTÈÛÛ\[žWÛ˜[YKˆËœÝ]\ÈTÈÛÛ\[žWÜÝ]\ËˆËœÝXœØÜš\[Û—ÜÝ]\ÈTÈÛÛ\[žWÜÝXœØÜš\[Û—ÜÝ]\ËˆËœÝXœØÜš\[Û—Ù^\™\×Ø]TÈÛÛ\[žWÜÝXœØÜš\[Û—Ù^\™\×Ø]ˆËšX[Ù[™Ù]HTÈÛÛ\[žWÝšX[Ù[™Ù]KˆËœÝ]\ÈTÈÝXœØÜš\[Û—ÜÝ]\ËˆË™[™Ù]HTÈÝXœØÜš\[Û—Ù[™Ù]KˆÜ›˜[YHTÈ[—Û˜[YBˆ”“ÓH\Ù\œÈBˆQ•“ÒSˆÛÛ\[šY\ÈÈÓˆK˜ÛÛ\[žWÚYXËšYˆQ•“ÒSˆÝXœØÜš\[ÛœÈÈÓˆËšY\Ë˜ÛÛ\[žWÚYˆQ•“ÒSˆÝXœØÜš\[Û—Ü[œÈÜÓˆËœ[—ÚY\ÜšYˆÒT‘HKšYIBˆÔ‘Tˆ–HËšYTÐÂˆSRUXˆÝ\Ù\’YBˆ
+NÂˆÛÛœÝ\Ù\ˆH™\Ý[œ›ÝÜÖÌNÂˆYˆ
+]\Ù\ŠH™]\›ˆ[Â‚ˆÛÛœÝ›Ü›X[^™Y[XZ[HÝš[™Ê\Ù\‹™[XZ[ˆŠKš[J
+KÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝ\ÔÝ\\YZ[ˆBˆ\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYHˆ›Ü›X[^™T›ÛJ\Ù\‹œ›ÛJHOOHœÝ\\—ØYZ[ˆˆˆÕTT—ÐQRS—ÑSPRSËš\Ê›Ü›X[^™Y[XZ[
+NÂ‚ˆÛÛœÝÝXœØÜš\[Û”Ý]\ÈBˆ\Ù\‹œÝXœØÜš\[Û—ÜÝ]\È\Ù\‹˜ÛÛ\[žWÜÝXœØÜš\[Û—ÜÝ]\ÈˆŽÂ‚ˆÛÛœÝÚÙ[ˆHÝœÚYÛŠˆÂˆYˆ\Ù\‹šYˆ[XZ[ˆ\Ù\‹™[XZ[ˆ›ÛNˆ\ÔÝ\\YZ[ˆÈœÝ\\—ØYZ[ˆˆˆ\Ù\‹œ›ÛKˆÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚYˆ\×ÜÝ\\—ØYZ[Žˆ\ÔÝ\\YZ[‹ˆÝXœØÜš\[Û—ÜÝ]\ÎˆÝXœØÜš\[Û”Ý]\ÂˆKˆ•ÕÔÑPÔ‘UˆÈ^\™\Ò[ŽˆŒYˆBˆ
+NÂ‚ˆÛÛœÝÛÛ\[žS[Ù[\ÈH\ÔÝ\\YZ[‚ˆÈ]ØZ]Ù]ÛÛ\[žS[Ù[\Ê[
+Bˆˆ]ØZ]Ù]ÛÛ\[žS[Ù[\Ê\Ù\‹˜ÛÛ\[žWÚY
+NÂ‚ˆ™]\›ˆÂˆÚÙ[‹ˆ\Ù\ŽˆÂˆYˆ\Ù\‹šYˆ[˜[YNˆ\Ù\‹™[˜[YKˆ[XZ[ˆ\Ù\‹™[XZ[ˆ›ÛNˆ\ÔÝ\\YZ[ˆÈœÝ\\—ØYZ[ˆˆˆ\Ù\‹œ›ÛKˆÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚYˆÛÛ\[žWÛ˜[YNˆ\Ù\‹˜ÛÛ\[žWÛ˜[YHˆ‹ˆÛÛ\[žWÜÝ]\Îˆ\Ù\‹˜ÛÛ\[žWÜÝ]\Èˆ‹ˆ\×ÜÝ\\—ØYZ[Žˆ\ÔÝ\\YZ[‹ˆÝXœØÜš\[Û—ÜÝ]\ÎˆÝXœØÜš\[Û”Ý]\ËˆÝXœØÜš\[Û—Ù[™Ù]Nˆ\Ù\‹œÝXœØÜš\[Û—Ù[™Ù]Hˆ‹ˆšX[Ù[™Ù]Nˆ\Ù\‹˜ÛÛ\[žWÝšX[Ù[™Ù]Hˆ‹ˆÝXœØÜš\[Û—Ù^\™\×Ø]ˆ\Ù\‹˜ÛÛ\[žWÜÝXœØÜš\[Û—Ù^\™\×Ø]ˆ‹ˆ[—Û˜[YNˆ\Ù\‹œ[—Û˜[YHˆ‹ˆ›Ùš[WÚ[XYÙWÝ\›ˆ\Ù\‹œ›Ùš[WÚ[XYÙWÝ\›ˆ‹ˆ›Ü˜ÙWÜ\ÜÝÛÜ™ØÚ[™ÙNˆ\Ù\‹™›Ü˜ÙWÜ\ÜÝÛÜ™ØÚ[™ÙHOOHYKˆ[Ù[\ÎˆÛÛ\[žS[Ù[\ÂˆBˆNÂŸB‚™[˜Ý[Ûˆ\Ñ^\›˜[^[Y[Y]Ù
+Y]Ù
+HÂˆ™]\›ˆÈØ\H˜[˜ØZ\™H‹“Ü˜[™ÙH[Û™^H‹“[ÛÝˆ[Û™^H‹•Ø]™H‹•š\™[Y[—Kš[˜ÛY\ÊÝš[™ÊY]ÙˆŠJNÂŸB‚™[˜Ý[ÛˆÐ›ÛÛX[‘›YÊ˜[YKY˜][˜[YHH˜[ÙJHÂˆYˆ
+˜[YHOOHYH˜[YHOOH˜[ÙJH™]\›ˆ˜[YNÂˆÛÛœÝ›Ü›X[^™YHÝš[™Ê˜[YHÏÈˆŠKš[J
+KÓÝÙ\Ø\ÙJ
+NÂˆYˆ
+È›ÝZH‹YH‹ŒH‹žY\È‹˜XÝYˆ‹˜XÝ]™H—Kš[˜ÛY\Ê›Ü›X[^™Y
+JH™]\›ˆYNÂˆYˆ
+È››Ûˆ‹™˜[ÙH‹Œ‹››È‹š[˜XÝYˆ‹š[˜XÝ]™H—Kš[˜ÛY\Ê›Ü›X[^™Y
+JH™]\›ˆ˜[ÙNÂˆ™]\›ˆY˜][˜[YNÂŸB‚™[˜Ý[Ûˆ›ÝšY\’Ù^Qœ›ÛSY]Ù
+Y]Ù
+HÂˆÛÛœÝ›Ü›X[^™YHÝš[™ÊY]ÙˆŠKÓÝÙ\Ø\ÙJ
+NÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Ê˜Ø\HŠJH™]\›ˆ˜Ø\™ŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Ê›Ü˜[™ÙHŠJH™]\›ˆ›Ü˜[™ÙWÛ[Û™^HŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Ê›[ÛÝˆŠJH™]\›ˆ›[ÛÝ—Û[Û™^HŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\ÊØ]™HŠJH™]\›ˆØ]™HŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Êš\™[Y[ŠJH™]\›ˆ˜˜[š×Ý˜[œÙ™\ˆŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Ê˜Ú0ê]YHŠH›Ü›X[^™Yš[˜ÛY\Ê˜Ú\]YHŠJH™]\›ˆ˜ÚXÚÈŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Ê›Z^HŠJH™]\›ˆ›Z^YŽÂˆYˆ
+›Ü›X[^™Yš[˜ÛY\Ê˜Ü°êY]ŠH›Ü›X[^™Yš[˜ÛY\Ê˜Ü™Y]ŠJH™]\›ˆ˜Ý\ÝÛY\—ØÜ™Y]ŽÂˆ™]\›ˆ˜Ø\ÚŽÂŸB‚™[˜Ý[ÛˆØ[Ý[]Q\Ý[˜ÙSY]\œÊ]KÛŒK]‹ÛŒŠHÂˆÛÛœÝÔ˜YH
+˜[YJHOˆ
+[X™\Š˜[YJH
+ˆX]”JHÈNÂˆÛÛœÝX\˜Y]\ÓY]\œÈHŒÍÌLÂˆÛÛœÝ]HÔ˜Y
+]ˆH]JNÂˆÛÛœÝÛˆHÔ˜Y
+ÛŒˆHÛŒJNÂˆÛÛœÝHBˆX]œÚ[Š]ÈŠH
+ˆX]œÚ[Š]ÈŠH
+ÂˆX]˜ÛÜÊÔ˜Y
+]JJH
+‚ˆX]˜ÛÜÊÔ˜Y
+]ŠJH
+‚ˆX]œÚ[ŠÛˆÈŠH
+‚ˆX]œÚ[ŠÛˆÈŠNÂˆÛÛœÝÈHˆ
+ˆX]˜][ŒŠX]œÜ\
+JKX]œÜ\
+HHJJNÂˆ™]\›ˆX\˜Y]\ÓY]\œÈ
+ˆÎÂŸB‚™[˜Ý[ÛˆØ[“X[˜YÙP][™[˜ÙTÚ]\Ê\Ù\ŠHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\Ëœ›ÛJNÂˆ™]\›ˆ\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH›ÛHOOHœÝ\\—ØYZ[ˆˆ›ÛHOOH˜YZ[ˆŽÂŸB‚™[˜Ý[Ûˆ›Ü›X[^™P][™[˜ÙQÜÔÝ]\Ê˜[YJHÂˆÛÛœÝÝ]\ÈHÝš[™Ê˜[YHˆŠKÓÝÙ\Ø\ÙJ
+NÂˆYˆ
+Ý]\ÈOOH›[Øš[HŠH™]\›ˆ›[Øš[HŽÂˆYˆ
+Ý]\Ëš[˜ÛY\ÊšÜœÈŠJH™]\›ˆšÜœ×Þ›Û™HŽÂˆYˆ
+Ý]\Ëš[˜ÛY\Êœ™Y\ÈŠJH™]\›ˆœ™Y\ðêHŽÂˆYˆ
+Ý]\Ëš[˜ÛY\Ê˜]]ÜˆŠJH™]\›ˆšÜœ×Þ›Û™WØ]]Üš\ðêHŽÂˆ™]\›ˆÝ]\È˜XØÙ\0êHŽÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ][ÝÙY][™[˜ÙTÚ]\Ñ›Ü•\Ù\Š\Ù\ŠHÂˆÛÛœÝÛÛ\[žRYH\Ù\‹˜ÛÛ\[žWÚY[ÂˆÛÛœÝ\ÜÚYÛ™Y™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕËŠ‚ˆ”“ÓH][™[˜ÙWÜÚ]\ÈÂˆS“‘Tˆ“ÒSˆ[\ÞYYWØ][™[˜ÙWÜÚ]\ÈX\ÂˆÓˆX\Ë˜][™[˜ÙWÜÚ]WÚY\ËšYˆÒT‘HX\Ë\Ù\—ÚYIBˆS‘Ë˜XÝY]YBˆS‘
+	ŽŽš[TÈ•SÔˆË˜ÛÛ\[žWÚYIˆÔˆË˜ÛÛ\[žWÚYTÈ•S
+BˆÔ‘Tˆ–HË››ÛWÙWÜÚ]HTÐØˆÝ\Ù\‹šYÛÛ\[žRYBˆ
+NÂ‚ˆYˆ
+\ÜÚYÛ™Y™\Ý[œ›ÝÜË›[™Ýˆ
+H™]\›ˆ\ÜÚYÛ™Y™\Ý[œ›ÝÜÎÂ‚ˆYˆ
+\Ù\‹œš[X\žWØ][™[˜ÙWÜÚ]WÚY
+HÂˆÛÛœÝš[X\žT™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕ
+‚ˆ”“ÓH][™[˜ÙWÜÚ]\ÂˆÒT‘HYIBˆS‘XÝY]YBˆS‘
+	ŽŽš[TÈ•SÔˆÛÛ\[žWÚYIˆÔˆÛÛ\[žWÚYTÈ•S
+BˆSRUXˆÝ\Ù\‹œš[X\žWØ][™[˜ÙWÜÚ]WÚYÛÛ\[žRYBˆ
+NÂˆYˆ
+š[X\žT™\Ý[œ›ÝÜË›[™Ýˆ
+H™]\›ˆš[X\žT™\Ý[œ›ÝÜÎÂˆB‚ˆ™]\›ˆ×NÂŸB‚™[˜Ý[Ûˆ›ÙXÝ\•\›
+™\K›ÙXÝ
+HÂˆÛÛœÝ›ÜØ\™Y›ÝÈH™\K™Ù]
+žY›ÜØ\™Y\›ÝÈŠH™\Kœ›ÝØÛÛÂˆÛÛœÝÜÝH™\K™Ù]
+šÜÝŠNÂˆÛÛœÝ˜\ÙU\›Bˆ›ØÙ\ÜË™[‹‘”“Ó•S‘ÔP“P×ÕT“ˆ›ØÙ\ÜË™[‹“‘VÔP“P×Ñ”“Ó•S‘ÕT“ˆ›ØÙ\ÜË™[‹”P“P×ÐTÑWÕT“ˆ	ÚÜÝËš[˜ÛY\ÊšX[™Û]Û\Ü›Ë˜ÛÛHŠHÈšÈˆˆ›ÜØ\™Y›ÝßN‹ËÉÚÜÝXÂˆÛÛœÝÛÙHH[˜ÛÙUT’PÛÛ\Û™[
+›ÙXÝœ™Y™\™[˜ÙH›ÙXÝ˜˜\˜ÛÙH›ÙXÝšY
+NÂˆ™]\›ˆ	Ø˜\ÙU\›œ™\XÙJ×ÉËˆŠ_KÜØØ[‹Ü›ÙXÝÉØÛÙ_XÂŸB‚™[˜Ý[ÛˆÝš\Ø[\žQšY[Ê›ÝË™\]Y\Ý\ŠHÂˆÛÛœÝØ[”ÙYTØ[\žHBˆØ[•šY]Ð[Ø[\šY\Ê™\]Y\Ý\ŠH[X™\Š›ÝËšY›ÝË\Ù\—ÚY
+HOOH[X™\Š™\]Y\Ý\ËšY
+NÂ‚ˆYˆ
+Ø[”ÙYTØ[\žJH™]\›ˆ›ÝÎÂ‚ˆÛÛœÝØ[š]^™YHÈ‹‹œ›ÝÈNÂˆ[]HØ[š]^™YšÝ\›WÜ˜]NÂˆ[]HØ[š]^™Y™Z[WÜ˜]NÂˆ[]HØ[š]^™Y™Z[WÜØ[\žNÂˆ[]HØ[š]^™YœÙ][™×ÙZ[WÜØ[\žNÂˆ[]HØ[š]^™Y›[ÛWÜØ[\žNÂˆ[]HØ[š]^™YœØ[\žNÂˆ[]HØ[š]^™YœØ[\žWØ[[Ý[Âˆ[]HØ[š]^™Y˜Ø[Ý[]YÜØ[\žNÂˆØ[š]^™YœØ[\žWÝ\HHØ[š]^™YœØ[\žWÝ\HÈ›X\Ü]pêHˆˆØ[š]^™YœØ[\žWÝ\NÂˆ™]\›ˆØ[š]^™YÂŸB‚™[˜Ý[ÛˆX›XÕ\ØY\›
+™\Kš[[˜[YJHÂˆÛÛœÝ›ÜØ\™Y›ÝÈH™\K™Ù]
+žY›ÜØ\™Y\›ÝÈŠH™\Kœ›ÝØÛÛÂˆÛÛœÝÜÝH™\K™Ù]
+šÜÝŠNÂˆÛÛœÝ˜\ÙU\›Bˆ›ØÙ\ÜË™[‹”P“P×ÐTÑWÕT“ˆ	ÚÜÝËš[˜ÛY\ÊšX[™Û]Û\Ü›Ë˜ÛÛHŠHÈšÈˆˆ›ÜØ\™Y›ÝßN‹ËÉÚÜÝXÂ‚ˆ™]\›ˆ	Ø˜\ÙU\›œ™\XÙJ×ÉËˆŠ_KØ\KÝ\ØYËÉÙš[[˜[Y_XÂŸB‚™[˜Ý[Ûˆ]]Üš^™T›Û\Ê‹‹œ›Û\ÊHÂˆ™]\›ˆ
+™\K™\Ë™^
+HOˆÂˆÛÛœÝ[ÝÙYH›Û\Ë›X\
+›Ü›X[^™T›ÛJNÂˆÛÛœÝ\Ù\”›ÛHH›Ü›X[^™T›ÛJ™\K\Ù\Ëœ›ÛJNÂ‚ˆYˆ
+™\K\Ù\Ëš\×ÜÝ\\—ØYZ[ˆOOHYH[ÝÙYš[˜ÛY\Ê\Ù\”›ÛJJHÂˆ™]\›ˆ™^
+
+NÂˆB‚ˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ›Ý\È‰Ø]™^ˆ\È	Ø]]Üš\Ø][Û‹ˆ‚ˆJNÂˆNÂŸB‚™[˜Ý[ÛˆÙ]\Ù\ÛÛ\[žRY
+™\JHÂˆ™]\›ˆ™\K\Ù\Ë˜ÛÛ\[žWÚY[ÂŸB‚˜\Þ[˜È[˜Ý[Ûˆ]][XØ]UÚÙ[Š™\K™\Ë™^
+HÂˆÛÛœÝÚÙ[ˆHÙ]]]ÚÙ[‘œ›ÛT™\]Y\Ý
+™\JNÂˆYˆ
+]ÚÙ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÂˆ\œ›ÜŽˆ•ÚÙ[ˆX[œ]X[‚ˆJNÂˆB‚ˆžHÂˆÛÛœÝ\Ù\ˆHÝ™\šYžJÚÙ[‹•ÕÔÑPÔ‘U
+NÂˆÛÛœÝ™\]Y\Ý[˜[HÙ][˜[œ›ÛT™\]Y\Ý
+™\JNÂˆÛÛœÝÚÙ[•[˜[H›Ü›X[^™U[˜[Y
+\Ù\‹[˜[ÚY
+NÂ‚ˆYˆ
+ÚÙ[•[˜[	‰ˆÚÙ[•[˜[OOH™\]Y\Ý[˜[
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXØðêÈ™Y\ðêHˆÙHÛÛ\H¸ &X\\Y[\È0èÙ]H™\œÚ[Û‹ˆ‚ˆJNÂˆB‚ˆYˆ
+J]ØZ]ÛÛ\[žP™[Û™ÜÕÕ[˜[
+\Ù\‹˜ÛÛ\[žWÚY™\]Y\Ý[˜[
+JJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ[™\š\ÙH›Ûˆ]]Üš\ðêYHÝ\ˆÙH[˜[ˆ‚ˆJNÂˆB‚ˆ™\K\Ù\ˆHÂˆ‹‹\Ù\‹ˆ[˜[ÚYˆÚÙ[•[˜[™\]Y\Ý[˜[ˆNÂˆ™\K[˜[ÚYH™\]Y\Ý[˜[Â‚ˆ™^
+
+NÂˆHØ]Ú
+\œŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆ•ÚÙ[ˆ[˜[YH‚ˆJNÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ]ÛÛ\[žT[“[Z]ÊÛÛ\[žRY
+HÂˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕˆÜŠ‚ˆ”“ÓHÝXœØÜš\[ÛœÈÂˆQ•“ÒSˆÝXœØÜš\[Û—Ü[œÈÜˆÓˆËœ[—ÚYHÜšYˆÒT‘HË˜ÛÛ\[žWÚYH	BˆÔ‘Tˆ–HËšYTÐÂˆSRUXˆØÛÛ\[žRYBˆ
+NÂ‚ˆ™]\›ˆ™\Ý[œ›ÝÜÖÌH[ÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÙÐXÝ]š]J\Ù\—Û˜[YK\Ù\—Ü›ÛKXÝ[Û‹[Ù[K]Z[ÊHÂˆžHÂˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È\Ù\—ØXÝ]š]Y\Âˆ
+\Ù\—Û˜[YK\Ù\—Ü›ÛKXÝ[Û‹[Ù[K]Z[ÊBˆSQTÈ
+	K	‹	Ë		JXˆÂˆ\Ù\—Û˜[YH”Þ\Ý0êYH‹ˆ\Ù\—Ü›ÛH“›Ûˆ0êYš[šH‹ˆXÝ[Û‹ˆ[Ù[Kˆ]Z[Èˆ‚ˆBˆ
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘\œ™]\ˆXÝ]š]0êHˆ‹\œ›ÜŠNÂˆBŸB‚˜\Þ[˜È[˜Ý[ÛˆÙÐ]Y]
+™\KXÝ[Û‹[]U\HHˆ‹[]RYH[]Z[ÈHßJHÂˆžHÂˆÛÛœÝ\Ù\ˆH™\OË\Ù\ˆßNÂˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È]Y]ÛÙÜÂˆ
+\Ù\—ÚY\Ù\—Ù[XZ[\Ù\—Ü›ÛKÛÛ\[žWÚYXÝ[Û‹[]WÝ\K[]WÚY\ØY™\ÜË\Ù\—ØYÙ[]Z[ÊBˆSQTÈ
+	K	‹	Ë		K	‹	Ë		K	L
+XˆÂˆ\Ù\‹šY[ˆ\Ù\‹™[XZ[ˆ‹ˆ\Ù\‹œ›ÛHˆ‹ˆÙ]Y™™XÝ]™PÛÛ\[žRY
+™\HßJH\Ù\‹˜ÛÛ\[žWÚY[ˆXÝ[Û‹ˆ[]U\Kˆ[]RYˆ™\OËš\™\OËšXY\œÏË–ÈžY›ÜØ\™YY›Üˆ—Hˆ‹ˆ\[Ùˆ™\OË™Ù]OOH™[˜Ý[ÛˆˆÈ™\K™Ù]
+\Ù\‹XYÙ[ŠHˆˆˆ™\OËšXY\œÏË–È\Ù\‹XYÙ[—Hˆ‹ˆ”ÓÓ‹œÝš[™ÚYžJ]Z[ÈßJBˆBˆ
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘\œ™]\ˆ]Y]ÙÈˆ‹\œ›Ü‹›Y\ÜØYÙH\œ›ÜŠNÂˆBŸB‚™[˜Ý[ÛˆÙ[™\˜]SÝÛÙJ
+HÂˆ™]\›ˆÝš[™ÊX]™›ÛÜŠL
+ÈX]œ˜[™ÛJ
+H
+ˆL
+JNÂŸB‚™[˜Ý[Ûˆ\Ú™\šYšXØ][Û”ÙXÜ™]
+˜[YJHÂˆ™]\›ˆÜž\Âˆ˜Ü™X]R\Ú
+œÚLMˆŠBˆ\]J	ÔÝš[™Ê˜[YHˆŠ_N‰Ü›ØÙ\ÜË™[‹’•ÕÔÑPÔ‘U•ÕÔÑPÔ‘UX
+Bˆ™YÙ\Ý
+š^ŠNÂŸB‚™[˜Ý[ÛˆÝ\ÜÚ]Ð\\›
+
+HÂˆÛÛœÝ[X™\ˆHÝš[™Ê›ØÙ\ÜË™[‹”ÕTÔ•ÕÒUÐTÓ•SP‘TˆˆŠKœ™\XÙJÖ×ŒNWKÙËˆŠNÂˆYˆ
+[[X™\ŠH™]\›ˆˆŽÂˆÛÛœÝ^H[˜ÛÙUT’PÛÛ\Û™[
+›Ûš›Ý\ˆšX[™ÛHÓTÈ›Ë‰ØZH™\ÛÚ[ˆ	ØZYHŠNÂˆ™]\›ˆÎ‹ËÝØK›YKÉÛ[X™\ŸOÝ^IÝ^XÂŸB‚™[˜Ý[ÛˆX›XÐ\\›
+
+HÂˆ™]\›ˆÝš[™Ê›ØÙ\ÜË™[‹TÕT“›ØÙ\ÜË™[‹”P“P×ÐTÑWÕT“›ØÙ\ÜË™[‹‘”“Ó•S‘ÕT“šÎ‹ËÝšX[™Û]Û\Ü›Ë˜ÛÛHŠKœ™\XÙJ×ÉËˆŠNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÜ™X]U™\šYšXØ][ÛÛÙJÈÛÛ\[žRY\Ù\’Y\™Ù]\K\™Ù]˜[YKˆHÛÛJHÂˆÛÛœÝÛÙHHÙ[™\˜]SÝÛÙJ
+NÂˆÛÛœÝÚÙ[ˆHÜž\Ëœ˜[™ÛPž]\Ê
+KÔÝš[™Êš^ŠNÂˆÛÛœÝÛÙR\ÚH]ØZ]˜Üž\š\Ú
+ÛÙKÔ–TÔ“ÕS‘ÊNÂˆÛÛœÝÚÙ[’\ÚH\Ú™\šYšXØ][Û”ÙXÜ™]
+ÚÙ[ŠNÂ‚ˆ]ØZ]‹œ]Y\žJˆTUH™\šYšXØ][Û—ØÛÙ\ÂˆÑU\ÙYØ]S“ÕÊ
+BˆÒT‘H\ÙYØ]TÈ•SˆS‘
+	NŽš[TÈ•SÔˆ\Ù\—ÚYIJBˆS‘\™Ù]Ý\OI‚ˆS‘ÕÑTŠ\™Ù]Ý˜[YJOSÕÑTŠ	ÊXˆÝ\Ù\’Y[\™Ù]\K\™Ù]˜[YWBˆ
+NÂ‚ˆ]ØZ]‹œ]Y\žJˆS”ÑT•S•È™\šYšXØ][Û—ØÛÙ\Âˆ
+ÛÛ\[žWÚY\Ù\—ÚY\™Ù]Ý\K\™Ù]Ý˜[YKÛÙWÚ\ÚÚÙ[—Ú\Ú^\™\×Ø]
+BˆSQTÈ
+	K	‹	Ë		K	‹“ÕÊ
+H
+ÈS•T•S	ÌLZ[]\ÉÊXˆØÛÛ\[žRY[\Ù\’Y[\™Ù]\K\™Ù]˜[YKÛÙR\ÚÚÙ[’\ÚBˆ
+NÂ‚ˆ™]\›ˆÂˆÛÙKˆÚÙ[‹ˆ™\šYžWÝ\›ˆ	ÜX›XÐ\\›
+
+_KÝ™\šYžKIÝ\™Ù]\_OÝÚÙ[IÝÚÙ[ŸXˆNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ[™™\šYšXØ][Û“Y\ÜØYÙJÈ\™Ù]\K\™Ù]˜[YKÛÙK™\šYžU\›JHÂˆYˆ
+\™Ù]\HOOH™[XZ[ŠHÂˆYˆ
+\›ØÙ\ÜË™[‹”ÓUÒÔÕ\›ØÙ\ÜË™[‹”ÓUÕTÑTˆ\›ØÙ\ÜË™[‹”ÓUÔTÔÊHÂˆ™]\›ˆÂˆÙ[ˆ˜[ÙKˆ›ÝšY\ŽˆœÛ]‹ˆY\ÜØYÙNˆ”ÓU›ÛˆÛÛ™šYÝ\°êKˆÛÛ™šYÝ\™^ˆÓUÝ\ˆ[›ÞY\ˆHÛÙHÕ°êY[ˆ‚ˆNÂˆB‚ˆÛÛœÝ˜[œÜÜ\ˆH›Ù[XZ[\‹˜Ü™X]U˜[œÜÜ
+ÂˆÜÝˆ›ØÙ\ÜË™[‹”ÓUÒÔÕˆÜˆ[X™\Š›ØÙ\ÜË™[‹”ÓUÔÔ•NÊKˆÙXÝ\™Nˆ[X™\Š›ØÙ\ÜË™[‹”ÓUÔÔ•NÊHOOHKˆ]]ˆÂˆ\Ù\Žˆ›ØÙ\ÜË™[‹”ÓUÕTÑT‹ˆ\ÜÎˆ›ØÙ\ÜË™[‹”ÓUÔTÔÂˆBˆJNÂ‚ˆ]ØZ]˜[œÜÜ\‹œÙ[™XZ[
+Âˆœ›ÛNˆ›ØÙ\ÜË™[‹”ÓUÑ”“ÓH›ØÙ\ÜË™[‹”ÓUÕTÑT‹ˆÎˆ\™Ù]˜[YKˆÝXš™XÝˆÛÙHH°ê\šYšXØ][ÛˆšX[™ÛHÓTÈ›È‹ˆ^ˆ›Ý™HÛÙHH°ê\šYšXØ][ÛˆšX[™ÛHÓTÈ›È\Ýˆ	ØÛÙ_Kˆ[^\™H[œÈLZ[]\Ë——“Y[ˆðêXÝ\š\ðêHˆ	Ý™\šYžU\›Xˆ[ˆˆ]ˆÝ[OH™›ÛY˜[Z[N\šX[Ø[œË\Ù\šYŽØÛÛÜŽˆÌLLH‚ˆ•°ê\šYšXØ][ÛˆšX[™ÛHÓTÈ›ÏÚ‚ˆ•›Ý™HÛÙHH°ê\šYšXØ][Ûˆ\ÝÜ‚ˆÝ[OH™›Û\Ú^™NŒŽÙ›Û]ÙZYÚÌÛ]\‹\ÜXÚ[™Î‰ØÛÙ_OÜ‚ˆÙHÛÙH^\™H[œÈLZ[]\ËÜ‚ˆH™YH‰Ù\ØØ\R[
+™\šYžU\›
+_H•˜[Y\ˆ\™XÝ[Y[[ÛˆÛÛ\OØOÜ‚ˆÙ]‚ˆˆJNÂ‚ˆ™]\›ˆÈÙ[ˆYK›ÝšY\Žˆ›ØÙ\ÜË™[‹‘SPRSÔ“Õ’QTˆœÛ]‹Y\ÜØYÙNˆÛÙHÕ[›ÞpêH\ˆ[XZ[ˆˆNÂˆB‚ˆYˆ
+
+›ØÙ\ÜË™[‹”ÓT×Ô“Õ’QTˆœØ[™›ÞŠHOOHœØ[™›Þˆ\›ØÙ\ÜË™[‹”ÓT×ÐTWÒÑVJHÂˆ™]\›ˆÂˆÙ[ˆ˜[ÙKˆ›ÝšY\Žˆ›ØÙ\ÜË™[‹”ÓT×Ô“Õ’QTˆœÛ\È‹ˆY\ÜØYÙNˆ”›ÝšY\ˆÓTÈ›ÛˆÛÛ™šYÝ\°êKˆÛÛ™šYÝ\™^ˆÚ[[ËYœšXØIÜÈ[Ú[™ËÜ˜[™ÙHTHÝHUˆTKˆ‚ˆNÂˆB‚ˆÛÛœÛÛK›ÙÊ”ÓTÈÕ°ê0è[›ÞY\ˆˆ‹È\™Ù]˜[YHJNÂˆ™]\›ˆÈÙ[ˆ˜[ÙK›ÝšY\Žˆ›ØÙ\ÜË™[‹”ÓT×Ô“Õ’QT‹Y\ÜØYÙNˆ”›ÝšY\ˆÓTÈ°ê\\°êKˆˆNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÙ[™\ÜÝÛÜ™™\Ù]Y\ÜØYÙJÈ\™Ù]\K\™Ù]˜[YKÛÙK™\Ù]\›JHÂˆYˆ
+\™Ù]\HOOH™[XZ[ŠHÂˆYˆ
+\›ØÙ\ÜË™[‹”ÓUÒÔÕ\›ØÙ\ÜË™[‹”ÓUÕTÑTˆ\›ØÙ\ÜË™[‹”ÓUÔTÔÊHÂˆ™]\›ˆÂˆÙ[ˆ˜[ÙKˆ›ÝšY\ŽˆœÛ]‹ˆY\ÜØYÙNˆ”ÓU›ÛˆÛÛ™šYÝ\°êKˆÛÛ™šYÝ\™^ˆÓUÝ\ˆ[›ÞY\ˆHÛÙHH°êZ[š]X[\Ø][Û‹ˆ‚ˆNÂˆB‚ˆÛÛœÝ˜[œÜÜ\ˆH›Ù[XZ[\‹˜Ü™X]U˜[œÜÜ
+ÂˆÜÝˆ›ØÙ\ÜË™[‹”ÓUÒÔÕˆÜˆ[X™\Š›ØÙ\ÜË™[‹”ÓUÔÔ•NÊKˆÙXÝ\™Nˆ[X™\Š›ØÙ\ÜË™[‹”ÓUÔÔ•NÊHOOHKˆ]]ˆÂˆ\Ù\Žˆ›ØÙ\ÜË™[‹”ÓUÕTÑT‹ˆ\ÜÎˆ›ØÙ\ÜË™[‹”ÓUÔTÔÂˆBˆJNÂ‚ˆ]ØZ]˜[œÜÜ\‹œÙ[™XZ[
+Âˆœ›ÛNˆ›ØÙ\ÜË™[‹”ÓUÑ”“ÓH›ØÙ\ÜË™[‹”ÓUÕTÑT‹ˆÎˆ\™Ù]˜[YKˆÝXš™XÝˆ”°êZ[š]X[\Ø][Ûˆ[ÝH\ÜÙHšX[™ÛHÓTÈ›È‹ˆ^ˆ›Ý™HÛÙHH°êZ[š]X[\Ø][ÛˆšX[™ÛHÓTÈ›È\Ýˆ	ØÛÙ_Kˆ[^\™H[œÈMHZ[]\Ë——“Y[ˆðêXÝ\š\ðêHˆ	Ü™\Ù]\›Xˆ[ˆˆ]ˆÝ[OH™›ÛY˜[Z[N\šX[Ø[œË\Ù\šYŽØÛÛÜŽˆÌLLH‚ˆ”°êZ[š]X[\Ø][Ûˆ[ÝH\ÜÙOÚ‚ˆ•›Ý™HÛÙHH°êZ[š]X[\Ø][Ûˆ\ÝÜ‚ˆÝ[OH™›Û\Ú^™NŒŽÙ›Û]ÙZYÚÌÛ]\‹\ÜXÚ[™Î‰ØÛÙ_OÜ‚ˆÙHÛÙH^\™H[œÈMHZ[]\ËÜ‚ˆH™YH‰Ù\ØØ\R[
+™\Ù]\›
+_HÜ°êY\ˆ[ˆ›Ý]™X]H[ÝH\ÜÙOØOÜ‚ˆÙ]‚ˆˆJNÂ‚ˆ™]\›ˆÈÙ[ˆYK›ÝšY\Žˆ›ØÙ\ÜË™[‹‘SPRSÔ“Õ’QTˆœÛ]‹Y\ÜØYÙNˆÛÙH[›ÞpêH\ˆ[XZ[ˆˆNÂˆB‚ˆ™]\›ˆÂˆÙ[ˆ˜[ÙKˆ›ÝšY\Žˆ›ØÙ\ÜË™[‹”ÓT×Ô“Õ’QTˆœÛ\È‹ˆY\ÜØYÙNˆ”ÓTËÕÚ]Ð\›ÛˆÛÛ™šYÝ\°êKˆ][\Ù^ˆ[ˆ[XZ[ÝHÛÛ™šYÝ\™^ˆ[ˆ›ÝšY\ˆÓTËˆ‚ˆNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆXÝ]˜]U™\šYšYYXØÛÝ[
+ÈÛÛ\[žRY\Ù\’Y\™Ù]\HJHÂˆÛÛœÝ\Ù\ÛÛ[[ˆH\™Ù]\HOOHœÛ™HˆÈœÛ™WÝ™\šYšYYˆˆ™[XZ[Ý™\šYšYYŽÂˆÛÛœÝÛÛ\[žPÛÛ[[ˆH\™Ù]\HOOHœÛ™HˆÈœÛ™WÝ™\šYšYYˆˆ™[XZ[Ý™\šYšYYŽÂˆÛÛœÝ\Ù\œÒ\Õ™\šYšXØ][Û”Ý]\ÈH]ØZ]ÛÛ[[‘^\ÝÊ\Ù\œÈ‹™\šYšXØ][Û—ÜÝ]\ÈŠNÂˆÛÛœÝÛÛ\[šY\Ò\Õ™\šYšXØ][Û”Ý]\ÈH]ØZ]ÛÛ[[‘^\ÝÊ˜ÛÛ\[šY\È‹™\šYšXØ][Û—ÜÝ]\ÈŠNÂˆÛÛœÝ\Ù\œÒ\Õ™\šYšYY]H]ØZ]ÛÛ[[‘^\ÝÊ\Ù\œÈ‹™\šYšYYØ]ŠNÂˆÛÛœÝÛÛ\[šY\Ò\Õ™\šYšYY]H]ØZ]ÛÛ[[‘^\ÝÊ˜ÛÛ\[šY\È‹™\šYšYYØ]ŠNÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆTUH\Ù\œÂˆÑU	Ý\Ù\ÛÛ[[ŸO]YKˆXØÛÝ[ÜÝ]\ÏIØXÝ]™IËˆ™\šYšXØ][Û—Ü™\]Z\™YY˜[ÙKˆ	Ý\Ù\œÒ\Õ™\šYšXØ][Û”Ý]\ÈÈ™\šYšXØ][Û—ÜÝ]\ÏIÝ™\šYšYY	ËˆˆˆŸBˆ	Ý\Ù\œÒ\Õ™\šYšYY]È™\šYšYYØ]PÓÐSTÐÑJ™\šYšYYØ]ÕT”‘S•ÕSQTÕST
+KˆˆˆŸBˆ[š]][Û—ÜÝ]\ÏPÐTÑHÒSˆ[š]][Û—ÜÝ]\ÏIÜ[™[™×Ý™\šYšXØ][Û‰ÈSˆ	ØXÝ]™IÈSÑH[š]][Û—ÜÝ]\ÈS‘ˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYIXˆÝ\Ù\’YBˆ
+NÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆTUHÛÛ\[šY\ÂˆÑU	ØÛÛ\[žPÛÛ[[ŸO]YKˆXØÛÝ[ÜÝ]\ÏIØXÝ]™IËˆ	ØÛÛ\[šY\Ò\Õ™\šYšXØ][Û”Ý]\ÈÈ™\šYšXØ][Û—ÜÝ]\ÏIÝ™\šYšYY	ËˆˆˆŸBˆ	ØÛÛ\[šY\Ò\Õ™\šYšYY]È™\šYšYYØ]PÓÐSTÐÑJ™\šYšYYØ]ÕT”‘S•ÕSQTÕST
+KˆˆˆŸBˆÝXœØÜš\[Û—ÜÝ]\ÏPÓÐSTÐÑJ•SQŠÝXœØÜš\[Û—ÜÝ]\Ë	ÉÊK	ÝšX[	ÊKˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYIXˆØÛÛ\[žRYBˆ
+NÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÜ™X]S›ÝYšXØ][ÛŠÂˆ\Ù\—ÚYˆ]KˆY\ÜØYÙKˆ\KˆÛÛ\[žWÚYˆÝ]\ÈH[œ™XY‹ˆš[Üš]HH››Ü›X[‹ˆ™[]YÙ[]WÝ\HHˆ‹ˆ™[]YÙ[]WÚYH[ˆXÝ[Û—Ý\›Hˆ‹ˆÜ™X]YØžHH[ˆ\ÜÚYÛ™YÝÈH[ˆØ\™ZÝ\ÙWÚYH[ŸJHÂˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È›ÝYšXØ][ÛœÂˆ
+\Ù\—ÚY]KY\ÜØYÙK\KÛÛ\[žWÚYÝ]\Ëš[Üš]Kˆ™[]YÙ[]WÝ\K™[]YÙ[]WÚYXÝ[Û—Ý\›Ü™X]YØžKˆ\ÜÚYÛ™YÝËØ\™ZÝ\ÙWÚY
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë		K	L	LK	L‹	LÊXˆÂˆ\Ù\—ÚYˆ]KˆY\ÜØYÙKˆ\KˆÛÛ\[žWÚYˆÝ]\Ëˆš[Üš]Kˆ™[]YÙ[]WÝ\Kˆ™[]YÙ[]WÚYˆXÝ[Û—Ý\›ˆÜ™X]YØžKˆ\ÜÚYÛ™YÝËˆØ\™ZÝ\ÙWÚYˆBˆ
+NÂŸB‚˜ÛÛœÝÓÓTS–WÓSÑSWÒÑVTÈHÂˆ™\Ú›Ø\™‹ˆœ™XÚ\˜ÚH‹ˆ˜\ÜÚ\Ý[ÚXH‹ˆœÝ\\—ØYZ[ˆ‹ˆ˜Ú]‹ˆ››ÝYšXØ][ÛœÈ‹ˆœ›ÙZ]È‹ˆœ\[˜Z\™\È‹ˆœÝØÚÈ‹ˆ›[Ý]™[Y[È‹ˆ™[™\ÝÈ‹ˆ™[\XÙ[Y[È‹ˆœØØ[›™\ˆ‹ˆœÜÈ‹ˆ›X\šÙ]XÙH‹ˆ˜ÛÛ[X[™\×Ü™XÝY\È‹ˆ™[\È‹ˆœZY[Y[È‹ˆœ™XÝ\È‹ˆ˜XÚ]È‹ˆ™›Ý\›š\ÜÙ]\œÈ‹ˆ˜ÛY[È‹ˆœÚ[YÙH‹ˆœÚ[YÙWÜ\ˆ‹ˆœ\˜[Y]™\×ÜÚ[YÙH‹ˆš[™[Z\™H‹ˆšXH‹ˆœ™][š[ÛœÈ‹ˆ˜ÛÛ\Xš[]H‹ˆ™ØÝ[Y[È‹ˆœ˜\ÜÈ‹ˆ˜[\\È‹ˆ˜XÝ]š]\È‹ˆ][\Ø]]\œÈ‹ˆ˜˜YÙ\È‹ˆœ\˜[Y]™\È‹ˆ˜[œÜÜ‹ˆ˜Ü›H‹ˆ˜]]Û[Øš[H‹ˆš[[[Øš[Y\ˆ‹ˆšÝ[‹ˆœ™\Ý]\˜[‹ˆ›X›Ü˜]Ú\™H‹ˆ™[XÝ›Ûš\]YH‹ˆ[\Û™\È‹ˆš[™›Ü›X]\]YH‹ˆ˜™X]]H‹ˆ›XZ\ÛÛ—ÛY]X›\È‹ˆœÙ\šXÙ\È‹ˆ™YXØ][Ûˆ‹ˆØ[]‹ˆ›ÞXYÙH‹ˆœÛØÚX[‹ˆœ\›XXÚYH‹ˆœ™\ÙX]H‚—NÂ‚‹Êˆ[Ù[\ÈY™™XÝ]™[Y[XÝYœÈÝ\ˆ[™HÛØÚpê]0êH
+š]™X]HÛØÚpê]0êHÙ][‚ˆ›Ùš[pê]Y\‹[‹ÛÛ\[žWÛ[Ù[\Ë0ê\›ÙØ][ÛœÈÝ\\‹XYZ[ŠKˆÙ\0èBˆ°ê\ÛœÙHHÛÛ›™^[Ûˆ]]HÛÛÚÚYHH\ˆHZY]Ø\™HHœ›Û[™‚ˆ[˜ÚY[›™H°êÛH0ªÈ\ÈHYÛ™HHXÝYˆ0®ÈˆÉÙ\Ý[H]ZHÝ]œ˜Z]Ý]\È\Âˆ™\XØ[\ËˆH0êXÚ\Ú[Ûˆ\ÜÙH0ê\ÛÜ›XZ\È\ˆXØÙ\ÜËXÛÛ›ÛšœËˆ
+‹Â˜\Þ[˜È[˜Ý[ÛˆÙ]ÛÛ\[žS[Ù[\ÊÛÛ\[žRY
+HÂˆÛÛœÝ[Ù[RÙ^\ÈHË‹‹›™]ÈÙ]
+Ë‹‹ÓÓTS–WÓSÑSWÒÑVTË‹‹˜XØÙ\ÜË“SÑSWÐÐUSÑË›X\
+
+JHOˆKšÙ^JWJWNÂ‚ˆYˆ
+XÛÛ\[žRY
+HÂˆ™]\›ˆ[Ù[RÙ^\Ëœ™YXÙJ
+XØËÙ^JHOˆÂˆXØÖÚÙ^WHHYNÂˆ™]\›ˆXØÎÂˆKßJNÂˆB‚ˆÛÛœÝÝH]ØZ]XØÙ\ÜË›ØYXØÙ\ÜÐÛÛ^
+ÛÛÈÛÛ\[žRYJNÂˆ™]\›ˆ[Ù[RÙ^\Ëœ™YXÙJ
+XØËÙ^JHOˆÂˆXØÖÚÙ^WHHXØÙ\ÜË˜ÛÛ\[žS[Ù[TÝ]JÝÙ^JK™[˜X›YÂˆ™]\›ˆXØÎÂˆKßJNÂŸB‚‹ÊˆOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOBˆÓÓ•°åH	ÐPÐðâÈ8 %\XØ][Ûˆ˜XÚÙ[™ˆKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÝ]HH0êXÚ\Ú[Ûˆš][œÈXØÙ\ÜËXÛÛ›ÛšœÈˆ[Ù[HHBˆÛØÚpê]0êK[‹0ê\›ÙØ][ÛˆÝ\\‹XYZ[‹\›Z\ÜÚ[Ûˆ][\Ø]]\‹ˆ0êY˜]]H°íKˆÙH›ØÈ™H˜Z]]YH	Ø\\]Y\ˆ]^™\]pê\Ë‚‚ˆ]^Ú[™Ù[Y[ÈH›Û™\ˆ˜\Ü0è	Ø[˜ÚY[›™H™\œÚ[Ûˆ‚ˆH\È›Ú]ÈÜðê\È[œÈ0ªÈ›Ú]È	ˆ\›Z\ÜÚ[ÛœÈ0®È
+Û0ê\ÂˆÛÛ[Y\˜ÙKœÝØÚÜø )ŠHÛÛ[™š[ˆ\È\ˆ\ÈØ\™\È]HY[Bˆ
+Û0ê\ÈÝØÚø )ŠK]ZH™H\È™[˜ÛÛ˜ZY[˜[XZ\ÈÂˆH[ˆØ\È	Ù\œ™]\‹HØ\™H‘Q•TÑH
+LÊH]HY]HHZ\ÜÙ\‚ˆ\ÜÙ\ˆˆ[™H[›™H™HÚ]\ÈÝ]œš\ˆ\È[Ù[\È™\›pê\Ë‚ˆOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOH
+‹Â˜ÛÛœÝ˜˜XÈH™\]Z\™J‹‹Ü˜˜XÈŠNÂ˜ÛÛœÝXØÙ\ÜÈH™\]Z\™J‹‹ØXØÙ\ÜËXÛÛ›ÛŠNÂ‚‹ËÈ0êXÛÙHH™]ÛˆÚH°ê\Ù[
+›Ý]\ÈX›\]Y\È8¡¤ˆ™[›ÚYH[]]ðê\°êYHZ[]\œÊK‚™[˜Ý[Ûˆ™\ÛÛ™T™\]Y\Ý\Ù\Š™\JHÂˆYˆ
+™\K\Ù\ŠH™]\›ˆ™\K\Ù\ŽÂˆÛÛœÝXY\ˆH™\KšXY\œË˜]]Üš^˜][ÛˆˆŽÂˆÛÛœÝÚÙ[ˆHXY\‹œÝ\ÕÚ]
+™X\™\ˆŠHÈXY\‹œÛXÙJÊHˆˆŽÂˆYˆ
+]ÚÙ[ŠH™]\›ˆ[ÂˆžHÈ™]\›ˆÝ™\šYžJÚÙ[‹•ÕÔÑPÔ‘U
+NÈHØ]ÚÈ™]\›ˆ[ÈBŸB‚‹ÊˆÛÛ^H	ØXØðêÈHH™\]pêKÚ\™ðêH[™HÙ][H›Ú\È]\YðêH\‚ˆÝ]\È\ÈØ\™\È]IÙ[H˜]™\œÙKˆ
+‹Â˜\Þ[˜È[˜Ý[ÛˆXØÙ\ÜÐÛÛ^›ÜŠ™\K\Ù\ŠHÂˆYˆ
+™\K—ØXØÙ\ÜÐÝ
+H™]\›ˆ™\K—ØXØÙ\ÜÐÝÂˆ™\K—ØXØÙ\ÜÐÝH]ØZ]XØÙ\ÜË›ØYXØÙ\ÜÐÛÛ^
+ÛÛÂˆÛÛ\[žRYˆ\Ù\‹˜ÛÛ\[žWÚYÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JKˆ\Ù\’Yˆ\Ù\‹šYˆ›ÛNˆ›Ü›X[^™T›ÛJ\Ù\‹œ›ÛJKˆ\ÔÝ\\YZ[Žˆ\ÔÝ\\YZ[•\Ù\Š\Ù\ŠKˆJNÂˆ™]\›ˆ™\K—ØXØÙ\ÜÐÝÂŸB‚™[˜Ý[Ûˆ™Y\ÐXØÙ\Ê™\Ë™\™XÝÙ^KXÝ[ÛŠHÂˆÛÛœÝÛØÚY]HH™\™XÝ›]™[OOHœÛØÚY]HŽÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆÛØÚY]BˆÈ[Ù[H0ªÈ	ÚÙ^_H0®È›Ûˆ\ÜÛšX›HÝ\ˆ›Ý™H[™\š\ÙK˜ˆˆXÝ[Ûˆ0ªÈ	ØXÝ[ÛŸH0®È›Ûˆ]]Üš\ðêYHÝ\ˆ0ªÈ	ÚÙ^_H0®Ë˜ˆÛÙNˆÛØÚY]HÈ“SÑSWÑTÐP“Qˆˆ”T“RTÔÒSÓ—ÑS’QQ‹ˆ[Ù[NˆÙ^KˆXÝ[Û‹ˆ™X\ÛÛŽˆ™\™XÝœ™X\ÛÛ‹ˆJNÂŸB‚™[˜Ý[ÛˆXÚXÐÛÛ›ÛJ™\ËÚ\™K\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ	ÝÚ\™_N˜\œ›Ü‹›Y\ÜØYÙH\œ›ÜŠNÂˆ™]\›ˆ™\ËœÝ]\ÊLÊKšœÛÛŠÂˆ\œ›ÜŽˆÛÛ°íH	ØXØðêÈ[ÛY[[°ê[Y[[™\ÜÛšX›Kˆ°êY\ÜØ^Y^‹ˆ‹ˆÛÙNˆPÐÑTÔ×ÐÒPÒ×ÑRSQ‹ˆJNÂŸB‚‹ÊˆØ\™HÛØ˜[HˆÚ\]YH›Ý]HTH˜]XÚ0êYH0è[ˆ[Ù[H
+›Ú\‚ˆXØÙ\ÜËTWÔ“ÕUWÔ•STÊH^YÙH	ØXØðêÈY™™XÝYˆÝ\ˆ	ØXÝ[Ûˆ0êYZ]BˆHHpê]ÙHˆ\È›Ý]\ÈX›\]Y\È
+Ø[œÈ™]ÛŠH\ÜÙ[ˆ]\‚ˆ›Ü™H]][XØ]UÚÙ[ˆ0êXÚYKˆ
+‹Â˜\Þ[˜È[˜Ý[Ûˆ[Ù[PXØÙ\ÜÑÝX\™
+™\K™\Ë™^
+HÂˆÛÛœÝ[HHXØÙ\ÜËœ[Q›Ü”]
+™\Kœ]
+NÂˆYˆ
+\[JH™]\›ˆ™^
+
+NÂˆÛÛœÝ\Ù\ˆH™\ÛÛ™T™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\ŠH™]\›ˆ™^
+
+NÂˆYˆ
+\ÔÝ\\YZ[•\Ù\Š\Ù\ŠJH™]\›ˆ™^
+
+NÂˆYˆ
+›Ü›X[^™T›ÛJ\Ù\‹œ›ÛJHOOH˜Ý\ÝÛY\ˆŠH™]\›ˆ™^
+
+NÂˆžHÂˆÛÛœÝÝH]ØZ]XØÙ\ÜÐÛÛ^›ÜŠ™\K\Ù\ŠNÂˆYˆ
+XÝ˜ÛÛ\[žRY
+H™]\›ˆ™^
+
+NÂˆÛÛœÝXÝ[ÛˆHXØÙ\ÜË˜XÝ[Û‘›Ü”™\]Y\Ý
+™\K›Y]Ù™\Kœ]
+NÂˆ]™\™XÝHXØÙ\ÜË™Y™™XÝ]™PXØÙ\ÜÊÝ[K›[Ù[KXÝ[ÛŠNÂˆËÈÛ›°êY\ÈH°êY°ê\™[˜ÙHˆ[ˆ0êXÜ˜[ˆ›Ú\Ú[ˆ]]\ÈT‘K‚ˆYˆ
+]™\™XÝ˜[ÝÙY	‰ˆXÝ[ÛˆOOHšY]Èˆ	‰ˆ\œ˜^Kš\Ð\œ˜^J[Kœ™XY[ÛÊJHÂˆÛÛœÝ›Ú\Ú[ˆH[Kœ™XY[ÛË™š[™
+
+ÊHOˆXØÙ\ÜË™Y™™XÝ]™PXØÙ\ÜÊÝËšY]ÈŠK˜[ÝÙY
+NÂˆYˆ
+›Ú\Ú[ŠH™\™XÝHÈ[ÝÙYˆYK™X\ÛÛŽˆXÝ\™WÝšXWÉÝ›Ú\Ú[ŸXNÂˆBˆYˆ
+]™\™XÝ˜[ÝÙY
+H™]\›ˆ™Y\ÐXØÙ\Ê™\Ë™\™XÝ[K›[Ù[KXÝ[ÛŠNÂˆ™]\›ˆ™^
+
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ™]\›ˆXÚXÐÛÛ›ÛJ™\Ë›[Ù[PXØÙ\ÜÑÝX\™‹\œ›ÜŠNÂˆBŸB˜\\ÙJ[Ù[PXØÙ\ÜÑÝX\™
+NÂ‚˜ÛÛœÝQUÑÐPÕSÓˆHÂˆÑUˆšY]È‹PQˆšY]È‹ÔSÓ”ÎˆšY]È‹ˆÔÕˆ˜Ü™X]H‹Uˆ\]H‹UÒˆ\]H‹SUNˆ™[]H‹ŸNÂ‚‹ÊˆØ\™H	Ý[ˆ[Ù[HÝHÛÝ\Ë[[Ù[H°êXÚ\È
+™\Ý]\˜[˜ÝZ\Ú[™x )ŠHÈ	ØXÝ[Û‚ˆ\Ý0êYZ]HHHpê]ÙHˆ
+‹Â™[˜Ý[Ûˆ™\]Z\™S[Ù[QÝX\™
+[Ù^KÜÈHßJHÂˆÛÛœÝÚXÚÔ\›Z\ÜÚ[ÛˆHÜË˜ÚXÚÔ\›Z\ÜÚ[ÛˆOOH˜[ÙNÂˆ™]\›ˆ\Þ[˜È
+™\K™\Ë™^
+HOˆÂˆÛÛœÝ\Ù\ˆH™\ÛÛ™T™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\ŠH™]\›ˆ™^
+
+NÈËÈ›Ý]HX›\]YBˆYˆ
+\ÔÝ\\YZ[•\Ù\Š\Ù\ŠJH™]\›ˆ™^
+
+NÈËÈÝ\\ˆYZ[ˆˆXØðêÈÝ[ˆžHÂˆÛÛœÝÝH]ØZ]XØÙ\ÜÐÛÛ^›ÜŠ™\K\Ù\ŠNÂˆYˆ
+XÝ˜ÛÛ\[žRY
+H™]\›ˆ™^
+
+NÂˆÛÛœÝXÝ[ÛˆHQUÑÐPÕSÓ–Ü™\K›Y]ÙHšY]ÈŽÂˆYˆ
+XÚXÚÔ\›Z\ÜÚ[ÛŠHÂˆÛÛœÝ]]HXØÙ\ÜË˜ÛÛ\[žS[Ù[TÝ]JÝ[Ù^JNÂˆYˆ
+Y]]™[˜X›Y
+H™]\›ˆ™Y\ÐXØÙ\Ê™\ËÈ]™[ˆœÛØÚY]H‹™X\ÛÛŽˆ]]œ™X\ÛÛˆK[Ù^KXÝ[ÛŠNÂˆ™]\›ˆ™^
+
+NÂˆBˆÛÛœÝ™\™XÝHXØÙ\ÜË™Y™™XÝ]™PXØÙ\ÜÊÝ[Ù^KXÝ[ÛŠNÂˆYˆ
+]™\™XÝ˜[ÝÙY
+H™]\›ˆ™Y\ÐXØÙ\Ê™\Ë™\™XÝ[Ù^KXÝ[ÛŠNÂˆ™]\›ˆ™^
+
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ™]\›ˆXÚXÐÛÛ›ÛJ™\Ëœ™\]Z\™S[Ù[QÝX\™‹\œ›ÜŠNÂˆBˆNÂŸB‚‹ËÈØ\™H[Ù[HÚ[\H
+Ø[œÈ\›Z\ÜÚ[ÛŠHÝ\ˆ\È›Ý]\œÈ0è°í\È[\›™\Ë‚™[˜Ý[Ûˆ™\]Z\™PÛÛ\[žS[Ù[J[Ù[RÙ^JHÂˆ™]\›ˆ™\]Z\™S[Ù[QÝX\™
+[Ù[RÙ^KÈÚXÚÔ\›Z\ÜÚ[ÛŽˆ˜[ÙHJNÂŸB‚‹ËÈZY]Ø\™H^XÚ]H°ê]][\ØX›Hˆ™\]Z\™T\›Z\ÜÚ[ÛŠœ›ÙZ]È‹˜Ü™X]HŠK‚™[˜Ý[Ûˆ™\]Z\™T\›Z\ÜÚ[ÛŠ[Ù^KXÝ[ÛŠHÂˆ™]\›ˆ\Þ[˜È
+™\K™\Ë™^
+HOˆÂˆÛÛœÝ\Ù\ˆH™\K\Ù\ˆ™\ÛÛ™T™\]Y\Ý\Ù\Š™\JNÂˆYˆ
+]\Ù\ŠH™]\›ˆ™^
+
+NÂˆYˆ
+\ÔÝ\\YZ[•\Ù\Š\Ù\ŠJH™]\›ˆ™^
+
+NÂˆžHÂˆÛÛœÝÝH]ØZ]XØÙ\ÜÐÛÛ^›ÜŠ™\K\Ù\ŠNÂˆYˆ
+XÝ˜ÛÛ\[žRY
+H™]\›ˆ™^
+
+NÂˆÛÛœÝ™\™XÝHXØÙ\ÜË™Y™™XÝ]™PXØÙ\ÜÊÝ[Ù^KXÝ[ÛŠNÂˆYˆ
+]™\™XÝ˜[ÝÙY
+H™]\›ˆ™Y\ÐXØÙ\Ê™\Ë™\™XÝ[Ù^KXÝ[ÛŠNÂˆ™]\›ˆ™^
+
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆ™]\›ˆXÚXÐÛÛ›ÛJ™\Ëœ™\]Z\™T\›Z\ÜÚ[Ûˆ‹\œ›ÜŠNÂˆBˆNÂŸB‚‹ËÈÛÛ\]ˆ[ˆ[Ù[HÚ[\H\ÝZ[XÝYˆÝ\ˆ	Ù[™\š\ÙHÂ˜\Þ[˜È[˜Ý[Ûˆ\ÐÛÛ\[žS[Ù[Q[˜X›Y
+ÛÛ\[žRY[Ù[RÙ^JHÂˆYˆ
+XÛÛ\[žRY[[Ù[RÙ^JH™]\›ˆYNÂˆÛÛœÝÝH]ØZ]XØÙ\ÜË›ØYXØÙ\ÜÐÛÛ^
+ÛÛÈÛÛ\[žRYJNÂˆ™]\›ˆXØÙ\ÜË˜ÛÛ\[žS[Ù[TÝ]JÝ[Ù[RÙ^JK™[˜X›YÂŸB‚‹ËÈØ\™\ÈÓÕTËSSÑSTÈÝ\ˆÚ[Z[œÈÔ•Q°êXÚ\È
+XØðêÈ
+È\›Z\ÜÚ[Ûˆ\ˆpê]ÙJK‚˜ÛÛœÝÕP“SÑSWÔ“ÕUWÑÕPT‘ÈHÂˆËÈ™\Ý]\˜[ˆÈ‹Ü™\Ý]\˜[ÛÜ™\œÈ‹œ™\Ý]\˜[˜ÛÛ[X[™\È—KˆÈ‹Ü™\Ý]\˜[ÛY[KZ][\È‹œ™\Ý]\˜[›Y[H—KˆÈ‹Ü™\Ý]\˜[ÝX›\È‹œ™\Ý]\˜[X›\È—KˆËÈ0âYXØ][Û‚ˆÈ‹ÙYXØ][Û‹ÜÝY[È‹™YXØ][Û‹™[]™\È—KˆÈ‹ÙYXØ][Û‹Ù[œ›ÛY[È‹™YXØ][Û‹š[œØÜš\[ÛœÈ—KˆÈ‹ÙYXØ][Û‹Ù^[\È‹™YXØ][Û‹››Ý\È—KˆÈ‹ÙYXØ][Û‹ÙÜ˜Y\È‹™YXØ][Û‹››Ý\È—KˆÈ‹ÙYXØ][Û‹ÝXXÚ\œÈ‹™YXØ][Û‹œ›Ù™\ÜÙ]\œÈ—KˆÈ‹ÙYXØ][Û‹ØÛ\ÜÙ\È‹™YXØ][Û‹˜Û\ÜÙ\È—KˆÈ‹ÙYXØ][Û‹ÜØÚY[\È‹™YXØ][Û‹™[\ÚWÙWÝ[\È—KˆÈ‹ÙYXØ][Û‹Ø][™[˜ÙH‹™YXØ][Û‹œ™\Ù[˜Ù\È—KˆÈ‹ÙYXØ][Û‹Ù™YK\[œÈ‹™YXØ][Û‹›Y[œÝX[]\È—KˆËÈ[[[Øš[Y\‚ˆÈ‹Ú[[[Øš[Y\‹Ü›Ü\Y\È‹š[[[Øš[Y\‹˜šY[œÈ—KˆÈ‹Ú[[[Øš[Y\‹Ü™[[È‹š[[[Øš[Y\‹›ØØ][ÛœÈ—KˆÈ‹Ú[[[Øš[Y\‹ÜØ[\È‹š[[[Øš[Y\‹™[\È—KˆÈ‹Ú[[[Øš[Y\‹ÚÝ[‹š[[[Øš[Y\‹šÝ[—KˆËÈ]]Û[Øš[BˆÈ‹Ø]]Û[Øš[KÝ™ZXÛ\È‹˜]]Û[Øš[K™ZXÝ[\È—KˆÈ‹Ø]]Û[Øš[KÜ™[[È‹˜]]Û[Øš[K›ØØ][ÛœÈ—KˆÈ‹Ø]]Û[Øš[KÜØ[\È‹˜]]Û[Øš[K™[\È—KˆËÈ›ÞXYÙBˆÈ‹Ý˜]™[Ü\™\ˆ‹›ÞXYÙKœ\[˜Z\™H—KˆËÈÝ˜]™[Ø›ÛÚÚ[™ÜÈ‰Ù\Ý\ÈØ\™0êH\ˆH[Ù[HˆÙHÛÛ\Èš[]ÈBˆËÈ“ÖPQÑUTˆ
+°ê\Ù\™\‹^Y\‹[›[\ŠK[ˆÙ\šXÙHH]Y›Ü›YHÝ]™\0èˆËÈÝ\ËˆHØ\™\ˆ]\˜Z][\™]0è	Ù[\ÞpêH	Ý[™H›Ý]\]YHH°ê\Ù\™\‹‚—NÂ™›Üˆ
+ÛÛœÝÜ™Yš^Ù^WHÙˆÕP“SÑSWÔ“ÕUWÑÕPT‘ÊH\\ÙJ™Yš^™\]Z\™S[Ù[QÝX\™
+Ù^JJNÂ‚‹ËÈKKKKKKKKKHPÈˆ[™Ú[È™YÚ\Ý™H
+È›Ú]È[\Þpê\ÈKKKKKKKKKB™[˜Ý[Ûˆ\ÐYZ[“ZÙU\Ù\Š\Ù\ŠHÂˆÛÛœÝˆH›Ü›X[^™T›ÛJ\Ù\‹œ›ÛJNÂˆ™]\›ˆ\ÔÝ\\YZ[•\Ù\Š\Ù\ŠHÈ˜YZ[ˆ‹˜YZ[š\Ý˜]]\ˆ‹˜YZ[š\Ý˜]]\—Ù[™\š\ÙH‹™\™XÝ[Ûˆ‹™\™XÝ]\ˆ‹›X[˜YÙ\ˆ‹™Ù\˜[—Kš[˜ÛY\ÊŠNÂŸB˜ÛÛœÝ\›P›ÛÛH
+ŠHOˆ
+ˆOOHYHÈYHˆˆOOH˜[ÙHÈ˜[ÙHˆ[
+NÂ‚‹ËÈ™YÚ\Ý™HPÈ
+Ý\ˆ	ÕRJK‚˜\™Ù]
+‹Ü˜˜XËÜ™YÚ\ÝžH‹]][XØ]UÚÙ[‹
+™\K™\ÊHOˆÂˆ™\ËšœÛÛŠÈXÝ[ÛœÎˆ˜˜XËPÕSÓ”ËÝX›[Ù[\Îˆ˜˜XË”ÕP“SÑSTËX™[Îˆ˜˜XË“SÑSWÓP‘SÈJNÂŸJNÂ‚˜ÛÛœÝÕTÔ•QÓS‘ÕPQÑTÈH™]ÈÙ]
+È™œˆ‹™[ˆ‹˜\ˆ‹žšPÓˆ—JNÂ˜\™Ù]
+‹Ü™Y™\™[˜Ù\ËÛ[™ÝXYÙH‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ›ÝÈH
+]ØZ]ÛÛœ]Y\žJ”ÑSPÕ™Y™\œ™YÛ[™ÝXYÙH”“ÓH\Ù\œÈÒT‘HYIH‹Ü™\K\Ù\‹šYJJKœ›ÝÜÖÌNÂˆ™\ËšœÛÛŠÈ[™ÝXYÙNˆÕTÔ•QÓS‘ÕPQÑTËš\Ê›ÝÏËœ™Y™\œ™YÛ[™ÝXYÙJHÈ›ÝËœ™Y™\œ™YÛ[™ÝXYÙHˆ™œˆˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆXÝ\™H[™ÝYKˆˆJNÂˆBŸJNÂ‚˜\œ]
+‹Ü™Y™\™[˜Ù\ËÛ[™ÝXYÙH‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ[™ÝXYÙHHÝš[™Ê™\K˜›ÙOË›[™ÝXYÙHˆŠNÂˆYˆ
+TÕTÔ•QÓS‘ÕPQÑTËš\Ê[™ÝXYÙJJH™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“[™ÝYH›Ûˆš\ÙH[ˆÚ\™ÙKˆˆJNÂˆ]ØZ]ÛÛœ]Y\žJ•TUH\Ù\œÈÑU™Y™\œ™YÛ[™ÝXYÙOIK\]YØ]PÕT”‘S•ÕSQTÕSTÒT‘HYIˆ‹Û[™ÝXYÙK™\K\Ù\‹šYJNÂˆ™\ËšœÛÛŠÈ[™ÝXYÙHJNÂˆHØ]Ú
+\œ›ÜŠHÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆØ]]™YØ\™H[™ÝYKˆˆJNÂˆBŸJNÂ‚‹ËÈ›Ú]ÈY™™XÝYœÈH	Ý][\Ø]]\ˆÛÝ\˜[‚˜\™Ù]
+‹Ü˜˜XËÛYH‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÝH]ØZ]XØÙ\ÜÐÛÛ^›ÜŠ™\K™\K\Ù\ŠNÂˆÛÛœÝÙ^\ÈHXØÙ\ÜË™^ÜÙYÙ^\Ê
+NÂˆÛÛœÝY™™XÝ]™HHXØÙ\ÜË™Y™™XÝ]™SX\
+ÝÙ^\ÊNÂˆÛÛœÝ[Ù[\ÈHßNÂˆÛÛœÝ\ØX›YH×NÂˆ›Üˆ
+ÛÛœÝÙ^HÙˆÙ^\ÊHÂˆÛÛœÝXÝYˆHÝš\ÔÝ\\YZ[ˆXØÙ\ÜË˜ÛÛ\[žS[Ù[TÝ]JÝÙ^JK™[˜X›YÂˆYˆ
+ZÙ^Kš[˜ÛY\Ê‹ˆŠJH[Ù[\ÖÚÙ^WHHXÝYŽÂˆYˆ
+XXÝYŠH\ØX›Yœ\Ú
+Ù^JNÂˆBˆÛÛœÝ\›\ÈH]ØZ]ÛÛœ]Y\žJÑSPÕ
+ˆ”“ÓH\Ù\—Ü\›Z\ÜÚ[ÛœÈÒT‘H\Ù\—ÚYIXÜ™\K\Ù\‹šYJNÂˆ™\ËšœÛÛŠÂˆ›ÛNˆ™\K\Ù\‹œ›ÛKˆ\×ÜÝ\\—ØYZ[Žˆ\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠKˆ\Ú[™\Ü×Ü›Ùš[NˆÝœ›Ùš[RÙ^KˆËÈØ[œÈÛØÚpê]0êH
+ÛY[X\šÙ]XÙx )ŠK]XÝ[™HØ\™HH[Ù[H™HÉØ\\]YK‚ˆ\×ØÛÛ\[žNˆ›ÛÛX[ŠÝ˜ÛÛ\[žRY
+Kˆ[Ù[\Ëˆ\ØX›YÚÙ^\Îˆ\ØX›Yˆ\›Z\ÜÚ[ÛœÎˆ\›\Ëœ›ÝÜËˆËÈ™\™XÝš[˜[Ø[Ý[0êH\ˆHpê›YH[Ý]\ˆ]YH\ÈØ\™\ÈTK‚ˆY™™XÝ]™KˆYÙWÜ›Ý]\ÎˆXØÙ\ÜË”QÑWÔ“ÕUWÔ•STËˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠœ˜˜XËÛYNˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆPÈˆJNÂˆBŸJNÂ‚‹ËÈ›Ú]È	Ý[ˆ[\ÞpêH
+YZ[ˆ[™\š\ÙJH8 %ØÛÜ[™ÈÝšXÝšXHHÚÙ[ˆ
+TÑHJK‚˜\™Ù]
+‹ØÛÛ\[žKÝ\Ù\œËÎšYÜ\›Z\ÜÚ[ÛœÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+Z\ÐYZ[“ZÙU\Ù\Š™\K\Ù\ŠJH™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ”°ê\Ù\°êH0è	ØYZ[š\Ý˜][ÛˆH	Ù[™\š\ÙKˆˆJNÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\™Ù]H
+]ØZ]ÛÛœ]Y\žJÑSPÕY[˜[YK›ÛKÛÛ\[žWÚY\×ÜÝ\\—ØYZ[ˆ”“ÓH\Ù\œÈÒT‘HYIXÜ™\Kœ\˜[\ËšYJJKœ›ÝÜÖÌNÂˆYˆ
+]\™Ù]
+H™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ‘[\ÞpêH[›Ý]˜X›HˆJNÂˆYˆ
+Z\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠH	‰ˆ[X™\Š\™Ù]˜ÛÛ\[žWÚY
+HOOH[X™\ŠÛÛ\[žRY
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ‘[\ÞpêH	Ý[™H]]™H[™\š\ÙKˆˆJNÂˆBˆÛÛœÝ\›\ÈH
+]ØZ]ÛÛœ]Y\žJÑSPÕ
+ˆ”“ÓH\Ù\—Ü\›Z\ÜÚ[ÛœÈÒT‘H\Ù\—ÚYIXÝ\™Ù]šYJJKœ›ÝÜÎÂˆÛÛœÝ[Ù[\ÈH]ØZ]Ù]ÛÛ\[žS[Ù[\Ê\™Ù]˜ÛÛ\[žWÚY
+NÂ‚ˆÊˆ	Ø[˜ÚY[ˆ0êXÜ˜[ˆY™šXÚZ]0ªÈ0êXÛØÚ0êH0®ÈÝ\ˆÝ]HØ\ÙHØ[œÈYÛ™Bˆ[œ™YÚ\Ý°êYK[ÜœÈ]YH	ØXØðêÈ°êY[0ê]Z]0ªÈ]]Üš\ðêH0®Ëˆ[™péÛÚ]ˆ0ê\ÛÜ›XZ\ËÝ\ˆÚ\]YHÛ0êHH™YÚ\Ý™KH˜[]\ˆ]ZHÉØ\\]YBˆ”RSQS•
+YÛ™H^XÚ]KÚ[›Ûˆ0êY˜]]H°íJH]H0êY˜]]H°íBˆÙ][Ý\ˆH›Ý]Ûˆ0ªÈ°êZ[š]X[\Ù\ˆÙ[ÛˆH°íH0®Ëˆ
+‹ÂˆÛÛœÝÝH]ØZ]XØÙ\ÜË›ØYXØÙ\ÜÐÛÛ^
+ÛÛÂˆÛÛ\[žRYˆ\™Ù]˜ÛÛ\[žWÚY\Ù\’Yˆ\™Ù]šYˆ›ÛNˆ›Ü›X[^™T›ÛJ\™Ù]œ›ÛJK\ÔÝ\\YZ[Žˆ˜[ÙKˆJNÂˆÛÛœÝY™™XÝ]™HHßNÂˆÛÛœÝ›ÛQY˜][ÈHßNÂˆÛÛœÝ^XÚ]HßNÂˆÛÛœÝ™YÚ\Ý™HH˜˜XË˜[[Ù[RÙ^\Ê
+NÂˆÛÛœÝYÛ™\ÈH™]ÈX\
+\›\Ë›X\
+
+
+HOˆÜ›[Ù[WÚÙ^KJJNÂˆ›Üˆ
+ÛÛœÝÙ^HÙˆ™YÚ\Ý™JHÂˆY™™XÝ]™VÚÙ^WHHßNÂˆ^XÚ]ÚÙ^WHHßNÂˆ›ÛQY˜][ÖÚÙ^WHH˜˜XË™Y˜][\›Z\ÜÚ[ÛœÑ›Ü”›ÛJ›Ü›X[^™T›ÛJ\™Ù]œ›ÛJKÙ^JNÂˆÛÛœÝYÛ™HHYÛ™\Ë™Ù]
+Ù^JNÂˆ›Üˆ
+ÛÛœÝXÝ[ÛˆÙˆ˜˜XËPÕSÓ”ÊHÂˆÛÛœÝ˜[]\ˆHYÛ™HÈYÛ™VÜ˜˜XËPÕSÓ—ÐÓÓSS–ØXÝ[Û—WHˆ[Âˆ^XÚ]ÚÙ^WVØXÝ[Û—HH˜[]\ˆOOHYH˜[]\ˆOOH˜[ÙNÂˆY™™XÝ]™VÚÙ^WVØXÝ[Û—HH^XÚ]ÚÙ^WVØXÝ[Û—HÈ˜[]\ˆOOHYHˆ›ÛQY˜][ÖÚÙ^WVØXÝ[Û—HOOHYNÂˆBˆBˆËÈ[Ù[\È™\›pê\È]Hš]™X]HHHÛØÚpê]0êHˆ›Ûˆ]šXXX›\ÈXÚK‚ˆÛÛœÝ[™\ÜÛšX›\ÈH™YÚ\Ý™K™š[\Š
+ÊHOˆXXØÙ\ÜË˜ÛÛ\[žS[Ù[TÝ]JÝÊK™[˜X›Y
+NÂ‚ˆ™\ËšœÛÛŠÂˆ\Ù\ŽˆÈYˆ\™Ù]šY[˜[YNˆ\™Ù]™[˜[YK›ÛNˆ\™Ù]œ›ÛHKˆ[Ù[\Ë\›Z\ÜÚ[ÛœÎˆ\›\ËˆY™™XÝ]™K›ÛWÙY˜][Îˆ›ÛQY˜][Ë^XÚ]ˆ[˜]˜Z[X›WÚÙ^\Îˆ[™\ÜÛšX›\ËˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ˜ÛÛ\[žKÝ\Ù\œËÜ\›Z\ÜÚ[ÛœÈÑUˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ›Ú]È[\ÞpêHˆJNÂˆBŸJNÂ‚‹ËÈ[œ™YÚ\Ý™H\È›Ú]È	Ý[ˆ[\ÞpêH
+TÑHKM‹N
+Kˆ°êÛHHˆ˜[XZ\ÈH›Ú]‹ËÈÝ\ˆ[ˆ[Ù[H0ê\ØXÝ]°êHÝ\ˆ	Ù[™\š\ÙK‚˜\œ]
+‹ØÛÛ\[žKÝ\Ù\œËÎšYÜ\›Z\ÜÚ[ÛœÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+Z\ÐYZ[“ZÙU\Ù\Š™\K\Ù\ŠJH™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ”°ê\Ù\°êH0è	ØYZ[š\Ý˜][ÛˆH	Ù[™\š\ÙKˆˆJNÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\™Ù]H
+]ØZ]ÛÛœ]Y\žJÑSPÕYÛÛ\[žWÚY”“ÓH\Ù\œÈÒT‘HYIXÜ™\Kœ\˜[\ËšYJJKœ›ÝÜÖÌNÂˆYˆ
+]\™Ù]
+H™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ‘[\ÞpêH[›Ý]˜X›HˆJNÂˆYˆ
+Z\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠH	‰ˆ[X™\Š\™Ù]˜ÛÛ\[žWÚY
+HOOH[X™\ŠÛÛ\[žRY
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ‘[\ÞpêH	Ý[™H]]™H[™\š\ÙKˆˆJNÂˆBˆÛÛœÝ][\ÈH\œ˜^Kš\Ð\œ˜^J™\K˜›ÙOËœ\›Z\ÜÚ[ÛœÊHÈ™\K˜›ÙKœ\›Z\ÜÚ[ÛœÈˆ×NÂˆÛÛœÝÛÛ\[žS[Ù[\ÈH]ØZ]Ù]ÛÛ\[žS[Ù[\Ê\™Ù]˜ÛÛ\[žWÚY
+NÂˆ]ÛÝ[HÂˆ›Üˆ
+ÛÛœÝ]Ùˆ][\ÊHÂˆÛÛœÝÙ^HHÝš[™Ê]›[Ù[WÚÙ^HˆŠKš[J
+NÂˆYˆ
+ZÙ^JHÛÛ[YNÂˆÛÛœÝÈ[Ù[RÙ^HHH˜˜XËœÜ]Ù^JÙ^JNÂˆYˆ
+ÛÛ\[žS[Ù[\ÖÛ[Ù[RÙ^WHOOH˜[ÙJHÛÛ[YNÈËÈ°êÛHBˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È\Ù\—Ü\›Z\ÜÚ[ÛœÂˆ
+\Ù\—ÚY[Ù[WÚÙ^KØ[—ÝšY]ËØ[—ØÜ™X]KØ[—ÙY]Ø[—Ù[]KØ[—Ý˜[Y]KˆØ[—Ú[\ÜØ[—Ù^ÜØ[—Üš[Ø[—ØØ[˜Ù[Ø[—ÜÚ\™K\]YØžK\]YØ]
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë		K	L	LK	L‹	LË“ÕÊ
+JBˆÓˆÓÓ‘“PÕ
+\Ù\—ÚY[Ù[WÚÙ^JHÈTUHÑUˆØ[—ÝšY]ÏQVÓQQ˜Ø[—ÝšY]ËØ[—ØÜ™X]OQVÓQQ˜Ø[—ØÜ™X]KØ[—ÙY]QVÓQQ˜Ø[—ÙY]ˆØ[—Ù[]OQVÓQQ˜Ø[—Ù[]KØ[—Ý˜[Y]OQVÓQQ˜Ø[—Ý˜[Y]KØ[—Ú[\ÜQVÓQQ˜Ø[—Ú[\ÜˆØ[—Ù^ÜQVÓQQ˜Ø[—Ù^ÜØ[—Üš[QVÓQQ˜Ø[—Üš[Ø[—ØØ[˜Ù[QVÓQQ˜Ø[—ØØ[˜Ù[ˆØ[—ÜÚ\™OQVÓQQ˜Ø[—ÜÚ\™K\]YØžOQVÓQQ\]YØžK\]YØ]S“ÕÊ
+XˆÝ\™Ù]šYÙ^K\›P›ÛÛ
+]šY]ÊK\›P›ÛÛ
+]˜Ü™X]JK\›P›ÛÛ
+]\]JK\›P›ÛÛ
+]™[]JKˆ\›P›ÛÛ
+]˜[Y]JK\›P›ÛÛ
+]š[\Ü
+K\›P›ÛÛ
+]™^Ü
+K\›P›ÛÛ
+]œš[
+Kˆ\›P›ÛÛ
+]˜Ø[˜Ù[
+K\›P›ÛÛ
+]œÚ\™JK™\K\Ù\‹šYBˆ
+NÂˆÛÝ[
+ÊÎÂˆBˆ™\ËšœÛÛŠÈÚÎˆYKÛÝ[JNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ˜ÛÛ\[žKÝ\Ù\œËÜ\›Z\ÜÚ[ÛœÈUˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆZ\ÙH0è›Ý\ˆ›Ú]ÈˆJNÂˆBŸJNÂ‚‹ËÈÙÙÛH\ÈÓÕTËSSÑSTÈÝ\ˆØH›Ü™H[™\š\ÙH
+YZ[ŠKˆ°êÛHMˆˆ\Â‹ËÈ[Ù[\Èš[˜Ú\]^™\Ý[°ê\Ù\°ê\È]HÝ\\ˆYZ[ˆ
+Û0êHØ[œÈÚ[™Y\ðêYJK‚˜\œ]
+‹ØÛÛ\[žKÛ[Ù[\È‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+Z\ÐYZ[“ZÙU\Ù\Š™\K\Ù\ŠJH™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ”°ê\Ù\°êH0è	ØYZ[š\Ý˜][ÛˆH	Ù[™\š\ÙKˆˆJNÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ[Ù[\ÈH
+™\K˜›ÙH	‰ˆ™\K˜›ÙK›[Ù[\ÊHßNÂˆ]ÛÝ[HÂˆ›Üˆ
+ÛÛœÝÚÙ^K˜[HÙˆØš™XÝ™[šY\Ê[Ù[\ÊJHÂˆYˆ
+Z\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠH	‰ˆZÙ^Kš[˜ÛY\Ê‹ˆŠJHÛÛ[YNÈËÈ°êÛHM‚ˆÛÛœÝÛÝ\˜ÙHH\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠHÈœÝ\\—ØYZ[ˆˆˆœÛØÚY]HŽÂˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÛÛ\[žWÛ[Ù[\È
+ÛÛ\[žWÚY[Ù[WÚÙ^K\×Ù[˜X›Y[˜X›Y\]YØžKÛÝ\˜ÙJBˆSQTÈ
+	K	‹	Ë	Ë		JBˆÓˆÓÓ‘“PÕ
+ÛÛ\[žWÚY[Ù[WÚÙ^JHÈTUHÑUˆ\×Ù[˜X›YQVÓQQš\×Ù[˜X›Y[˜X›YQVÓQQ™[˜X›Y\]YØžOQVÓQQ\]YØžKˆÛÝ\˜ÙOQVÓQQœÛÝ\˜ÙK\]YØ]S“ÕÊ
+XˆØÛÛ\[žRYÙ^K˜[OOHYK™\K\Ù\‹šYÛÝ\˜ÙWBˆ
+NÂˆÛÝ[
+ÊÎÂˆBˆ™\ËšœÛÛŠÈÚÎˆYKÛÝ[JNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ˜ÛÛ\[žKÛ[Ù[\ÈUˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ[Ù[\È[™\š\ÙHˆJNÂˆBŸJNÂ‚˜\Þ[˜È[˜Ý[ÛˆX›Q^\ÝÊX›S˜[YJHÂˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJ”ÑSPÕ×Ü™YØÛ\ÜÊ	JHTÈX›WÛ˜[YH‹ÂˆX›XË‰ÝX›S˜[Y_XˆJNÂˆ™]\›ˆ›ÛÛX[Š™\Ý[œ›ÝÜÖÌOËX›WÛ˜[YJNÂŸB‚˜\Þ[˜È[˜Ý[ÛˆÛÛ[[‘^\ÝÊX›S˜[YKÛÛ[[“˜[YJHÂˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕBˆ”“ÓH[™›Ü›X][Û—ÜØÚ[XK˜ÛÛ[[œÂˆÒT‘HX›WÜØÚ[XOIÜX›XÉÂˆS‘X›WÛ˜[YOIBˆS‘ÛÛ[[—Û˜[YOI‚ˆSRUXˆÝX›S˜[YKÛÛ[[“˜[YWBˆ
+NÂˆ™]\›ˆ™\Ý[œ›ÝÜË›[™ÝˆÂŸB‚˜\Þ[˜È[˜Ý[Ûˆ[œÝ\™QY˜][ÝXœØÜš\[Û”[œÊ
+HÂˆÛÛœÝY˜][[œÈHÂˆÂˆ˜[YNˆ‘\ÜÙ[Y[‹ˆšXÙWÛ[ÛNˆLˆX^Ý\Ù\œÎˆËˆX^ÝØ\™ZÝ\Ù\ÎˆKˆX^Ü›ÙXÝÎˆŒˆX^Û[Ý™[Y[×Û[ÛNˆLˆšX[Ù^\ÎˆMBˆKˆÂˆ˜[YNˆ”Ý[™\™‹ˆšXÙWÛ[ÛNˆLˆX^Ý\Ù\œÎˆLˆX^ÝØ\™ZÝ\Ù\ÎˆËˆX^Ü›ÙXÝÎˆŒˆX^Û[Ý™[Y[×Û[ÛNˆÌˆšX[Ù^\ÎˆMBˆKˆÂˆ˜[YNˆ”™[Z][H‹ˆšXÙWÛ[ÛNˆMLˆX^Ý\Ù\œÎˆÌˆX^ÝØ\™ZÝ\Ù\ÎˆLˆX^Ü›ÙXÝÎˆLˆX^Û[Ý™[Y[×Û[ÛNˆŒˆšX[Ù^\ÎˆMBˆBˆNÂ‚ˆ›Üˆ
+ÛÛœÝ[ˆÙˆY˜][[œÊHÂˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÝXœØÜš\[Û—Ü[œÂˆ
+ˆ˜[YKˆšXÙWÛ[ÛKˆX^Ý\Ù\œËˆX^ÝØ\™ZÝ\Ù\ËˆX^Ü›ÙXÝËˆX^Û[Ý™[Y[×Û[ÛKˆšX[Ù^\Ëˆ[Ù[\ËˆØ[—Ý\ÙWÜ™\ÜËˆØ[—Ý\ÙWÜ\‹ˆØ[—Ý\ÙWØY˜[˜ÙYÚ[™[ÜžKˆØ[—Ý\ÙWÙØÝ[Y[ËˆØ[—Ý\ÙWØÚ]ˆØ[—Ý\ÙWØZBˆ
+BˆÑSPÕˆ	NŽ˜\˜Ú\‹ˆ	ŽŽ›[Y\šXËˆ	ÎŽš[YÙ\‹ˆ	Žš[YÙ\‹ˆ	NŽš[YÙ\‹ˆ	ŽŽš[YÙ\‹ˆ	ÎŽš[YÙ\‹ˆ	Ž^ˆYKˆYKˆYKˆYKˆYKˆYBˆÒT‘H“ÕVTÕÈ
+ˆÑSPÕH”“ÓHÝXœØÜš\[Û—Ü[œÈÒT‘H˜[YOINŽ˜\˜Ú\‚ˆ
+XˆÂˆ[‹›˜[YKˆ[‹œšXÙWÛ[ÛKˆ[‹›X^Ý\Ù\œËˆ[‹›X^ÝØ\™ZÝ\Ù\Ëˆ[‹›X^Ü›ÙXÝËˆ[‹›X^Û[Ý™[Y[×Û[ÛKˆ[‹šX[Ù^\Ëˆ˜[‚ˆBˆ
+NÂˆB‚ˆ]ØZ]ÛÛœ]Y\žJˆTUHÝXœØÜš\[Û—Ü[œÂˆÑUˆX^Ý\Ù\œÈHÐTÑBˆÒSˆÕÑTŠ˜[YJOIÜ™[Z][IÈS‘ÓÐSTÐÑJX^Ý\Ù\œË
+HHSˆÌˆÒSˆÕÑTŠ˜[YJOIÜÝ[™\™	ÈS‘ÓÐSTÐÑJX^Ý\Ù\œË
+HHSˆLˆÒSˆÕÑTŠ˜[YJHSˆ
+	Ù\ÜÙ[Y[	Ë	ÜÝ\\‰ÊHS‘ÓÐSTÐÑJX^Ý\Ù\œË
+HHSˆÂˆSÑHX^Ý\Ù\œÂˆS‘ˆX^ÝØ\™ZÝ\Ù\ÈHÐTÑBˆÒSˆÕÑTŠ˜[YJOIÜ™[Z][IÈS‘ÓÐSTÐÑJX^ÝØ\™ZÝ\Ù\Ë
+HHSˆLˆÒSˆÕÑTŠ˜[YJOIÜÝ[™\™	ÈS‘ÓÐSTÐÑJX^ÝØ\™ZÝ\Ù\Ë
+HHSˆÂˆÒSˆÕÑTŠ˜[YJHSˆ
+	Ù\ÜÙ[Y[	Ë	ÜÝ\\‰ÊHS‘ÓÐSTÐÑJX^ÝØ\™ZÝ\Ù\Ë
+HHSˆBˆSÑHX^ÝØ\™ZÝ\Ù\ÂˆS‘ˆX^Ü›ÙXÝÈHÐTÑBˆÒSˆÕÑTŠ˜[YJOIÜ™[Z][IÈS‘ÓÐSTÐÑJX^Ü›ÙXÝË
+HHSˆLˆÒSˆÕÑTŠ˜[YJOIÜÝ[™\™	ÈS‘ÓÐSTÐÑJX^Ü›ÙXÝË
+HŒSˆŒˆÒSˆÕÑTŠ˜[YJHSˆ
+	Ù\ÜÙ[Y[	Ë	ÜÝ\\‰ÊHS‘ÓÐSTÐÑJX^Ü›ÙXÝË
+HÌSˆÌˆSÑHX^Ü›ÙXÝÂˆS‘ˆX^Û[Ý™[Y[×Û[ÛHHÐTÑBˆÒSˆÕÑTŠ˜[YJOIÜ™[Z][IÈS‘ÓÐSTÐÑJX^Û[Ý™[Y[×Û[ÛK
+HHSˆŒˆÒSˆÕÑTŠ˜[YJOIÜÝ[™\™	ÈS‘ÓÐSTÐÑJX^Û[Ý™[Y[×Û[ÛK
+HHSˆÌˆÒSˆÕÑTŠ˜[YJHSˆ
+	Ù\ÜÙ[Y[	Ë	ÜÝ\\‰ÊHS‘ÓÐSTÐÑJX^Û[Ý™[Y[×Û[ÛK
+HHSˆLˆSÑHX^Û[Ý™[Y[×Û[ÛBˆS‘ˆX^Û[Ù[\×Ø[ÝÙYHÐTÑBˆÒSˆÕÑTŠ˜[YJOIÜ™[Z][IÈS‘ÓÐSTÐÑJX^Û[Ù[\×Ø[ÝÙY
+HHSˆNNBˆÒSˆÕÑTŠ˜[YJOIÜÝ[™\™	ÈS‘ÓÐSTÐÑJX^Û[Ù[\×Ø[ÝÙY
+HHSˆL‚ˆÒSˆÕÑTŠ˜[YJHSˆ
+	Ù\ÜÙ[Y[	Ë	ÜÝ\\‰ÊHS‘ÓÐSTÐÑJX^Û[Ù[\×Ø[ÝÙY
+HHSˆBˆSÑHX^Û[Ù[\×Ø[ÝÙYˆS‘ˆÒT‘HÕÑTŠ˜[YJHSˆ
+	Ù\ÜÙ[Y[	Ë	ÜÝ\\‰Ë	ÜÝ[™\™	Ë	Ü™[Z][IÊBˆ
+NÂŸB‚˜\™Ù]
+‹È‹
+™\K™\ÊHOˆÂˆ™\ËœÙ[™
+•šX[™ÛHÓTÈ˜XÚÙ[™ðêXÝ\š\ðêHÒÈŠNÂŸJNÂ‚‹ÊˆTÐQÑÓÈ
+‹Â˜\œÜÝ
+ˆ‹Ý\ØY[ÙÛÈ‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\ØYœÚ[™ÛJ›ÙÛÈŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\™\K™š[JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ]XÝ[ˆšXÚY\ˆ™péÝHˆJNÂˆB‚ˆÛÛœÝÙÛÕ\›HX›XÕ\ØY\›
+™\K™\K™š[K™š[[˜[YJNÂ‚ˆ™\ËšœÛÛŠÂˆY\ÜØYÙNˆ“ÙÛÈ\ØY0êH]™XÈÝXØðêÈ‹ˆÙÛ×Ý\›ˆÙÛÕ\›ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ\ØYÙÛÈˆJNÂˆBˆBŠNÂ‚‹ÊˆTÐQÕÈUSTÐUUTˆ
+‹Â˜\œÜÝ
+‹Ý\ØY]\Ù\‹\ÝÈ‹]][XØ]UÚÙ[‹\ØYœÚ[™ÛJœÝÈŠK\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\™\K™š[JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ]XÝ[™HÝÈ™péÝYHˆJNÂˆB‚ˆÛÛœÝÝÕ\›HX›XÕ\ØY\›
+™\K™\K™š[K™š[[˜[YJNÂ‚ˆ™\ËšœÛÛŠÂˆY\ÜØYÙNˆ”ÝÈ][\Ø]]\ˆ\ØY0êYH]™XÈÝXØðêÈ‹ˆ›Ùš[WÚ[XYÙWÝ\›ˆÝÕ\›ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ\ØYÝÈ][\Ø]]\ˆˆJNÂˆBŸJNÂ‚˜\œÜÝ
+ˆ‹Ý\ØY\›ÙXÝZ[XYÙH‹ˆ]][XØ]UÚÙ[‹ˆ\ØY›ÙXÝ[XYÙKœÚ[™ÛJš[XYÙHŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\Ô™XYÛ›T›ÛJ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈXÝ\™HÙ][KˆˆJNÂˆB‚ˆYˆ
+\™\K™š[JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ]XÝ[™H[XYÙH™péÝYHˆJNÂˆB‚ˆÛÛœÝ[XYÙU\›HX›XÕ\ØY\›
+™\K›ÙXÝËÉÜ™\K™š[K™š[[˜[Y_X
+NÂ‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠÂˆY\ÜØYÙNˆ’[XYÙH›ÙZ]\ØY0êYH]™XÈÝXØðêÈ‹ˆ[XYÙWÝ\›ˆ[XYÙU\›ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ\œ›Ü‹›Y\ÜØYÙH‘\œ™]\ˆ\ØY[XYÙH›ÙZ]ˆJNÂˆBˆBŠNÂ‚‹ÊˆTSpâ‘TÈS•‘T’TÑH
+‹Â˜\™Ù]
+‹ØÛÛ\[žK\Ù][™ÜÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕ
+ˆ”“ÓHÛÛ\[žWÜÙ][™ÜÈÔ‘Tˆ–HYTÐÈSRUH‚ˆ
+NÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÖÌH[
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆXÝ\™H\˜[pê™\È[™\š\ÙHˆJNÂˆBŸJNÂ‚˜\™Ù]
+‹ØÛÛ\[žK\Ù][™ÜËØÝ\œ™[‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JNÂ‚ˆYˆ
+XÛÛ\[žRY	‰ˆ\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËšœÛÛŠÂˆÛÛ\[žWÛ˜[YNˆ”]Y›Ü›YHÛØ˜[H‹ˆÙÛ×Ý\›ˆˆ‹ˆ[—Û˜[YNˆYZ[š\Ý˜]]\ˆÞ\Ý0êYH‹ˆÝXœØÜš\[Û—ÜÝ]\Îˆ’[[Z]0êH‹ˆ\×Ü]›Ü›NˆYBˆJNÂˆB‚ˆÛÛœÝÙ][™ÜÔ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕÜËŠ‹Ë›˜[YHTÈ™YÚ\Ý\™YØÛÛ\[žWÛ˜[YBˆ”“ÓHÛÛ\[žWÜÙ][™ÜÈÜÂˆQ•“ÒSˆÛÛ\[šY\ÈÈÓˆËšYXÜË˜ÛÛ\[žWÚYˆÒT‘HÜË˜ÛÛ\[žWÚYIHÔˆÜË˜ÛÛ\[žWÚYTÈ•SˆÔ‘Tˆ–HÐTÑHÒSˆÜË˜ÛÛ\[žWÚYIHSˆSÑHHS‘ÜËšYTÐÂˆSRUXˆØÛÛ\[žRYBˆ
+NÂˆÛÛœÝÛÛ\[žT™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕËŠ‹ËœÝ]\ÈTÈÝXœØÜš\[Û—ÜÝ]\ËÜ›˜[YHTÈ[—Û˜[YBˆ”“ÓHÛÛ\[šY\ÈÂˆQ•“ÒSˆÝXœØÜš\[ÛœÈÈÓˆË˜ÛÛ\[žWÚYXËšYˆQ•“ÒSˆÝXœØÜš\[Û—Ü[œÈÜÓˆÜšY\Ëœ[—ÚYˆÒT‘HËšYIBˆÔ‘Tˆ–HËšYTÐÂˆSRUXˆØÛÛ\[žRYBˆ
+NÂˆÛÛœÝÙ][™ÜÈHÙ][™ÜÔ™\Ý[œ›ÝÜÖÌHßNÂˆÛÛœÝÛÛ\[žHHÛÛ\[žT™\Ý[œ›ÝÜÖÌHßNÂ‚ˆ™\ËšœÛÛŠÂˆ‹‹œÙ][™ÜËˆÛÛ\[žWÚYˆÛÛ\[žRYˆÛÛ\[žWÛ˜[YNˆÙ][™ÜË˜ÛÛ\[žWÛ˜[YHÛÛ\[žK›˜[YH•šX[™ÛHÓTÈ›È‹ˆÙÛ×Ý\›ˆÙ][™ÜË›ÙÛ×Ý\›ˆ‹ˆ[—Û˜[YNˆÛÛ\[žKœ[—Û˜[YHˆ‹ˆÝXœØÜš\[Û—ÜÝ]\ÎˆÛÛ\[žKœÝXœØÜš\[Û—ÜÝ]\Èˆ‹ˆ\Ú[™\Ü×Ý\NˆÛÛ\[žK˜\Ú[™\Ü×Ý\Hˆ‚ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆÓÓTS–HÑUS‘ÔÈÕT”‘S•ˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆY[]0êH[™\š\ÙHˆJNÂˆBŸJNÂ‚˜\œ]
+ˆ‹ØÛÛ\[žK\Ù][™ÜÈ‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\Ô™XYÛ›T›ÛJ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆ•›Ý\È]™^ˆ[ˆXØðêÈXÝ\™HÙ][KˆˆJNÂˆB‚ˆÛÛœÝÂˆÛÛ\[žWÛ˜[YKˆY™\ÜËˆÛ™Kˆ[XZ[ˆÙXœÚ]KˆÙÛ×Ý\›ˆÛÙØ[‹ˆÚ]KˆÛÝ[žKˆ\ØÜš\[Û‹ˆ\Ú[™\Ü×ÜÙXÝÜ‹ˆÝ\œ™[˜ÞKˆ[™ÝXYÙKˆÜ[š[™×ÚÝ\œËˆ˜XÙX›ÛÚ×Ý\›ˆÚ]Ø\Û[X™\‹ˆ[œÝYÜ˜[WÝ\›ˆ\×ÜX›XËˆ\Ú[™\Ü×Ý\BˆHH™\K˜›ÙNÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JNÂ‚ˆËÈÛÛÛ›™\È0ê][™Y\È
+ZYÜ˜][ÛˆŠHˆÛˆ™H\È0êXÜš]]YHÚH[\ÂˆËÈ^\Ý[Ý\ˆ™H\ÈØ\ÜÙ\ˆ[™H˜\ÙH›ÛˆZYÜ°êYK‚ˆÛÛœÝ\Ñ^[™YÛÛ[[œÈH]ØZ]ÛÛ[[‘^\ÝÊ˜ÛÛ\[žWÜÙ][™ÜÈ‹˜Ú]HŠNÂ‚ˆÛÛœÝ^\Ý[™ÈH]ØZ]ÛÛœ]Y\žJˆÑSPÕY”“ÓHÛÛ\[žWÜÙ][™ÜÂˆÒT‘HÛÛ\[žWÚYIHÔˆ
+	NŽš[TÈ•SS‘ÛÛ\[žWÚYTÈ•S
+BˆÔ‘Tˆ–HYTÐÈSRUXˆØÛÛ\[žRYBˆ
+NÂ‚ˆ]Ø]™YÂˆYˆ
+^\Ý[™Ëœ›ÝÜË›[™ÝOOH
+HÂˆØ]™YH]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÛÛ\[žWÜÙ][™ÜÂˆ
+ÛÛ\[žWÚYÛÛ\[žWÛ˜[YKY™\ÜËÛ™K[XZ[ÙXœÚ]KÙÛ×Ý\›ÛÙØ[ŠBˆSQTÈ
+	K	‹	Ë		K	‹	Ë	
+Bˆ‘UT“’S‘È
+˜ˆØÛÛ\[žRYÛÛ\[žWÛ˜[YKY™\ÜËÛ™K[XZ[ÙXœÚ]KÙÛ×Ý\›ÛÙØ[—Bˆ
+NÂˆH[ÙHÂˆØ]™YH]ØZ]ÛÛœ]Y\žJˆTUHÛÛ\[žWÜÙ][™ÜÂˆÑUÛÛ\[žWÛ˜[YOIKˆY™\ÜÏI‹ˆÛ™OIËˆ[XZ[IˆÙXœÚ]OIKˆÙÛ×Ý\›I‹ˆÛÙØ[IËˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYIˆ‘UT“’S‘È
+˜ˆØÛÛ\[žWÛ˜[YKY™\ÜËÛ™K[XZ[ÙXœÚ]KÙÛ×Ý\›ÛÙØ[‹^\Ý[™Ëœ›ÝÜÖÌKšYBˆ
+NÂˆB‚ˆÛÛœÝÙ][™ÜÒYHØ]™Yœ›ÝÜÖÌKšYÂ‚ˆYˆ
+\Ñ^[™YÛÛ[[œÊHÂˆØ]™YH]ØZ]ÛÛœ]Y\žJˆTUHÛÛ\[žWÜÙ][™ÜÂˆÑUÚ]OPÓÐSTÐÑJ	KÚ]JKˆÛÝ[žOPÓÐSTÐÑJ	‹ÛÝ[žJKˆ\ØÜš\[ÛPÓÐSTÐÑJ	Ë\ØÜš\[ÛŠKˆ\Ú[™\Ü×ÜÙXÝÜPÓÐSTÐÑJ	\Ú[™\Ü×ÜÙXÝÜŠKˆÝ\œ™[˜ÞOPÓÐSTÐÑJ	KÝ\œ™[˜ÞJKˆ[™ÝXYÙOPÓÐSTÐÑJ	‹[™ÝXYÙJKˆÜ[š[™×ÚÝ\œÏPÓÐSTÐÑJ	ËÜ[š[™×ÚÝ\œÊKˆ˜XÙX›ÛÚ×Ý\›PÓÐSTÐÑJ	˜XÙX›ÛÚ×Ý\›
+KˆÚ]Ø\Û[X™\PÓÐSTÐÑJ	KÚ]Ø\Û[X™\ŠKˆ[œÝYÜ˜[WÝ\›PÓÐSTÐÑJ	L[œÝYÜ˜[WÝ\›
+Kˆ\×ÜX›XÏPÓÐSTÐÑJ	LK\×ÜX›XÊKˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYIL‚ˆ‘UT“’S‘È
+˜ˆÂˆÚ]HÏÈ[ˆÛÝ[žHÏÈ[ˆ\ØÜš\[ÛˆÏÈ[ˆ\Ú[™\Ü×ÜÙXÝÜˆÏÈ[ˆÝ\œ™[˜ÞHÏÈ[ˆ[™ÝXYÙHÏÈ[ˆÜ[š[™×ÚÝ\œÈÏÈ[ˆ˜XÙX›ÛÚ×Ý\›ÏÈ[ˆÚ]Ø\Û[X™\ˆÏÈ[ˆ[œÝYÜ˜[WÝ\›ÏÈ[ˆ\[Ùˆ\×ÜX›XÈOOH˜›ÛÛX[ˆˆÈ\×ÜX›XÈˆ[ˆÙ][™ÜÒYˆBˆ
+NÂˆB‚ˆËÈH\H	ØXÝ]š]0êHš]Ý\ˆÛÛ\[šY\Èˆ[[ÝHH\Ú›Ø\™Y\]Y‹‚ˆYˆ
+\Ú[™\Ü×Ý\HOOH[™Yš[™Y	‰ˆÛÛ\[žRY
+HÂˆ]ØZ]ÛÛœ]Y\žJˆTUHÛÛ\[šY\ÈÑU\Ú[™\Ü×Ý\OIHÒT‘HYI˜ˆÔÝš[™Ê\Ú[™\Ü×Ý\HˆŠKÛÛ\[žRYBˆ
+NÂˆB‚ˆÛÛœÝ\]YHØ]™YÂ‚ˆ]ØZ]ÙÐXÝ]š]JˆYZ[š\Ý˜]]\ˆ‹ˆ˜YZ[ˆ‹ˆ“[ÙYšXØ][Ûˆ\˜[pê™\È[™\š\ÙH‹ˆ”\˜[pê™\È‹ˆ\˜[pê™\È[™\š\ÙH[ÙYšpê\Èˆ	ØÛÛ\[žWÛ˜[Y_Xˆ
+NÂ‚ˆ™\ËšœÛÛŠ\]Yœ›ÝÜÖÌJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ÂˆœÝ]\ÊL
+BˆšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ[ÙYšXØ][Ûˆ\˜[pê™\È[™\š\ÙHˆJNÂˆBŸJNÂ‚‹Êˆ‘QÒTÕTˆÐPTÈHU‘PÈSˆÒÒTÒH
+‹Â˜\œÜÝ
+‹Ü™YÚ\Ý\‹\ØX\È‹\Þ[˜È
+™\K™\ÊHOˆÂˆ]™YÚ\Ý˜][ÛÛY[H[Âˆ]™YÚ\Ý˜][Û’[•˜[œØXÝ[ÛˆH˜[ÙNÂˆžHÂˆÛÛœÝÂˆÛÛ\[žWÛ˜[YKˆ\Ú[™\Ü×Ý\Kˆ™\ÜÛœÚX›WÛ˜[YKˆ[XZ[ˆÛ™KˆY™\ÜËˆ\ÜÝÛÜ™ˆ[—ÚYˆ[—Û˜[YKˆ[—ÜšXÙKˆÙ[XÝYÛ[Ù[\ÈHßBˆHH™\K˜›ÙNÂ‚ˆÛÛœÝÛX[‘[XZ[HÝš[™Ê[XZ[ˆŠKš[J
+KÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝÛX[”Û™HH›Ü›X[^™SX[TÛ™JÛ™JNÂ‚ˆYˆ
+XÛÛ\[žWÛ˜[YH\™\ÜÛœÚX›WÛ˜[YH\\ÜÝÛÜ™
+XÛX[‘[XZ[	‰ˆXÛX[”Û™JJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ“›ÛH[™\š\ÙK™\ÜÛœØX›K[ÝH\ÜÙH]]H[Ú[œÈ[ˆÛÛXÝ[XZ[ÝH0ê[0ê\Û™HÛÛØ›YØ]Ú\™\Ëˆ‚ˆJNÂˆB‚ˆÛÛœÝ\ÜÝÛÜ™\œ›ÜˆH˜[Y]T\ÜÝÛÜ™Ý™[™Ý
+\ÜÝÛÜ™
+NÂˆYˆ
+\ÜÝÛÜ™\œ›ÜŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ\ÜÝÛÜ™\œ›ÜˆJNÂˆB‚ˆ]ØZ][œÝ\™QY˜][ÝXœØÜš\[Û”[œÊ
+NÂ‚ˆ][”™\Ý[Â‚ˆYˆ
+[X™\‹š\Ò[YÙ\Š[X™\Š[—ÚY
+JJHÂˆ[”™\Ý[H]ØZ]ÛÛœ]Y\žJˆˆÑSPÕ
+‚ˆ”“ÓHÝXœØÜš\[Û—Ü[œÂˆÒT‘HYH	BˆSRUBˆˆÓ[X™\Š[—ÚY
+WBˆ
+NÂˆH[ÙHÂˆ[”™\Ý[HÈ›ÝÜÎˆ×HNÂˆB‚ˆYˆ
+[”™\Ý[œ›ÝÜË›[™ÝOOH	‰ˆ[—Û˜[YJHÂˆ[”™\Ý[H]ØZ]ÛÛœ]Y\žJˆˆÑSPÕ
+‚ˆ”“ÓHÝXœØÜš\[Û—Ü[œÂˆÒT‘HÕÑTŠ˜[YJHHÕÑTŠ	JBˆSRUBˆˆÜ[—Û˜[YWBˆ
+NÂˆB‚ˆYˆ
+[”™\Ý[œ›ÝÜË›[™ÝOOH	‰ˆ[—ÜšXÙJHÂˆ[”™\Ý[H]ØZ]ÛÛœ]Y\žJˆˆÑSPÕ
+‚ˆ”“ÓHÝXœØÜš\[Û—Ü[œÂˆÒT‘HšXÙWÛ[ÛHH	BˆÔ‘Tˆ–HYTÐÂˆSRUBˆˆÓ[X™\Š[—ÜšXÙJWBˆ
+NÂˆB‚ˆYˆ
+[”™\Ý[œ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ”[ˆ[›Ý]˜X›H‚ˆJNÂˆB‚ˆÛÛœÝ[ˆH[”™\Ý[œ›ÝÜÖÌNÂˆÊˆÙ][\È\ÈÙ™œ™\ÈX›\]Y\È]XÝ]™\ÈÛÛÛÝ\ØÜš]˜X›\ÈXÚKˆ\Âˆ[˜ÚY[›™\ÈÙ™œ™\È
+Ý[™\™™[Z][JH™\Ý[[ˆXÙHÝ\ˆ]\œÂˆX›Û›°ê\ËXZ\È™HÙHÚÚ\Ú\ÜÙ[\È0è	Ú[œØÜš\[Û‹ˆ
+‹ÂˆYˆ
+[‹š\×ÜX›XÈOOHYH[‹š\×ØXÝ]™HOOH˜[ÙJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆÙ]HÙ™œ™H‰Ù\Ý\È›ÜÜðêYH0è	Ú[œØÜš\[Û‹ˆÚÚ\Ú\ÜÙ^ˆÝ\\‹\Ú[™\ÜÈÝH›Ëˆ‹ˆÛÙNˆ”S—Ó“ÕÓÑ‘‘T‘Q‹ˆJNÂˆBˆÛÛœÝ™\]Y\ÝY[Ù[\ÈBˆ\œ˜^Kš\Ð\œ˜^JÙ[XÝYÛ[Ù[\ÊBˆÈÙ[XÝYÛ[Ù[\Ëœ™YXÙJ
+XØËÙ^JHOˆÂˆXØÖÚÙ^WHHYNÂˆ™]\›ˆXØÎÂˆKßJBˆˆÙ[XÝYÛ[Ù[\È	‰ˆ\[ÙˆÙ[XÝYÛ[Ù[\ÈOOH›Øš™XÝ‚ˆÈÙ[XÝYÛ[Ù[\ÂˆˆßNÂˆÊˆðê[XÝ[Ûˆš[˜[H\È[Ù[\È8 %\H	ØXÝ]š]0êH
+È[ˆ
+ÈÚÚ^‚ˆ]˜[ˆÝ][Ù[HXœÙ[HH™\]pêH0ê]Z]PÕU°âK]H›Ü›][Z\™BˆÛØÚZ]Ý]\ˆ0êY˜]]È[™H›Ý]\]YH™XÙ]˜Z]™\Ý]\˜[0âYXØ][Û‹ˆX›Ü˜]Ú\™x )ˆH°êÛH\Ý0ê\ÛÜ›XZ\È‚ˆHH›Ùš[pê]Y\ˆ›Ý\›š]Hðê[XÝ[ÛˆH0ê\\ÂˆH	ÛÙ™œ™H™]\™HÙH]IÙ[H‰Ú[˜Û]\ÈÂˆH[™H™\XØ[HÜœÈ›Ùš[™HÉØZ›Ý]H\È0è	Ú[œØÜš\[Ûˆ
+Ù][BˆÝ\\‹XYZ[ˆ]]	ØXØÛÜ™\ˆ[œÝZ]JHÂˆHH[Z]HH[ˆÛÛ\H\È[Ù[\ÈR“ÕU0âTÈ]KY[0èH›Ùš[ˆ
+‹ÂˆÛÛœÝ›Ùš[Y]Y\ˆHXØÙ\ÜË››Ü›X[^™P\Ú[™\ÜÕ\J\Ú[™\Ü×Ý\JNÂˆÛÛœÝ[Ù[\ÑT›Ùš[HXØÙ\ÜËœ›Ùš[S[Ù[\Ê›Ùš[Y]Y\ŠNÂˆÛÛœÝ^Û\Ô\“Ù™œ™HH™]ÈÙ]
+\œ˜^Kš\Ð\œ˜^J[‹™^ÛYYÛ[Ù[\ÊHÈ[‹™^ÛYYÛ[Ù[\Èˆ×JNÂˆÛÛœÝ[X[™\ÈH™]ÈÙ]
+ˆØš™XÝ™[šY\Ê™\]Y\ÝY[Ù[\ÊBˆ™š[\Š
+Ë˜[YWJHOˆ˜[YHOOHYJBˆ›X\
+
+ÚÙ^WJHOˆXØÙ\ÜË››Ü›X[^™RÙ^JÙ^JJBˆ
+NÂˆÛÛœÝÙ[XÝ[Û‘[X[™YHH[X[™\ËœÚ^™HˆÈ[X[™\Èˆ[Ù[\ÑT›Ùš[ÂˆÛÛœÝ[Ù[\Ñš[˜]^HßNÂˆ›Üˆ
+ÛÛœÝ[žHÙˆXØÙ\ÜË“SÑSWÐÐUSÑÊHÂˆYˆ
+[žK˜ÛÜ™JHÈ[Ù[\Ñš[˜]^Ù[žKšÙ^WHHYNÈÛÛ[YNÈBˆ]XÝYˆHÙ[XÝ[Û‘[X[™YKš\Ê[žKšÙ^JNÂˆYˆ
+^Û\Ô\“Ù™œ™Kš\Ê[žKšÙ^JJHXÝYˆH˜[ÙNÂˆÛÛœÝÜ[Û“Ý]™\HH[žK™Ü›Ý\OOH›Ü[ÛœÈŽÂˆYˆ
+[žK™\XØ[	‰ˆ[Ü[Û“Ý]™\H	‰ˆ[[Ù[\ÑT›Ùš[š\Ê[žKšÙ^JJHXÝYˆH˜[ÙNÂˆ[Ù[\Ñš[˜]^Ù[žKšÙ^WHHXÝYŽÂˆBˆÛÛœÝZ›Ý]ÈHØš™XÝšÙ^\Ê[Ù[\Ñš[˜]^
+K™š[\Š
+ÊHOˆ[Ù[\Ñš[˜]^Ú×H	‰ˆ[[Ù[\ÑT›Ùš[š\ÊÊJNÂˆÛÛœÝX^[Ù[\Ð[ÝÙYH[X™\Š[‹›X^Û[Ù[\×Ø[ÝÙY
+NÂ‚ˆYˆ
+X^[Ù[\Ð[ÝÙYˆ	‰ˆX^[Ù[\Ð[ÝÙYNNH	‰ˆZ›Ý]Ë›[™ÝˆX^[Ù[\Ð[ÝÙY
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ	ÛÙ™œ™H	Ü[‹›˜[Y_H\›Y]	ØZ›Ý]\ˆ	ÛX^[Ù[\Ð[ÝÙYH[Ù[JÊH]KY[0èH›Ý™HXÝ]š]0êHÈ›Ý\È[ˆ]™^ˆZ›Ý]0êH	ØZ›Ý]Ë›[™ÝK˜ˆÛÙNˆ“SÑSWÓSRU‹ˆYYÛ[Ù[\ÎˆZ›Ý]Ëˆ[Z]ˆX^[Ù[\Ð[ÝÙYˆJNÂˆB‚ˆYˆ
+ÛX[”Û™JHÂˆÛÛœÝÛ™QYÚ]ÈHX[TÛ™U˜\šX[ÊÛX[”Û™JK›X\
+
+˜\šX[
+HOˆ˜\šX[œ™\XÙJÖ×ŒNWKÙËˆŠJNÂˆÛÛœÝ^\Ý[™ÔÛ™HH]ØZ]ÛÛœ]Y\žJˆÑSPÕY”“ÓH\Ù\œÂˆÒT‘H™YÙ^Ü™\XÙJÓÐSTÐÑJÛ™K	ÉÊK	Ö×ŒNWIË	ÉË	ÙÉÊHHS–J	JBˆSRUXˆÜÛ™QYÚ]×Bˆ
+NÂˆYˆ
+^\Ý[™ÔÛ™Kœ›ÝÜË›[™Ýˆ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ“[pê\›ÈH0ê[0ê\Û™H0êZ°è][\ðêKˆÛÛ›™XÝ^‹]›Ý\È]™XÈ›Ý™H[pê\›ÈH0ê[0ê\Û™Kˆ‚ˆJNÂˆBˆB‚ˆÛÛœÝ^\Ý[™Õ\Ù\ˆH]ØZ]ÛÛœ]Y\žJˆÑSPÕY”“ÓH\Ù\œÈÒT‘HÕÑTŠ[XZ[
+HHÕÑTŠ	JHSRUXˆØÛX[‘[XZ[Û™KIØÛX[”Û™_P[™[™ËšX[™Û]Û\Ü›Ë›ØØ[Bˆ
+NÂ‚ˆYˆ
+^\Ý[™Õ\Ù\‹œ›ÝÜË›[™Ýˆ
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆÙ][XZ[^\ÝH0êZ°èˆ‚ˆJNÂˆB‚ˆÛÛœÝšX[^\ÈH[X™\Š[‹šX[Ù^\ÈMJNÂˆÛÛœÝÙ[™\˜]Y[XZ[HÛX[‘[XZ[Û™KIØÜž\Ëœ˜[™ÛPž]\Ê
+KÔÝš[™Êš^Š_P[™[™ËšX[™Û]Û\Ü›Ë›ØØ[ÂˆÊˆ[œØÜš\[Ûˆ\ˆ0ê[0ê\Û™HÙ][ˆ\ÈH°ê\šYšXØ][ÛˆÓTÈÝ\ˆ	Ú[œÝ[ˆ
+]XÝ[ˆ›ÝšY\ˆÓTÈœ˜[˜Ú0êJH8 %ÛÛ\HXÝYˆ[[pêYX][Y[‚ˆ]™XÈ[XZ[ˆH›^H°ê\šYšXØ][Ûˆ^\Ý[\ÝÛÛœÙ\°êKˆ
+‹ÂˆÛÛœÝÛ™SÛ›T™YÚ\Ý˜][ÛˆHXÛX[‘[XZ[ÂˆÊˆ[˜[H	Ú[œØÜš\[ÛˆˆØ[œÈZKHÛÛÛ›™H™[™H0êY˜]]ˆ	ÝšX[™ÛIÈ]	Ù[™\š\ÙH™H]]˜[XZ\ÈÙHÛÛ›™XÝ\ˆ\Z\ÂˆX[[[šÙÛØ˜[˜ÛÛH
+˜ÛÛ\H‰Ø\\Y[\È0èÙ]H™\œÚ[ÛˆŠKˆ
+‹ÂˆÛÛœÝ™YÚ\Ý˜][Û•[˜[HÙ][˜[œ›ÛT™\]Y\Ý
+™\JNÂ‚ˆ™YÚ\Ý˜][ÛÛY[H]ØZ]ÛÛ˜ÛÛ›™XÝ
+
+NÂˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJ‘QÒSˆŠNÂˆ™YÚ\Ý˜][Û’[•˜[œØXÝ[ÛˆHYNÂ‚ˆÛÛœÝÛÛ\[žT™\Ý[H]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJˆˆS”ÑT•S•ÈÛÛ\[šY\Âˆ
+ˆ˜[YKˆ\Ú[™\Ü×Ý\Kˆ™\ÜÛœÚX›WÛ˜[YKˆ[XZ[ˆÛ™KˆY™\ÜËˆ[—ÚYˆÝXœØÜš\[Û—ÜÝ]\ËˆšX[Ù[™×Ø]ˆ[XZ[Ý™\šYšYYˆÛ™WÝ™\šYšYYˆXØÛÝ[ÜÝ]\ËˆšX[ÜÝ\Ù]KˆšX[Ù[™Ù]KˆÝXœØÜš\[Û—Ü[‹ˆÝXœØÜš\[Û—Ù^\™\×Ø]ˆ[˜[ÚYˆ
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë	“ÕÊ
+H
+È
+	H	È^\ÉÊNŽš[\˜[	L	LK	L‹“ÕÊ
+K“ÕÊ
+H
+È
+	H	È^\ÉÊNŽš[\˜[	LË“ÕÊ
+H
+È
+	H	È^\ÉÊNŽš[\˜[	M
+Bˆ‘UT“’S‘È
+‚ˆˆÂˆÛÛ\[žWÛ˜[YKˆ\Ú[™\Ü×Ý\Hˆ‹ˆ™\ÜÛœÚX›WÛ˜[YKˆÛX[‘[XZ[ˆÛX[”Û™KˆY™\ÜÈˆ‹ˆ[‹šYˆšX[‹ˆšX[^\Ëˆ˜[ÙKˆÛ™SÛ›T™YÚ\Ý˜][Û‹ˆÛ™SÛ›T™YÚ\Ý˜][ÛˆÈ˜XÝ]™Hˆˆœ[™[™×Ý™\šYšXØ][Ûˆ‹ˆ[‹›˜[YH[—Û˜[YHˆ‹ˆ™YÚ\Ý˜][Û•[˜[ˆBˆ
+NÂ‚ˆÛÛœÝÛÛ\[žHHÛÛ\[žT™\Ý[œ›ÝÜÖÌNÂˆÛÛœÝ\ÚY\ÜÝÛÜ™H]ØZ]\Ú\ÜÝÛÜ™
+\ÜÝÛÜ™
+NÂ‚ˆÛÛœÝ\Ù\”™\Ý[H]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJˆˆS”ÑT•S•È\Ù\œÂˆ
+ˆ[˜[YKˆ[XZ[ˆ\ÜÝÛÜ™ˆ›ÛKˆÛÛ\[žWÚYˆ\×ÜÝ\\—ØYZ[‹ˆ˜YÙWØÛÙKˆÛ™Kˆ[XZ[Ý™\šYšYYˆÛ™WÝ™\šYšYYˆXØÛÝ[ÜÝ]\Ëˆ[š]][Û—ÜÝ]\Ëˆ™\šYšXØ][Û—Ü™\]Z\™Yˆ[˜[ÚYˆ
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë		K	L	LK	L‹	LË	M
+Bˆ‘UT“’S‘È
+‚ˆˆÂˆ™\ÜÛœÚX›WÛ˜[YKˆÙ[™\˜]Y[XZ[ˆ\ÚY\ÜÝÛÜ™ˆ˜YZ[ˆ‹ˆÛÛ\[žKšYˆ˜[ÙKˆ’PS‘ÓKQSTIØÛÛ\[žKšYKIÑ]K››ÝÊ
+_XˆÛX[”Û™Kˆ˜[ÙKˆÛ™SÛ›T™YÚ\Ý˜][Û‹ˆÛ™SÛ›T™YÚ\Ý˜][ÛˆÈ˜XÝ]™Hˆˆœ[™[™×Ý™\šYšXØ][Ûˆ‹ˆÛ™SÛ›T™YÚ\Ý˜][ÛˆÈ˜XÝ]™Hˆˆœ[™[™×Ý™\šYšXØ][Ûˆ‹ˆ\Û™SÛ›T™YÚ\Ý˜][Û‹ˆ™YÚ\Ý˜][Û•[˜[ˆBˆ
+NÂ‚ˆÛÛœÝ\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂ‚ˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJˆˆS”ÑT•S•ÈÝXœØÜš\[ÛœÂˆ
+ˆÛÛ\[žWÚYˆ[—ÚYˆÝ\Ù]Kˆ[™Ù]KˆÝ]\Ëˆ^[Y[ÜÝ]\Ëˆ[œÝ[][Û—Ù™YBˆ
+BˆSQTÈ
+	K	‹“ÕÊ
+K“ÕÊ
+H
+È
+	È	È^\ÉÊNŽš[\˜[		K	ŠBˆˆÂˆÛÛ\[žKšYˆ[‹šYˆ[X™\Š[‹šX[Ù^\ÈMJKˆšX[‹ˆ™œ™YWÝšX[‹ˆËÈ[Û[[››Û˜ðêH]HÛY[šYðêHˆ[ˆÚ[™Ù[Y[H\šYˆ[0ê\šY]\‚ˆËÈ™H°êpêXÜš]\ÈÙH]ZHH0ê]0êHÛÛ™[K‚ˆ[X™\Š[‹š[œÝ[][Û—Ù™YH
+BˆBˆ
+NÂ‚ˆ]™\šYšXØ][ÛˆH[Âˆ][]™\žHH[ÂˆÛÛœÝ\™Ù]\HHÛX[‘[XZ[È™[XZ[ˆˆœÛ™HŽÂˆÛÛœÝ\™Ù]˜[YHHÛX[‘[XZ[ÛX[”Û™NÂ‚ˆYˆ
+\Û™SÛ›T™YÚ\Ý˜][ÛŠHÂˆ™\šYšXØ][ÛˆH]ØZ]Ü™X]U™\šYšXØ][ÛÛÙJÂˆÛÛ\[žRYˆÛÛ\[žKšYˆ\Ù\’Yˆ\Ù\‹šYˆ\™Ù]\Kˆ\™Ù]˜[YKˆŽˆ™YÚ\Ý˜][ÛÛY[ˆJNÂˆB‚ˆÊˆ[™HYÛ™HVPÒUH\ˆ[Ù[HHØ][ÙÝYKXÝ]°êHÝH›Ûˆˆ\Âˆ]XÝ[ˆ[Ù[H™H0ê\[™	Ý[ˆ0ªÈ\ÈHYÛ™HHXÝYˆ0®Ëˆ
+‹Âˆ›Üˆ
+ÛÛœÝÛ[Ù[RÙ^K\Ñ[˜X›YHÙˆØš™XÝ™[šY\Ê[Ù[\Ñš[˜]^
+JHÂˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJˆS”ÑT•S•ÈÛÛ\[žWÛ[Ù[\Âˆ
+ÛÛ\[žWÚY[Ù[WÚÙ^K\×Ù[˜X›Y[˜X›Y\]YØžKÛÝ\˜ÙJBˆSQTÈ
+	K	‹	Ë	Ë		Ú[œØÜš\[Û‰ÊBˆÓˆÓÓ‘“PÕ
+ÛÛ\[žWÚY[Ù[WÚÙ^JBˆÈTUHÑUˆ\×Ù[˜X›YQVÓQQš\×Ù[˜X›Yˆ[˜X›YQVÓQQ™[˜X›Yˆ\]YØžOQVÓQQ\]YØžKˆÛÝ\˜ÙOQVÓQQœÛÝ\˜ÙKˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆØÛÛ\[žKšY[Ù[RÙ^K\Ñ[˜X›Y\Ù\‹šYBˆ
+NÂˆB‚ˆYˆ
+›Ùš[Y]Y\ˆOOHœ\›XXÚYHŠHÂˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJˆS”ÑT•S•È\›XXÞWÜÙ][™ÜÈ
+ÛÛ\[žWÚY[˜[ÚY
+BˆSQTÈ
+	K	ŠHÓˆÓÓ‘“PÕ
+ÛÛ\[žWÚY
+HÈ“ÕS‘ØˆØÛÛ\[žKšY™YÚ\Ý˜][Û•[˜[Bˆ
+NÂˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJˆS”ÑT•S•È\›XXÞWÜÚ]\È
+ÛÛ\[žWÚY[˜[ÚYÛÙK˜[YKÚ]WÝ\JBˆSQTÈ
+	K	‹	Ô’SÒTS	Ë	Ë	Ü\›XXÞIÊBˆÓˆÓÓ‘“PÕ
+ÛÛ\[žWÚYÛÙJHÈ“ÕS‘ØˆØÛÛ\[žKšY™YÚ\Ý˜][Û•[˜[ÛÛ\[žK›˜[YWBˆ
+NÂˆB‚ˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJÓÓSRUŠNÂˆ™YÚ\Ý˜][Û’[•˜[œØXÝ[ÛˆH˜[ÙNÂˆ™YÚ\Ý˜][ÛÛY[œ™[X\ÙJ
+NÂˆ™YÚ\Ý˜][ÛÛY[H[Â‚ˆYˆ
+™\šYšXØ][ÛŠHÂˆ[]™\žHH]ØZ]Ù[™™\šYšXØ][Û“Y\ÜØYÙJÂˆ\™Ù]\Kˆ\™Ù]˜[YKˆÛÙNˆ™\šYšXØ][Û‹˜ÛÙKˆ™\šYžU\›ˆ™\šYšXØ][Û‹™\šYžWÝ\›ˆJNÂˆB‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠÂˆÝXØÙ\ÜÎˆYKˆY\ÜØYÙNˆÛ™SÛ›T™YÚ\Ý˜][Û‚ˆÈÛÛ\HÜ°êpêH]™XÈÝXØðêËˆÛÛ›™XÝ^‹]›Ý\È]™XÈ›Ý™H[pê\›ÈH0ê[0ê\Û™Kˆ‚ˆˆ‘[™\š\ÙHÜ°êpêYKˆ°ê\šYšXØ][ÛˆØ›YØ]Ú\™H]˜[XØðêÈÛÛ\]ˆ‹ˆÛÛ\[žKˆ\Ù\‹ˆ[‹ˆ™\šYšXØ][ÛŽˆÛ™SÛ›T™YÚ\Ý˜][Û‚ˆÈÈ™\]Z\™Yˆ˜[ÙHBˆˆÂˆ™\]Z\™YˆYKˆ\™Ù]Ý\Nˆ\™Ù]\Kˆ\™Ù]Ý˜[YNˆ\™Ù]˜[YKˆ[]™\žKˆ™\šYžWÝ\›ˆ™\šYšXØ][Û‹™\šYžWÝ\›ˆBˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆYˆ
+™YÚ\Ý˜][ÛÛY[	‰ˆ™YÚ\Ý˜][Û’[•˜[œØXÝ[ÛŠHÂˆ]ØZ]™YÚ\Ý˜][ÛÛY[œ]Y\žJ”“ÓPÒÈŠK˜Ø]Ú
+
+
+HOˆßJNÂˆBˆ™YÚ\Ý˜][ÛÛY[Ëœ™[X\ÙJ
+NÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆ‘QÒTÕTˆÐPTÈˆ‹\œ›ÜŠNÂ‚ˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ\œ›Ü‹›Y\ÜØYÙH‘\œ™]\ˆÜ°êX][Ûˆ[™\š\ÙHØXTÈ‹ˆÛÙNˆ\œ›Ü‹˜ÛÙHˆ‹ˆ]Z[ˆ\œ›Ü‹™]Z[ˆ‹ˆX›Nˆ\œ›Ü‹X›Hˆ‹ˆÛÛ[[Žˆ\œ›Ü‹˜ÛÛ[[ˆˆ‚ˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ü\ÜÝÛÜ™\™\Ù]Ü™\]Y\Ý‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝY[YšY\ˆHÝš[™Ê™\K˜›ÙOËšY[YšY\ˆˆŠKš[J
+NÂˆÛÛœÝXØÛÝ[\HHÝš[™Ê™\K˜›ÙOË˜XØÛÝ[Ý\H˜]]ÈŠKÓÝÙ\Ø\ÙJ
+NÂ‚ˆYˆ
+ZY[YšY\ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ‘[XZ[ÝH0ê[0ê\Û™HØ›YØ]Ú\™KˆˆJNÂˆB‚ˆÛÛœÝ\Ù\œÒ\ÔÛ™HH]ØZ]ÛÛ[[‘^\ÝÊ\Ù\œÈ‹œÛ™HŠNÂˆÛÛœÝÛÚÜÓZÙQ[XZ[HY[YšY\‹š[˜ÛY\ÊŠNÂˆÛÛœÝ›Ü›X[^™YÛ™HHY[YšY\‹œ™\XÙJÖ×ŒNJ×KÙËˆŠNÂˆÛÛœÝ\™Ù]\HHÛÚÜÓZÙQ[XZ[È™[XZ[ˆˆœÛ™HŽÂˆÛÛœÝ\™Ù]˜[YHHÛÚÜÓZÙQ[XZ[ÈY[YšY\‹ÓÝÙ\Ø\ÙJ
+Hˆ›Ü›X[^™YÛ™NÂ‚ˆYˆ
+\™Ù]\HOOHœÛ™Hˆ	‰ˆ
+]\Ù\œÒ\ÔÛ™H›Ü›X[^™YÛ™K›[™ÝŠJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•0ê[0ê\Û™H[˜[YKˆˆJNÂˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕY[XZ[Û™K›ÛKÛÛ\[žWÚY\×ØXÝ]™Bˆ”“ÓH\Ù\œÂˆÒT‘H	ÛÛÚÜÓZÙQ[XZ[È“ÕÑTŠ[XZ[
+OSÕÑTŠ	JHˆˆœ™YÙ^Ü™\XÙJÓÐSTÐÑJÛ™K	ÉÊK	Ö×ŒNJ×IË	ÉË	ÙÉÊOIHŸBˆÔ‘Tˆ–HYTÐÂˆSRUXˆÝ\™Ù]˜[YWBˆ
+NÂˆÛÛœÝ\Ù\ˆH™\Ý[œ›ÝÜÖÌNÂˆÛÛœÝÙ[™\šXÓY\ÜØYÙHH”ÚHÙHÛÛ\H^\ÝK[ˆÛÙHH°êZ[š]X[\Ø][ÛˆH0ê]0êH[›ÞpêKˆŽÂ‚ˆYˆ
+]\Ù\ŠHÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYKY\ÜØYÙNˆÙ[™\šXÓY\ÜØYÙHJNÂˆB‚ˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ\Ù\‹œ›ÛJNÂˆYˆ
+XØÛÝ[\HOOH˜ÛY[ˆ	‰ˆ›ÛHOOH˜Ý\ÝÛY\ˆŠHÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYKY\ÜØYÙNˆÙ[™\šXÓY\ÜØYÙHJNÂˆBˆYˆ
+XØÛÝ[\HOOH™[\œš\ÙHˆ	‰ˆ›ÛHOOH˜Ý\ÝÛY\ˆŠHÂˆ™]\›ˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYKY\ÜØYÙNˆÙ[™\šXÓY\ÜØYÙHJNÂˆBˆYˆ
+\Ù\‹š\×ØXÝ]™HOOH˜[ÙJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆÛÛ\H0ê\ØXÝ]°êKˆÛÛXÝ^ˆ[ˆYZ[š\Ý˜]]\‹ˆˆJNÂˆB‚ˆÛÛœÝÛÙHHÙ[™\˜]SÝÛÙJ
+NÂˆÛÛœÝÚÙ[ˆHÜž\Ëœ˜[™ÛPž]\Ê
+KÔÝš[™Êš^ŠNÂˆÛÛœÝÛÙR\ÚH]ØZ]˜Üž\š\Ú
+ÛÙKÔ–TÔ“ÕS‘ÊNÂˆÛÛœÝÚÙ[’\ÚH\Ú™\šYšXØ][Û”ÙXÜ™]
+ÚÙ[ŠNÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆTUH\ÜÝÛÜ™Ü™\Ù]ØÛÙ\ÂˆÑU\ÙYØ]S“ÕÊ
+BˆÒT‘H\ÙYØ]TÈ•SS‘\Ù\—ÚYIXˆÝ\Ù\‹šYBˆ
+NÂ‚ˆÛÛœÝÜ™X]YH]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È\ÜÝÛÜ™Ü™\Ù]ØÛÙ\Âˆ
+\Ù\—ÚYÛÛ\[žWÚY\™Ù]Ý\K\™Ù]Ý˜[YKÛÙWÚ\ÚÚÙ[—Ú\Ú^\™\×Ø]
+BˆSQTÈ
+	K	‹	Ë		K	‹“ÕÊ
+H
+ÈS•T•S	ÌMHZ[]\ÉÊBˆ‘UT“’S‘ÈYˆÝ\Ù\‹šY\Ù\‹˜ÛÛ\[žWÚY[\™Ù]\K\™Ù]˜[YKÛÙR\ÚÚÙ[’\ÚBˆ
+NÂ‚ˆÛÛœÝ™\Ù]\›H	ÜX›XÐ\\›
+
+_KÛ[ÝYK\\ÜÙK[ÝX›YOÝÚÙ[IÝÚÙ[ŸXÂˆÛÛœÝ[]™\žHH]ØZ]Ù[™\ÜÝÛÜ™™\Ù]Y\ÜØYÙJÂˆ\™Ù]\Kˆ\™Ù]˜[YKˆÛÙKˆ™\Ù]\›ˆJNÂ‚ˆYˆ
+Y[]™\žKœÙ[
+HÂˆ™]\›ˆ™\ËœÝ]\ÊLÊKšœÛÛŠÂˆ\œ›ÜŽˆ[]™\žK›Y\ÜØYÙKˆ›ÝšY\Žˆ[]™\žKœ›ÝšY\‚ˆJNÂˆB‚ˆ]ØZ]ÙÐ]Y]
+ˆÈ‹‹œ™\K\Ù\ŽˆÈYˆ\Ù\‹šYÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚY›ÛNˆ\Ù\‹œ›ÛK[XZ[ˆ\Ù\‹™[XZ[HKˆœ\ÜÝÛÜ™Ü™\Ù]Ü™\]Y\ÝY‹ˆœ\ÜÝÛÜ™Ü™\Ù]ØÛÙH‹ˆÜ™X]Yœ›ÝÜÖÌKšYˆÈ\™Ù]Ý\Nˆ\™Ù]\K›ÝšY\Žˆ[]™\žKœ›ÝšY\ˆBˆ
+NÂ‚ˆ™\ËšœÛÛŠÂˆÝXØÙ\ÜÎˆYKˆY\ÜØYÙNˆ[]™\žK›Y\ÜØYÙHÙ[™\šXÓY\ÜØYÙKˆ\™Ù]Ý\Nˆ\™Ù]\Kˆ\™Ù]Ý˜[YNˆ\™Ù]˜[YKˆÚÙ[—Ú[ˆÚÙ[ˆÈˆˆˆ[™Yš[™YˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆTÔÕÓÔ‘‘TÑU‘TUQTÕˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ[X[™H°êZ[š]X[\Ø][Ûˆ[ÝH\ÜÙHˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ü\ÜÝÛÜ™\™\Ù]ØÛÛ™š\›H‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝÛY[H]ØZ]ÛÛ˜ÛÛ›™XÝ
+
+NÂˆžHÂˆÛÛœÝÂˆÚÙ[ˆHˆ‹ˆÛÙHHˆ‹ˆY[YšY\ˆHˆ‹ˆ™]×Ü\ÜÝÛÜ™Hˆ‹ˆÛÛ™š\›WÜ\ÜÝÛÜ™Hˆ‚ˆHH™\K˜›ÙHßNÂ‚ˆYˆ
+]ÚÙ[ˆ	‰ˆXÛÙJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÙHÝHY[ˆðêXÝ\š\ðêHØ›YØ]Ú\™KˆˆJNÂˆBˆYˆ
+Ýš[™Ê™]×Ü\ÜÝÛÜ™
+HOOHÝš[™ÊÛÛ™š\›WÜ\ÜÝÛÜ™
+JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“\È]^[ÝÈH\ÜÙH™HÛÜœ™\ÜÛ™[\ËˆˆJNÂˆBˆÛÛœÝ\ÜÝÛÜ™\œ›ÜˆH˜[Y]T\ÜÝÛÜ™Ý™[™Ý
+™]×Ü\ÜÝÛÜ™
+NÂˆYˆ
+\ÜÝÛÜ™\œ›ÜŠH™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ\ÜÝÛÜ™\œ›ÜˆJNÂ‚ˆÛÛœÝ˜[Y\ÈH×NÂˆ]š[\ˆH\ÙYØ]TÈ•SS‘^\™\×Ø]ˆ“ÕÊ
+HŽÂ‚ˆYˆ
+ÚÙ[ŠHÂˆ˜[Y\Ëœ\Ú
+\Ú™\šYšXØ][Û”ÙXÜ™]
+ÚÙ[ŠJNÂˆš[\ˆ
+ÏHS‘ÚÙ[—Ú\ÚI	Ý˜[Y\Ë›[™ÝXÂˆH[ÙHÂˆÛÛœÝ›Ü›X[^™YY[YšY\ˆHÝš[™ÊY[YšY\ˆˆŠKš[J
+NÂˆYˆ
+[›Ü›X[^™YY[YšY\ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ‘[XZ[ÝH0ê[0ê\Û™HØ›YØ]Ú\™H]™XÈHÛÙKˆˆJNÂˆBˆÛÛœÝ\™Ù]˜[YHH›Ü›X[^™YY[YšY\‹š[˜ÛY\ÊŠBˆÈ›Ü›X[^™YY[YšY\‹ÓÝÙ\Ø\ÙJ
+Bˆˆ›Ü›X[^™YY[YšY\‹œ™\XÙJÖ×ŒNJ×KÙËˆŠNÂˆ˜[Y\Ëœ\Ú
+\™Ù]˜[YJNÂˆš[\ˆ
+ÏHS‘ÕÑTŠ\™Ù]Ý˜[YJOSÕÑTŠ		Ý˜[Y\Ë›[™ÝJXÂˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛY[œ]Y\žJˆÑSPÕ‹Š‹K™[XZ[Kœ›ÛBˆ”“ÓH\ÜÝÛÜ™Ü™\Ù]ØÛÙ\È‚ˆ“ÒSˆ\Ù\œÈHÓˆKšY\‹\Ù\—ÚYˆÒT‘H	Ùš[\ŸBˆÔ‘Tˆ–H‹šYTÐÂˆSRUXˆ˜[Y\Âˆ
+NÂˆÛÛœÝ™\Ù]H™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+\™\Ù]
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÙH^\°êHÝH[›Ý]˜X›KˆˆJNÂˆB‚ˆYˆ
+[X™\Š™\Ù]˜][\È
+HHJHÂˆ™]\›ˆ™\ËœÝ]\ÊŽJKšœÛÛŠÈ\œ›ÜŽˆ•›ÜH[]]™\Ëˆ[X[™^ˆ[ˆ›Ý]™X]HÛÙKˆˆJNÂˆB‚ˆYˆ
+ÛÙJHÂˆÛÛœÝ˜[YÛÙHH]ØZ]˜Üž\˜ÛÛ\\™JÝš[™ÊÛÙHˆŠK™\Ù]˜ÛÙWÚ\Ú
+NÂˆYˆ
+]˜[YÛÙJHÂˆ]ØZ]ÛY[œ]Y\žJ•TUH\ÜÝÛÜ™Ü™\Ù]ØÛÙ\ÈÑU][\ÏX][\ÊÌHÒT‘HYIH‹Ü™\Ù]šYJNÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÙH[˜ÛÜœ™XÝˆˆJNÂˆBˆB‚ˆ]ØZ]ÛY[œ]Y\žJ‘QÒSˆŠNÂˆ]ØZ]ÛY[œ]Y\žJ•TUH\Ù\œÈÑU\ÜÝÛÜ™IK\]YØ]PÕT”‘S•ÕSQTÕSTÒT‘HYIˆ‹Âˆ]ØZ]\Ú\ÜÝÛÜ™
+™]×Ü\ÜÝÛÜ™
+Kˆ™\Ù]\Ù\—ÚYˆJNÂˆ]ØZ]ÛY[œ]Y\žJ•TUH\ÜÝÛÜ™Ü™\Ù]ØÛÙ\ÈÑU\ÙYØ]S“ÕÊ
+HÒT‘HYIH‹Ü™\Ù]šYJNÂˆ]ØZ]ÛY[œ]Y\žJˆ•TUH\ÜÝÛÜ™Ü™\Ù]ØÛÙ\ÈÑU\ÙYØ]S“ÕÊ
+HÒT‘H\ÙYØ]TÈ•SS‘\Ù\—ÚYIHS‘Y‰ˆ‹ˆÜ™\Ù]\Ù\—ÚY™\Ù]šYBˆ
+NÂˆ]ØZ]ÛY[œ]Y\žJÓÓSRUŠNÂ‚ˆ]ØZ]ÙÐ]Y]
+ˆÈ‹‹œ™\K\Ù\ŽˆÈYˆ™\Ù]\Ù\—ÚYÛÛ\[žWÚYˆ™\Ù]˜ÛÛ\[žWÚY›ÛNˆ™\Ù]œ›ÛK[XZ[ˆ™\Ù]™[XZ[HKˆœ\ÜÝÛÜ™Ü™\Ù]ØÛÛ™š\›YY‹ˆ\Ù\ˆ‹ˆ™\Ù]\Ù\—ÚYˆÈ\™Ù]Ý\Nˆ™\Ù]\™Ù]Ý\HBˆ
+NÂ‚ˆ™\ËšœÛÛŠÂˆÝXØÙ\ÜÎˆYKˆY\ÜØYÙNˆ“[ÝH\ÜÙH°êZ[š]X[\ðêKˆ›Ý\ÈÝ]™^ˆ›Ý\ÈÛÛ›™XÝ\‹ˆ‚ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ÛY[œ]Y\žJ”“ÓPÒÈŠK˜Ø]Ú
+
+
+HOˆßJNÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆTÔÕÓÔ‘‘TÑUÓÓ‘’T“Hˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆÛÛ™š\›X][Ûˆ°êZ[š]X[\Ø][Ûˆ[ÝH\ÜÙHˆJNÂˆHš[˜[HÂˆÛY[œ™[X\ÙJ
+NÂˆBŸJNÂ‚‹ÊˆKKKKKKKKKH0ê[0ê\Û™Hˆ›Ü›X[\Ø][ÛˆX[H
+
+ÌŒŒÈ\ˆ0êY˜]]
+HKKKKKKKKKBˆH[pê\›ÈH0ê[0ê\Û™H\Ý[ˆY[YšX[HÛÛ›™^[ÛˆˆÛˆÝØÚÙHBˆ›Ü›YHØ[›Ûš\]YH
+ÌŒŒÖ]ÛˆÛÛ\\™HÝ]\È\È˜\šX[\Âˆ
+ÍÌŽLŒKŒŒÈÍÌˆLˆK
+ÌŒŒÍÍÌŽLŒKŒŒÍÍÌŽLŒJKˆ
+‹Â™[˜Ý[Ûˆ›Ü›X[^™SX[TÛ™J˜]ÊHÂˆÛÛœÝÛX[™YHÝš[™Ê˜]ÈˆŠKœ™\XÙJÖ×ŒNJ×KÙËˆŠNÂˆYˆ
+XÛX[™Y
+H™]\›ˆˆŽÂˆ]YÚ]ÈHÛX[™YœÝ\ÕÚ]
+ŠÈŠHÈÛX[™YœÛXÙJJHˆÛX[™YÂˆYˆ
+YÚ]ËœÝ\ÕÚ]
+ŒŠJHYÚ]ÈHYÚ]ËœÛXÙJŠNÂˆYˆ
+YÚ]Ë›[™ÝOOH
+H™]\›ˆ
+ÌŒŒÉÙYÚ]ßXÂˆYˆ
+YÚ]ËœÝ\ÕÚ]
+ŒŒŒÈŠH	‰ˆYÚ]Ë›[™ÝOOHLJH™]\›ˆ
+ÉÙYÚ]ßXÂˆ™]\›ˆ
+ÉÙYÚ]ßXÂŸB‚™[˜Ý[ÛˆX[TÛ™U˜\šX[Ê˜]ÊHÂˆÛÛœÝØ[›ÛšXØ[H›Ü›X[^™SX[TÛ™J˜]ÊNÂˆYˆ
+XØ[›ÛšXØ[
+H™]\›ˆ×NÂˆÛÛœÝYÚ]ÈHØ[›ÛšXØ[œÛXÙJJNÈËÈØ[œÈH
+ÂˆÛÛœÝ˜\šX[ÈH™]ÈÙ]
+ØØ[›ÛšXØ[YÚ]Ë	ÙYÚ]ßXJNÂˆYˆ
+YÚ]ËœÝ\ÕÚ]
+ŒŒŒÈŠJHÂˆ˜\šX[Ë˜Y
+YÚ]ËœÛXÙJÊJNÈËÈ[pê\›ÈØØ[0èÚY™œ™\ÂˆBˆ™]\›ˆ\œ˜^K™œ›ÛJ˜\šX[ÊNÂŸB‚‹ÊˆÑÒSˆÐPTÈ
+‹Â˜\œÜÝ
+‹ÛÙÚ[ˆ‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÈ[XZ[\ÜÝÛÜ™HH™\K˜›ÙNÂˆÛÛœÝÙÚ[’Y[YšY\ˆHÝš[™Ê[XZ[ˆŠKš[J
+NÂˆÛÛœÝ›Ü›X[^™Y[XZ[HÙÚ[’Y[YšY\‹ÓÝÙ\Ø\ÙJ
+NÂ‚ˆYˆ
+[ÙÚ[’Y[YšY\ˆ\\ÜÝÛÜ™
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ’Y[YšX[][ÝH\ÜÙHØ›YØ]Ú\™\ÈˆJNÂˆB‚ˆÛÛœÝ\Ù\œÒ\ÔÛ™HH]ØZ]ÛÛ[[‘^\ÝÊ\Ù\œÈ‹œÛ™HŠNÂˆÛÛœÝÛÚÜÓZÙQ[XZ[HÙÚ[’Y[YšY\‹š[˜ÛY\ÊŠNÂˆÛÛœÝÛ™U˜\šX[ÈHX[TÛ™U˜\šX[ÊÙÚ[’Y[YšY\ŠNÂˆÛÛœÝØ[”ÙX\˜ÚÛ™HH\Ù\œÒ\ÔÛ™H	‰ˆ[ÛÚÜÓZÙQ[XZ[	‰ˆÛ™U˜\šX[Ë›[™Ýˆ	‰‚ˆÙÚ[’Y[YšY\‹œ™\XÙJÖ×ŒNWKÙËˆŠK›[™ÝHŽÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕˆKŠ‹ˆË›˜[YHTÈÛÛ\[žWÛ˜[YKˆËœÝ]\ÈTÈÛÛ\[žWÜÝ]\ËˆË˜XØÛÝ[ÜÝ]\ÈTÈÛÛ\[žWØXØÛÝ[ÜÝ]\ËˆË™[XZ[Ý™\šYšYYTÈÛÛ\[žWÙ[XZ[Ý™\šYšYYˆËœÛ™WÝ™\šYšYYTÈÛÛ\[žWÜÛ™WÝ™\šYšYYˆË˜\Ú[™\Ü×Ý\HTÈ\Ú[™\Ü×Ý\KˆËšX[Ù[™Ù]HTÈÛÛ\[žWÝšX[Ù[™Ù]KˆËœÝXœØÜš\[Û—Ù^\™\×Ø]TÈÛÛ\[žWÜÝXœØÜš\[Û—Ù^\™\×Ø]ˆËœÝ]\ÈTÈÝXœØÜš\[Û—ÜÝ]\ËˆË™[™Ù]HTÈÝXœØÜš\[Û—Ù[™Ù]KˆÜ›˜[YHTÈ[—Û˜[YBˆ”“ÓH\Ù\œÈBˆQ•“ÒSˆÛÛ\[šY\ÈÈÓˆK˜ÛÛ\[žWÚYHËšYˆQ•“ÒSˆÝXœØÜš\[ÛœÈÈÓˆËšYHË˜ÛÛ\[žWÚYˆQ•“ÒSˆÝXœØÜš\[Û—Ü[œÈÜÓˆËœ[—ÚYHÜšYˆÒT‘HÕÑTŠK™[XZ[
+HHÕÑTŠ	JBˆ	ØØ[”ÙX\˜ÚÛ™HÈ“Ôˆ™YÙ^Ü™\XÙJÓÐSTÐÑJKœÛ™K	ÉÊK	Ö×ŒNWIË	ÉË	ÙÉÊHHS–J	ŠHˆˆˆŸBˆÔ‘Tˆ–HËšYTÐÂˆSRUXˆØ[”ÙX\˜ÚÛ™BˆÈÛÙÚ[’Y[YšY\‹Û™U˜\šX[Ë›X\
+
+˜\šX[
+HOˆ˜\šX[œ™\XÙJÖ×ŒNWKÙËˆŠJWBˆˆÛÙÚ[’Y[YšY\—Bˆ
+NÂ‚ˆÛÛœÝ\Ù\ˆH™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+]\Ù\ŠH™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆ’Y[YšX[[˜ÛÜœ™XÝˆJNÂ‚ˆÛÛœÝ[˜[YHÙ][˜[œ›ÛT™\]Y\Ý
+™\JNÂ‚ˆYˆ
+J]ØZ]ÛÛ\[žP™[Û™ÜÕÕ[˜[
+\Ù\‹˜ÛÛ\[žWÚY[˜[Y
+JJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXØðêÈ™Y\ðêHˆÙHÛÛ\H¸ &X\\Y[\È0èÙ]H™\œÚ[Û‹ˆ‚ˆJNÂˆB‚ˆYˆ
+\Ù\‹š\×ØXÝ]™HOOH˜[ÙJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆÛÛ\H0ê\ØXÝ]°êHˆJNÂˆB‚ˆÛÛœÝ\ÜÝÛÜ™X]Ú\ÈH]ØZ]™\šYžT\ÜÝÛÜ™
+\ÜÝÛÜ™\Ù\‹œ\ÜÝÛÜ™
+NÂ‚ˆYˆ
+\\ÜÝÛÜ™X]Ú\ÊHÂˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆ“[ÝH\ÜÙH[˜ÛÜœ™XÝˆJNÂˆB‚ˆYˆ
+Z\Ð˜Üž\\Ú
+\Ù\‹œ\ÜÝÛÜ™
+JHÂˆ]ØZ]ÛÛœ]Y\žJ•TUH\Ù\œÈÑU\ÜÝÛÜ™IHÒT‘HYIˆ‹Âˆ]ØZ]\Ú\ÜÝÛÜ™
+\ÜÝÛÜ™
+Kˆ\Ù\‹šYˆJNÂˆB‚ˆÛÛœÝ\ÔÝ\\YZ[ˆBˆ\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYHˆ\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYHˆˆ\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHHˆÝš[™Ê\Ù\‹œ›ÛHˆŠKÓÝÙ\Ø\ÙJ
+HOOHœÝ\\—ØYZ[ˆˆˆÕTT—ÐQRS—ÑSPRSËš\Ê›Ü›X[^™Y[XZ[
+HˆÕTT—ÐQRS—ÑSPRSËš\ÊÝš[™Ê\Ù\‹™[XZ[ˆŠKš[J
+KÓÝÙ\Ø\ÙJ
+JNÂ‚ˆÛÛœÝ\ÐÝ\ÝÛY\XØÛÝ[H›Ü›X[^™T›ÛJ\Ù\‹œ›ÛJHOOH˜Ý\ÝÛY\ˆŽÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆËÈÛÛ\\ÈØ[œÈ[™\š\ÙH
+ÛY[]œ™]\ŠHˆ\ÈH°ê\šYšXØ][Û‚ˆËÈ[™\š\ÙH0è^YÙ\‹‚ˆÛÛœÝ\Ó›ÐÛÛ\[žHH]\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\Ù\•™\šYšYYH\Ù\‹™[XZ[Ý™\šYšYYOOHYH\Ù\‹œÛ™WÝ™\šYšYYOOHYNÂˆÛÛœÝÛÛ\[žU™\šYšYYBˆ\ÐÝ\ÝÛY\XØÛÝ[ˆ\Ó›ÐÛÛ\[žHˆ\Ù\‹˜ÛÛ\[žWÙ[XZ[Ý™\šYšYYOOHYHˆ\Ù\‹˜ÛÛ\[žWÜÛ™WÝ™\šYšYYOOHYNÂˆÛÛœÝXØÛÝ[[™[™ÈBˆÝš[™Ê\Ù\‹˜XØÛÝ[ÜÝ]\ÈˆŠKÓÝÙ\Ø\ÙJ
+HOOHœ[™[™×Ý™\šYšXØ][Ûˆˆˆ
+Z\ÐÝ\ÝÛY\XØÛÝ[	‰ˆZ\Ó›ÐÛÛ\[žH	‰ˆÝš[™Ê\Ù\‹˜ÛÛ\[žWØXØÛÝ[ÜÝ]\ÈˆŠKÓÝÙ\Ø\ÙJ
+HOOHœ[™[™×Ý™\šYšXØ][ÛˆŠHˆ\Ù\‹™\šYšXØ][Û—Ü™\]Z\™YOOHYNÂ‚ˆYˆ
+]\Ù\•™\šYšYYXÛÛ\[žU™\šYšYYXØÛÝ[[™[™ÊHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆ•°ê\šYšXØ][ÛˆØ›YØ]Ú\™H]˜[ÛÛ›™^[ÛˆÛÛ\0êKˆ‹ˆÛÙNˆ™\šYšXØ][Û—Ü™\]Z\™Y‹ˆ™Y\™XÝˆ‹Ý™\šYšXØ][Û‹\™\]Z\™Y‹ˆ\Ù\—ÚYˆ\Ù\‹šYˆÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚYˆ\™Ù]Ý\Nˆ\Ù\‹™[XZ[	‰ˆTÝš[™Ê\Ù\‹™[XZ[
+Kš[˜ÛY\Ê[™[™ËšX[™Û]Û\Ü›Ë›ØØ[ŠHÈ™[XZ[ˆˆœÛ™H‹ˆ\™Ù]Ý˜[YNˆ\Ù\‹™[XZ[	‰ˆTÝš[™Ê\Ù\‹™[XZ[
+Kš[˜ÛY\Ê[™[™ËšX[™Û]Û\Ü›Ë›ØØ[ŠHÈ\Ù\‹™[XZ[ˆ\Ù\‹œÛ™BˆJNÂˆB‚ˆYˆ
+Z\ÐÝ\ÝÛY\XØÛÝ[	‰ˆ\Ù\‹˜ÛÛ\[žWÜÝ]\ÈOOHœÝ\Ü[™YŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆ‘[™\š\ÙHÝ\Ü[™YKˆ™]Z[^ˆÛÛXÝ\ˆ8 &XYZ[š\Ý˜][Û‹ˆ‚ˆJNÂˆB‚ˆÛÛœÝÝXœØÜš\[Û‘[™Bˆ\Ù\‹˜ÛÛ\[žWÜÝXœØÜš\[Û—Ù^\™\×Ø]ˆ\Ù\‹˜ÛÛ\[žWÝšX[Ù[™Ù]Hˆ\Ù\‹œÝXœØÜš\[Û—Ù[™Ù]NÂˆYˆ
+Z\ÐÝ\ÝÛY\XØÛÝ[	‰ˆÝXœØÜš\[Û‘[™	‰ˆ™]È]JÝXœØÜš\[Û‘[™
+K™Ù][YJ
+H]K››ÝÊ
+JHÂˆ]ØZ]ÛÛœ]Y\žJˆ•TUHÛÛ\[šY\ÈÑUÝXœØÜš\[Û—ÜÝ]\ÏIÙ^\™Y	ÈÒT‘HYIH‹ˆÝ\Ù\‹˜ÛÛ\[žWÚYBˆ
+K˜Ø]Ú
+
+
+HOˆßJNÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆ•›Ý™H\ÜØZHÜ˜]Z]ÝHX›Û›™[Y[\Ý\›Z[°êKˆ‹ˆÛÙNˆœÝXœØÜš\[Û—Ù^\™Y‹ˆ™Y\™XÝˆ‹ØX›Û›™[Y[Y^\™H‚ˆJNÂˆB‚ˆYˆ
+ˆZ\ÐÝ\ÝÛY\XØÛÝ[	‰‚ˆ
+ˆ\Ù\‹œÝXœØÜš\[Û—ÜÝ]\ÈOOH™^\™Yˆˆ\Ù\‹œÝXœØÜš\[Û—ÜÝ]\ÈOOHœÝ\Ü[™Yˆˆ\Ù\‹œÝXœØÜš\[Û—ÜÝ]\ÈOOH˜Ø[˜Ù[Y‚ˆ
+Bˆ
+HÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆX›Û›™[Y[[˜XÝY‹ˆ™]Z[^ˆ™[›Ý]™[\ˆ›Ý™HX›Û›™[Y[ˆ‚ˆJNÂˆBˆB‚ˆÛÛœÝÚÙ[ˆHÝœÚYÛŠˆÂˆYˆ\Ù\‹šYˆ[XZ[ˆ\Ù\‹™[XZ[ˆ›ÛNˆ\Ù\‹œ›ÛKˆÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚYˆ[˜[ÚYˆ[˜[Yˆ\×ÜÝ\\—ØYZ[Žˆ\ÔÝ\\YZ[‹ˆÝXœØÜš\[Û—ÜÝ]\Îˆ\Ù\‹œÝXœØÜš\[Û—ÜÝ]\Èˆ‚ˆKˆ•ÕÔÑPÔ‘UˆÈ^\™\Ò[ŽˆŒYˆBˆ
+NÂ‚ˆ]ØZ]ÙÐXÝ]š]Jˆ\Ù\‹™[˜[YKˆ\Ù\‹œ›ÛKˆÛÛ›™^[Ûˆ][\Ø]]\ˆ‹ˆ]][YšXØ][Ûˆ‹ˆ	Ý\Ù\‹™[˜[Y_HÉÙ\ÝÛÛ›™XÝ0êXˆ
+NÂˆ]ØZ]ÙÐ]Y]
+ˆÈ‹‹œ™\K\Ù\ŽˆÈYˆ\Ù\‹šY[XZ[ˆ\Ù\‹™[XZ[›ÛNˆ\Ù\‹œ›ÛKÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚYHKˆ›ÙÚ[ˆ‹ˆ\Ù\ˆ‹ˆ\Ù\‹šYˆÈ[XZ[ˆ\Ù\‹™[XZ[Bˆ
+NÂ‚ˆÛÛœÝÛÛ\[žS[Ù[\ÈH\ÔÝ\\YZ[ˆÈ]ØZ]Ù]ÛÛ\[žS[Ù[\Ê[
+Hˆ]ØZ]Ù]ÛÛ\[žS[Ù[\Ê\Ù\‹˜ÛÛ\[žWÚY
+NÂ‚ˆÙ]ÙXÝ\™P]]ÛÛÚÚY\Ê™\K™\ËÚÙ[‹[˜[Y
+NÂ‚ˆ™\ËšœÛÛŠÂˆY\ÜØYÙNˆÛÛ›™^[Ûˆ°ê]\ÜÚYH‹ˆÚÙ[‹ˆ\Ù\ŽˆÂˆYˆ\Ù\‹šYˆ[˜[YNˆ\Ù\‹™[˜[YKˆ[XZ[ˆ\Ù\‹™[XZ[ˆ›ÛNˆ\ÔÝ\\YZ[ˆÈœÝ\\—ØYZ[ˆˆˆ\Ù\‹œ›ÛKˆÛÛ\[žWÚYˆ\Ù\‹˜ÛÛ\[žWÚYˆ[˜[ÚYˆ[˜[YˆÛÛ\[žWÛ˜[YNˆ\Ù\‹˜ÛÛ\[žWÛ˜[YHˆ‹ˆÛÛ\[žWÜÝ]\Îˆ\Ù\‹˜ÛÛ\[žWÜÝ]\Èˆ‹ˆ\×ÜÝ\\—ØYZ[Žˆ\ÔÝ\\YZ[‹ˆÝXœØÜš\[Û—ÜÝ]\Îˆ\Ù\‹œÝXœØÜš\[Û—ÜÝ]\Èˆ‹ˆÝXœØÜš\[Û—Ù[™Ù]Nˆ\Ù\‹œÝXœØÜš\[Û—Ù[™Ù]Hˆ‹ˆšX[Ù[™Ù]Nˆ\Ù\‹˜ÛÛ\[žWÝšX[Ù[™Ù]Hˆ‹ˆÝXœØÜš\[Û—Ù^\™\×Ø]ˆ\Ù\‹˜ÛÛ\[žWÜÝXœØÜš\[Û—Ù^\™\×Ø]ˆ‹ˆ[—Û˜[YNˆ\Ù\‹œ[—Û˜[YHˆ‹ˆ›Ùš[WÚ[XYÙWÝ\›ˆ\Ù\‹œ›Ùš[WÚ[XYÙWÝ\›ˆ‹ˆ\Ú[™\Ü×Ý\Nˆ\Ù\‹˜\Ú[™\Ü×Ý\Hˆ‹ˆ™Y™\œ™YÛ[™ÝXYÙNˆ\Ù\‹œ™Y™\œ™YÛ[™ÝXYÙHˆ‹ˆ›Ü˜ÙWÜ\ÜÝÛÜ™ØÚ[™ÙNˆ\Ù\‹™›Ü˜ÙWÜ\ÜÝÛÜ™ØÚ[™ÙHOOHYKˆ[Ù[\ÎˆÛÛ\[žS[Ù[\ÂˆBˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆÙÚ[ˆØXTÈˆJNÂˆBŸJNÂ‚˜\™Ù]
+‹ÜÝ\ÜØÛÛ™šYÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆ™\ËšœÛÛŠÂˆÚ]Ø\Ý\›ˆÝ\ÜÚ]Ð\\›
+
+KˆÚ]Ø\Ù[˜X›Yˆ›ÛÛX[ŠÝ\ÜÚ]Ð\\›
+
+JBˆJNÂŸJNÂ‚˜\™Ù]
+‹Ø]]ÜÛØÚX[Ü›ÝšY\œÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆÛÛœÝ›ÝšY\œÈHÈ™ÛÛÙÛH‹™˜XÙX›ÛÚÈ‹š[œÝYÜ˜[H‹ZÝÚÈ—K›X\
+
+›ÝšY\ŠHOˆÂˆÛÛœÝÛÛ™šYÈHÛØÚX[›ÝšY\ÛÛ™šYÊ›ÝšY\ŠNÂˆ™]\›ˆÂˆ›ÝšY\‹ˆX™[ˆÛÛ™šYÏË›X™[›ÝšY\‹ˆ[˜X›YˆÛØÚX[›ÝšY\‘[˜X›Y
+›ÝšY\ŠKˆØÛÜ\ÎˆÛÛ™šYÏËœØÛÜHˆ‚ˆNÂˆJNÂ‚ˆ›ÝšY\œËœ\Ú
+Âˆ›ÝšY\ŽˆÚ]Ø\‹ˆX™[ˆ•Ú]Ð\‹ˆ[˜X›YˆYKˆØÛÜ\ÎˆœÛ™WÛÝ‹ˆÝÛÛ›NˆYBˆJNÂ‚ˆ™\ËšœÛÛŠÈ›ÝšY\œÈJNÂŸJNÂ‚˜\™Ù]
+‹Ø]]ÜÛØÚX[Îœ›ÝšY\‹ÜÝ\‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ›ÝšY\ˆHÝš[™Ê™\Kœ\˜[\Ëœ›ÝšY\ˆˆŠKÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝ[ÙHHÝš[™Ê™\Kœ]Y\žK›[ÙH›ÙÚ[ˆŠNÂ‚ˆYˆ
+›ÝšY\ˆOOHÚ]Ø\ŠHÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÝ™\šYžK\Û™X
+NÂˆB‚ˆÛÛœÝÛÛ™šYÈHÛØÚX[›ÝšY\ÛÛ™šYÊ›ÝšY\ŠNÂˆYˆ
+XÛÛ™šYÈ\ÛØÚX[›ÝšY\‘[˜X›Y
+›ÝšY\ŠJHÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+”›ÝšY\ˆÐ]]›ÛˆÛÛ™šYÝ\°êHŠ_X
+NÂˆB‚ˆÛÛœÝÝ]HHÝœÚYÛŠˆÂˆ›ÝšY\‹ˆ[ÙNˆ[ÙHOOHœ™YÚ\Ý\ˆˆÈœ™YÚ\Ý\ˆˆˆ›ÙÚ[ˆ‹ˆ›Û˜ÙNˆÜž\Ëœ˜[™ÛPž]\ÊLŠKÔÝš[™Êš^ŠBˆKˆ•ÕÔÑPÔ‘UˆÈ^\™\Ò[ŽˆŒLHˆBˆ
+NÂ‚ˆÛÛœÝ]]\›H™]ÈT“
+ÛÛ™šYË˜]]\›
+NÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+˜ÛY[ÚY‹ÛÛ™šYË˜ÛY[Y
+NÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+œ™Y\™XÝÝ\šH‹ÛÛ™šYË˜Ø[˜XÚÕ\›
+NÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+œ™\ÜÛœÙWÝ\H‹˜ÛÙHŠNÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+œØÛÜH‹ÛÛ™šYËœØÛÜJNÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+œÝ]H‹Ý]JNÂˆYˆ
+›ÝšY\ˆOOH™ÛÛÙÛHŠHÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+˜XØÙ\Ü×Ý\H‹›Ù™›[™HŠNÂˆ]]\›œÙX\˜Ú\˜[\ËœÙ]
+œ›Û\‹œÙ[XÝØXØÛÝ[ŠNÂˆB‚ˆ™\Ëœ™Y\™XÝ
+]]\›ÔÝš[™Ê
+JNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆÓÐÒPSÕT•ˆ‹\œ›ÜŠNÂˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+‘\œ™]\ˆ0ê[X\œ˜YÙHÐ]]Š_X
+NÂˆBŸJNÂ‚˜\™Ù]
+‹Ø]]ÜÛØÚX[Îœ›ÝšY\‹ØØ[˜XÚÈ‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ›ÝšY\ˆHÝš[™Ê™\Kœ\˜[\Ëœ›ÝšY\ˆˆŠKÓÝÙ\Ø\ÙJ
+NÂˆÛÛœÝÈÛÙKÝ]HHH™\Kœ]Y\žNÂˆÛÛœÝÛÛ™šYÈHÛØÚX[›ÝšY\ÛÛ™šYÊ›ÝšY\ŠNÂ‚ˆYˆ
+XÛÙH\Ý]HXÛÛ™šYÈ\ÛØÚX[›ÝšY\‘[˜X›Y
+›ÝšY\ŠJHÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+“Ð]][˜ÛÛ\]ÝH›ÛˆÛÛ™šYÝ\°êHŠ_X
+NÂˆB‚ˆ]Ý]T^[ØYÂˆžHÂˆÝ]T^[ØYHÝ™\šYžJÝš[™ÊÝ]JK•ÕÔÑPÔ‘U
+NÂˆHØ]ÚÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+”Ù\ÜÚ[ÛˆÐ]]^\°êYHŠ_X
+NÂˆB‚ˆYˆ
+Ý]T^[ØYœ›ÝšY\ˆOOH›ÝšY\ŠHÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+”›ÝšY\ˆÐ]][˜[YHŠ_X
+NÂˆB‚ˆÛÛœÝÚÙ[”™\ÜÛœÙHH]ØZ]™]Ú
+ÛÛ™šYËÚÙ[•\›ÂˆY]Ùˆ”ÔÕ‹ˆXY\œÎˆÈÛÛ[U\HŽˆ˜\XØ][Û‹Þ]ÝÝËY›Ü›K]\›[˜ÛÙYˆKˆ›ÙNˆ™]ÈT“ÙX\˜Ú\˜[\ÊÂˆÛY[ÚYˆÛÛ™šYË˜ÛY[YˆÛY[ÜÙXÜ™]ˆÛÛ™šYË˜ÛY[ÙXÜ™]ˆ™Y\™XÝÝ\šNˆÛÛ™šYË˜Ø[˜XÚÕ\›ˆÜ˜[Ý\Nˆ˜]]Üš^˜][Û—ØÛÙH‹ˆÛÙNˆÝš[™ÊÛÙJBˆJBˆJNÂˆÛÛœÝÚÙ[”^[ØYH]ØZ]ÚÙ[”™\ÜÛœÙKšœÛÛŠ
+K˜Ø]Ú
+
+
+HOˆ
+ßJJNÂ‚ˆYˆ
+]ÚÙ[”™\ÜÛœÙK›ÚÈ]ÚÙ[”^[ØY˜XØÙ\Ü×ÝÚÙ[ŠHÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+’[\ÜÜÚX›HH°êXÝ\0ê\™\ˆH›Ùš[ÛØÚX[Š_X
+NÂˆB‚ˆÛÛœÝ›Ùš[U\›H™]ÈT“
+ÛÛ™šYË\Ù\’[™›Õ\›
+NÂˆÛÛœÝ›Ùš[RXY\œÈHßNÂˆYˆ
+›ÝšY\ˆOOH™˜XÙX›ÛÚÈŠHÂˆ›Ùš[U\›œÙX\˜Ú\˜[\ËœÙ]
+˜XØÙ\Ü×ÝÚÙ[ˆ‹ÚÙ[”^[ØY˜XØÙ\Ü×ÝÚÙ[ŠNÂˆH[ÙHÂˆ›Ùš[RXY\œË]]Üš^˜][ÛˆH™X\™\ˆ	ÝÚÙ[”^[ØY˜XØÙ\Ü×ÝÚÙ[ŸXÂˆB‚ˆÛÛœÝ›Ùš[T™\ÜÛœÙHH]ØZ]™]Ú
+›Ùš[U\›ÔÝš[™Ê
+KÈXY\œÎˆ›Ùš[RXY\œÈJNÂˆÛÛœÝ˜]Ô›Ùš[HH]ØZ]›Ùš[T™\ÜÛœÙKšœÛÛŠ
+K˜Ø]Ú
+
+
+HOˆ
+ßJJNÂ‚ˆYˆ
+\›Ùš[T™\ÜÛœÙK›ÚÊHÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+”›Ùš[ÛØÚX[[˜XØÙ\ÜÚX›HŠ_X
+NÂˆB‚ˆÛÛœÝ›Ùš[HH›Ü›X[^™TÛØÚX[›Ùš[J›ÝšY\‹˜]Ô›Ùš[JNÂˆYˆ
+\›Ùš[Kœ›ÝšY\—Ý\Ù\—ÚY
+HÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+’Y[YšX[ÛØÚX[X[œ]X[Š_X
+NÂˆB‚ˆ]\Ù\’YH[ÂˆÛÛœÝ^\Ý[™ÔÛØÚX[H]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕ\Ù\—ÚY”“ÓHÛØÚX[ØXØÛÝ[ÈÒT‘H›ÝšY\IHS‘›ÝšY\—Ý\Ù\—ÚYIˆSRUH‹ˆÜ›ÝšY\‹›Ùš[Kœ›ÝšY\—Ý\Ù\—ÚYBˆ
+NÂ‚ˆYˆ
+^\Ý[™ÔÛØÚX[œ›ÝÜÖÌJHÂˆ\Ù\’YH^\Ý[™ÔÛØÚX[œ›ÝÜÖÌK\Ù\—ÚYÂˆH[ÙHYˆ
+›Ùš[K™[XZ[
+HÂˆÛÛœÝ^\Ý[™Õ\Ù\ˆH]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕY”“ÓH\Ù\œÈÒT‘HÕÑTŠ[XZ[
+OSÕÑTŠ	JHSRUH‹ˆÜ›Ùš[K™[XZ[Bˆ
+NÂˆYˆ
+^\Ý[™Õ\Ù\‹œ›ÝÜÖÌJH\Ù\’YH^\Ý[™Õ\Ù\‹œ›ÝÜÖÌKšYÂˆB‚ˆYˆ
+]\Ù\’Y
+HÂˆ]ØZ][œÝ\™QY˜][ÝXœØÜš\[Û”[œÊ
+NÂˆÛÛœÝ[”™\Ý[H]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕ
+ˆ”“ÓHÝXœØÜš\[Û—Ü[œÈÔ‘Tˆ–HšXÙWÛ[ÛHTÐËYTÐÈSRUH‚ˆ
+NÂˆÛÛœÝ[ˆH[”™\Ý[œ›ÝÜÖÌHßNÂˆÛÛœÝ\Ü^S˜[YHH›Ùš[K›˜[YH	Ü›ÝšY\ŸH][\Ø]]\˜ÂˆÛÛœÝÙ[™\˜]Y[XZ[Bˆ›Ùš[K™[XZ[ˆ	Ü›ÝšY\ŸKIÜ›Ùš[Kœ›ÝšY\—Ý\Ù\—ÚYPÛØÚX[šX[™Û]Û\Ü›Ë›ØØ[ÂˆÛÛœÝ˜[™ÛT\ÜÝÛÜ™H]ØZ]\Ú\ÜÝÛÜ™
+Üž\Ëœ˜[™ÛPž]\Ê
+KÔÝš[™Êš^ŠJNÂ‚ˆÛÛœÝÛÛ\[žT™\Ý[H]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÛÛ\[šY\Âˆ
+˜[YK™\ÜÛœÚX›WÛ˜[YK[XZ[Û™K[—ÚYÝXœØÜš\[Û—ÜÝ]\ËˆšX[Ù[™×Ø][XZ[Ý™\šYšYYÛ™WÝ™\šYšYYXØÛÝ[ÜÝ]\ËˆšX[ÜÝ\Ù]KšX[Ù[™Ù]KÝXœØÜš\[Û—Ü[‹ÝXœØÜš\[Û—Ù^\™\×Ø]
+BˆSQTÈ
+	K	‹	Ë	ÉË		ÝšX[	Ë“ÕÊ
+H
+ÈS•T•S	ÌMH^\ÉË	K˜[ÙK	ØXÝ]™IËˆ“ÕÊ
+K“ÕÊ
+H
+ÈS•T•S	ÌMH^\ÉË	‹“ÕÊ
+H
+ÈS•T•S	ÌMH^\ÉÊBˆ‘UT“’S‘È
+˜ˆÂˆ[™\š\ÙHH	Ù\Ü^S˜[Y_Xˆ\Ü^S˜[YKˆ›Ùš[K™[XZ[ˆ‹ˆ[‹šY[ˆ›Ùš[K™[XZ[Ý™\šYšYYOOHYKˆ[‹›˜[YH•šX[‚ˆBˆ
+NÂˆÛÛœÝÛÛ\[žHHÛÛ\[žT™\Ý[œ›ÝÜÖÌNÂˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È\Ù\œÂˆ
+[˜[YK[XZ[\ÜÝÛÜ™›ÛKÛÛ\[žWÚY\×ÜÝ\\—ØYZ[‹ˆ›Ùš[WÚ[XYÙWÝ\›[XZ[Ý™\šYšYYÛ™WÝ™\šYšYYXØÛÝ[ÜÝ]\Ëˆ[š]][Û—ÜÝ]\Ë™\šYšXØ][Û—Ü™\]Z\™Y˜YÙWØÛÙJBˆSQTÈ
+	K	‹	Ë	ØYZ[‰Ë	˜[ÙK	K	‹˜[ÙK	ØXÝ]™IË	ØXÝ]™IË˜[ÙK	ÊBˆ‘UT“’S‘ÈYˆÂˆ\Ü^S˜[YKˆÙ[™\˜]Y[XZ[ˆ˜[™ÛT\ÜÝÛÜ™ˆÛÛ\[žKšYˆ›Ùš[K˜]˜]\—Ý\›ˆ‹ˆ›Ùš[K™[XZ[Ý™\šYšYYOOHYKˆ’PS‘ÓKTÓÐÒPSIØÛÛ\[žKšYKIÑ]K››ÝÊ
+_XˆBˆ
+NÂˆ\Ù\’YH\Ù\”™\Ý[œ›ÝÜÖÌKšYÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÝXœØÜš\[ÛœÂˆ
+ÛÛ\[žWÚY[—ÚYÝ\Ù]K[™Ù]KÝ]\Ë^[Y[ÜÝ]\ÊBˆSQTÈ
+	K	‹“ÕÊ
+K“ÕÊ
+H
+ÈS•T•S	ÌMH^\ÉË	ÝšX[	Ë	Ùœ™YWÝšX[	ÊXˆØÛÛ\[žKšY[‹šY[Bˆ
+NÂˆB‚ˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÛØÚX[ØXØÛÝ[Âˆ
+\Ù\—ÚY›ÝšY\‹›ÝšY\—Ý\Ù\—ÚY[XZ[Û™K]˜]\—Ý\›ØÛÜ\×ÙÜ˜[YˆXØÙ\Ü×ÝÚÙ[—Ù[˜Üž\Y™Yœ™\ÚÝÚÙ[—Ù[˜Üž\Y
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë		JBˆÓˆÓÓ‘“PÕ
+›ÝšY\‹›ÝšY\—Ý\Ù\—ÚY
+BˆÈTUHÑUˆ\Ù\—ÚYQVÓQQ\Ù\—ÚYˆ[XZ[QVÓQQ™[XZ[ˆÛ™OQVÓQQœÛ™Kˆ]˜]\—Ý\›QVÓQQ˜]˜]\—Ý\›ˆØÛÜ\×ÙÜ˜[YQVÓQQœØÛÜ\×ÙÜ˜[YˆXØÙ\Ü×ÝÚÙ[—Ù[˜Üž\YQVÓQQ˜XØÙ\Ü×ÝÚÙ[—Ù[˜Üž\Yˆ™Yœ™\ÚÝÚÙ[—Ù[˜Üž\YQVÓQQœ™Yœ™\ÚÝÚÙ[—Ù[˜Üž\Yˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÂˆ\Ù\’Yˆ›ÝšY\‹ˆ›Ùš[Kœ›ÝšY\—Ý\Ù\—ÚYˆ›Ùš[K™[XZ[ˆ‹ˆˆ‹ˆ›Ùš[K˜]˜]\—Ý\›ˆ‹ˆÛÛ™šYËœØÛÜKˆ[˜Üž\ÛØÚX[ÚÙ[ŠÚÙ[”^[ØY˜XØÙ\Ü×ÝÚÙ[ŠKˆ[˜Üž\ÛØÚX[ÚÙ[ŠÚÙ[”^[ØYœ™Yœ™\ÚÝÚÙ[ˆˆŠBˆBˆ
+NÂ‚ˆYˆ
+›Ùš[K™[XZ[Ý™\šYšYY	‰ˆ›Ùš[K™[XZ[
+HÂˆ]ØZ]ÛÛœ]Y\žJˆTUH\Ù\œÂˆÑU[XZ[Ý™\šYšYY]YKˆXØÛÝ[ÜÝ]\ÏIØXÝ]™IËˆ™\šYšXØ][Û—Ü™\]Z\™YY˜[ÙKˆ›Ùš[WÚ[XYÙWÝ\›PÓÐSTÐÑJ•SQŠ›Ùš[WÚ[XYÙWÝ\›	ÉÊK	ŠBˆÒT‘HYIXˆÝ\Ù\’Y›Ùš[K˜]˜]\—Ý\›ˆ—Bˆ
+NÂˆB‚ˆ]ØZ]ÙÐ]Y]
+ˆÈ‹‹œ™\K\Ù\ŽˆÈYˆ\Ù\’Y›ÛNˆœÛØÚX[Ø]]‹ÛÛ\[žWÚYˆ[HKˆœÛØÚX[ÛÙÚ[ˆ‹ˆœÛØÚX[ØXØÛÝ[‹ˆ\Ù\’YˆÈ›ÝšY\‹ØÛÜ\ÎˆÛÛ™šYËœØÛÜHBˆ
+NÂ‚ˆÛÛœÝÙÚ[”^[ØYH]ØZ]Z[ÙÚ[”™\ÜÛœÙQ›Ü•\Ù\Š\Ù\’Y
+NÂˆYˆ
+[ÙÚ[”^[ØY
+HÂˆ™]\›ˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+ÛÛ\HšX[™ÛH[›Ý]˜X›HŠ_X
+NÂˆB‚ˆÛÛœÝ[˜ÛÙYHY™™\‹™œ›ÛJ”ÓÓ‹œÝš[™ÚYžJÙÚ[”^[ØY
+JKÔÝš[™Ê˜˜\ÙM\›ŠNÂˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÜÛØÚX[X]]Ü^[ØYIÙ[˜ÛÙYX
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆÓÐÒPSÐSPÒÈˆ‹\œ›ÜŠNÂˆ™\Ëœ™Y\™XÝ
+	ÜX›XÐ\\›
+
+_KÛÙÚ[ÜÛØÚX[Ù\œ›ÜIÙ[˜ÛÙUT’PÛÛ\Û™[
+‘\œ™]\ˆÛÛ›™^[ÛˆÛØÚX[HŠ_X
+NÂˆBŸJNÂ‚˜\™[]J‹Ø]]ÜÛØÚX[Îœ›ÝšY\ˆ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ›ÝšY\ˆHÝš[™Ê™\Kœ\˜[\Ëœ›ÝšY\ˆˆŠKÓÝÙ\Ø\ÙJ
+NÂˆ]ØZ]ÛÛœ]Y\žJˆ‘SUH”“ÓHÛØÚX[ØXØÛÝ[ÈÒT‘H\Ù\—ÚYIHS‘›ÝšY\Iˆ‹ˆÜ™\K\Ù\‹šY›ÝšY\—Bˆ
+NÂˆ]ØZ]ÙÐ]Y]
+™\K[›[š×ÜÛØÚX[ØXØÛÝ[‹œÛØÚX[ØXØÛÝ[‹™\K\Ù\‹šYÈ›ÝšY\ˆJNÂˆ™\ËšœÛÛŠÈÝXØÙ\ÜÎˆYKY\ÜØYÙNˆÛÛ\HÛØÚX[0ê[pêKˆˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆS“S’ÈÓÐÒPSˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆÝ\™\ÜÚ[ÛˆXZ\ÛÛˆÛØÚX[HˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹ÜÝ\ÜØÛÛXÝ‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÈ˜[YK[™\š\ÙKÛÛ\[žWÚY\Ù\—ÚY[XZ[Û™KY\ÜØYÙKYÙWØXÝY[KÛÝ\˜ÙWÜYÙHHH™\K˜›ÙNÂ‚ˆYˆ
+[Y\ÜØYÙHÝš[™ÊY\ÜØYÙJKš[J
+K›[™ÝÊHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“Y\ÜØYÙHÝ\ÜØ›YØ]Ú\™KˆˆJNÂˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÝ\ÜÜ™\]Y\ÝÂˆ
+ÛÛ\[žWÚY\Ù\—ÚY˜[YK[XZ[Û™KY\ÜØYÙKÛÝ\˜ÙWÜYÙKÝ]\ÊBˆSQTÈ
+	K	‹	Ë		K	‹	Ë	Û›Ý]™X]IÊBˆ‘UT“’S‘È
+˜ˆÂˆÜ[Û˜[[X™\ŠÛÛ\[žWÚY
+KˆÜ[Û˜[[X™\Š\Ù\—ÚY
+Kˆ˜[YH[™\š\ÙHˆ‹ˆ[XZ[ˆ‹ˆÛ™Hˆ‹ˆY\ÜØYÙKˆÛÝ\˜ÙWÜYÙHYÙWØXÝY[Hˆ‚ˆBˆ
+NÂ‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠÂˆÝXØÙ\ÜÎˆYKˆ™\]Y\Ýˆ™\Ý[œ›ÝÜÖÌKˆÚ]Ø\Ý\›ˆÝ\ÜÚ]Ð\\›
+
+BˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆÕTÔ•ÓÓ•PÕˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ[X[™HÝ\ÜˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ý™\šYšXØ][Û‹Ý™\šYžH‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÈÛÙKÚÙ[‹\™Ù]Ý\K\™Ù]Ý˜[YK\Ù\—ÚYHH™\K˜›ÙNÂ‚ˆYˆ
+XÛÙH	‰ˆ]ÚÙ[ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÙHÝHÚÙ[ˆØ›YØ]Ú\™KˆˆJNÂˆB‚ˆÛÛœÝ˜[Y\ÈH×NÂˆ]š[\ˆH\ÙYØ]TÈ•SS‘^\™\×Ø]ˆ“ÕÊ
+HŽÂ‚ˆYˆ
+ÚÙ[ŠHÂˆ˜[Y\Ëœ\Ú
+\Ú™\šYšXØ][Û”ÙXÜ™]
+ÚÙ[ŠJNÂˆš[\ˆ
+ÏHS‘ÚÙ[—Ú\ÚI	Ý˜[Y\Ë›[™ÝXÂˆH[ÙHÂˆYˆ
+\™Ù]Ý\JHÂˆ˜[Y\Ëœ\Ú
+\™Ù]Ý\JNÂˆš[\ˆ
+ÏHS‘\™Ù]Ý\OI	Ý˜[Y\Ë›[™ÝXÂˆBˆYˆ
+\™Ù]Ý˜[YJHÂˆ˜[Y\Ëœ\Ú
+\™Ù]Ý˜[YJNÂˆš[\ˆ
+ÏHS‘\™Ù]Ý˜[YOI	Ý˜[Y\Ë›[™ÝXÂˆBˆYˆ
+\Ù\—ÚY
+HÂˆ˜[Y\Ëœ\Ú
+[X™\Š\Ù\—ÚY
+JNÂˆš[\ˆ
+ÏHS‘\Ù\—ÚYI	Ý˜[Y\Ë›[™ÝXÂˆBˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕ
+ˆ”“ÓH™\šYšXØ][Û—ØÛÙ\ÂˆÒT‘H	Ùš[\ŸBˆÔ‘Tˆ–HYTÐÂˆSRUXˆ˜[Y\Âˆ
+NÂ‚ˆÛÛœÝ™\šYšXØ][ÛˆH™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+]™\šYšXØ][ÛŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÙH^\°êHÝH[›Ý]˜X›KˆˆJNÂˆB‚ˆYˆ
+[X™\Š™\šYšXØ][Û‹˜][\È
+HHJHÂˆ™]\›ˆ™\ËœÝ]\ÊŽJKšœÛÛŠÈ\œ›ÜŽˆ•›ÜH[]]™\Ëˆ[X[™^ˆ[ˆ›Ý]™X]HÛÙKˆˆJNÂˆB‚ˆYˆ
+ÛÙJHÂˆÛÛœÝ˜[YÛÙHH]ØZ]˜Üž\˜ÛÛ\\™JÝš[™ÊÛÙHˆŠK™\šYšXØ][Û‹˜ÛÙWÚ\Ú
+NÂˆYˆ
+]˜[YÛÙJHÂˆ]ØZ]ÛÛœ]Y\žJˆ•TUH™\šYšXØ][Û—ØÛÙ\ÈÑU][\ÏX][\ÊÌHÒT‘HYIH‹ˆÝ™\šYšXØ][Û‹šYBˆ
+NÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÙH[˜ÛÜœ™XÝˆˆJNÂˆBˆB‚ˆ]ØZ]ÛÛœ]Y\žJˆ•TUH™\šYšXØ][Û—ØÛÙ\ÈÑU\ÙYØ]S“ÕÊ
+HÒT‘HYIH‹ˆÝ™\šYšXØ][Û‹šYBˆ
+NÂˆ]ØZ]XÝ]˜]U™\šYšYYXØÛÝ[
+ÂˆÛÛ\[žRYˆ™\šYšXØ][Û‹˜ÛÛ\[žWÚYˆ\Ù\’Yˆ™\šYšXØ][Û‹\Ù\—ÚYˆ\™Ù]\Nˆ™\šYšXØ][Û‹\™Ù]Ý\BˆJNÂ‚ˆ]ØZ]ÙÐ]Y]
+ˆÈ‹‹œ™\K\Ù\ŽˆÈYˆ™\šYšXØ][Û‹\Ù\—ÚYÛÛ\[žWÚYˆ™\šYšXØ][Û‹˜ÛÛ\[žWÚY›ÛNˆ™\šYšXØ][ÛˆˆHKˆ™\šYžWÉÝ™\šYšXØ][Û‹\™Ù]Ý\_Xˆ™\šYšXØ][Û—ØÛÙH‹ˆ™\šYšXØ][Û‹šYˆÈ\™Ù]Ý\Nˆ™\šYšXØ][Û‹\™Ù]Ý\HBˆ
+NÂ‚ˆÛÛœÝÙÚ[”^[ØYH™\šYšXØ][Û‹\Ù\—ÚYˆÈ]ØZ]Z[ÙÚ[”™\ÜÛœÙQ›Ü•\Ù\Š™\šYšXØ][Û‹\Ù\—ÚY
+Bˆˆ[ÂˆÛÛœÝ™\šYšYY›ÛHH›Ü›X[^™T›ÛJÙÚ[”^[ØYË\Ù\Ëœ›ÛJNÂ‚ˆ™\ËšœÛÛŠÂˆÝXØÙ\ÜÎˆYKˆY\ÜØYÙNˆ•°ê\šYšXØ][Ûˆ°ê]\ÜÚYKˆ›Ý\ÈÝ]™^ˆ›Ý\ÈÛÛ›™XÝ\‹ˆ‹ˆ™Y\™XÝˆÙÚ[”^[ØYËÚÙ[‚ˆÈ
+™\šYšYY›ÛHOOH˜Ý\ÝÛY\ˆˆÈ‹ØÛY[Ù\Ú›Ø\™ˆˆ‹Ù\Ú›Ø\™ŠBˆˆ‹ÛÙÚ[ˆ‹ˆÚÙ[ŽˆÙÚ[”^[ØYËÚÙ[‹ˆ\Ù\ŽˆÙÚ[”^[ØYË\Ù\‚ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆ‘T’Q’PÐUSÓˆˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ°ê\šYšXØ][ÛˆˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ý™\šYšXØ][Û‹Ü™\Ù[™‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÈ\™Ù]Ý\K\™Ù]Ý˜[YK\Ù\—ÚYHH™\K˜›ÙNÂˆÛÛœÝ\™Ù]\HH\™Ù]Ý\HOOHœÛ™HˆÈœÛ™Hˆˆ™[XZ[ŽÂˆÛÛœÝ\™Ù]˜[YHHÝš[™Ê\™Ù]Ý˜[YHˆŠKš[J
+NÂ‚ˆYˆ
+]\™Ù]˜[YH	‰ˆ]\Ù\—ÚY
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆÛÛXÝÝH][\Ø]]\ˆØ›YØ]Ú\™KˆˆJNÂˆB‚ˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕYÛÛ\[žWÚY[XZ[Û™Bˆ”“ÓH\Ù\œÂˆÒT‘H
+	NŽš[TÈ“Õ•SS‘YIJBˆÔˆ
+	ˆˆ	ÉÈS‘ÕÑTŠ[XZ[
+OSÕÑTŠ	ŠJBˆÔˆ
+	Èˆ	ÉÈS‘™YÙ^Ü™\XÙJÓÐSTÐÑJÛ™K	ÉÊK	Ö×ŒNJ×IË	ÉË	ÙÉÊHH™YÙ^Ü™\XÙJ	Ë	Ö×ŒNJ×IË	ÉË	ÙÉÊJBˆSRUXˆÂˆÜ[Û˜[[X™\Š\Ù\—ÚY
+Kˆ\™Ù]\HOOH™[XZ[ˆÈ\™Ù]˜[YHˆˆ‹ˆ\™Ù]\HOOHœÛ™HˆÈ\™Ù]˜[YHˆˆ‚ˆBˆ
+NÂ‚ˆÛÛœÝ\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂˆYˆ
+]\Ù\ŠH™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›KˆˆJNÂ‚ˆÛÛœÝš[˜[\™Ù]˜[YHH\™Ù]\HOOHœÛ™HˆÈ\Ù\‹œÛ™Hˆ\Ù\‹™[XZ[ÂˆÛÛœÝ™\šYšXØ][ÛˆH]ØZ]Ü™X]U™\šYšXØ][ÛÛÙJÂˆÛÛ\[žRYˆ\Ù\‹˜ÛÛ\[žWÚYˆ\Ù\’Yˆ\Ù\‹šYˆ\™Ù]\Kˆ\™Ù]˜[YNˆš[˜[\™Ù]˜[YBˆJNÂˆÛÛœÝ[]™\žHH]ØZ]Ù[™™\šYšXØ][Û“Y\ÜØYÙJÂˆ\™Ù]\Kˆ\™Ù]˜[YNˆš[˜[\™Ù]˜[YKˆÛÙNˆ™\šYšXØ][Û‹˜ÛÙKˆ™\šYžU\›ˆ™\šYšXØ][Û‹™\šYžWÝ\›ˆJNÂ‚ˆ™\ËšœÛÛŠÂˆÝXØÙ\ÜÎˆYKˆY\ÜØYÙNˆ“›Ý]™X]HÛÙHðê[°ê\°êKˆ‹ˆ\™Ù]Ý\Nˆ\™Ù]\Kˆ\™Ù]Ý˜[YNˆš[˜[\™Ù]˜[YKˆ[]™\žBˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆ‘TÑS‘‘T’Q’PÐUSÓˆˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ™[›ÚHÛÙHˆJNÂˆBŸJNÂ‚˜\œ]
+‹ÛYKÜ\ÜÝÛÜ™‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÈÝ\œ™[Ü\ÜÝÛÜ™™]×Ü\ÜÝÛÜ™HH™\K˜›ÙNÂ‚ˆÛÛœÝ\ÜÝÛÜ™\œ›ÜˆH˜[Y]T\ÜÝÛÜ™Ý™[™Ý
+™]×Ü\ÜÝÛÜ™
+NÂˆYˆ
+\ÜÝÛÜ™\œ›ÜŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ\ÜÝÛÜ™\œ›ÜˆJNÂˆB‚ˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕY\ÜÝÛÜ™”“ÓH\Ù\œÈÒT‘HYIHSRUH‹ˆÜ™\K\Ù\‹šYBˆ
+NÂˆÛÛœÝ\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+]\Ù\ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆÛÛœÝ\ÜÝÛÜ™X]Ú\ÈH]ØZ]™\šYžT\ÜÝÛÜ™
+Ý\œ™[Ü\ÜÝÛÜ™\Ù\‹œ\ÜÝÛÜ™
+NÂˆYˆ
+\\ÜÝÛÜ™X]Ú\ÊHÂˆ™]\›ˆ™\ËœÝ]\ÊJKšœÛÛŠÈ\œ›ÜŽˆ“[ÝH\ÜÙHXÝY[[˜ÛÜœ™XÝˆJNÂˆB‚ˆ]ØZ]ÛÛœ]Y\žJˆTUH\Ù\œÂˆÑU\ÜÝÛÜ™IKˆ›Ü˜ÙWÜ\ÜÝÛÜ™ØÚ[™ÙOY˜[ÙKˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYI˜ˆØ]ØZ]\Ú\ÜÝÛÜ™
+™]×Ü\ÜÝÛÜ™
+K™\K\Ù\‹šYBˆ
+NÂ‚ˆ]ØZ]ÙÐ]Y]
+™\K˜Ú[™ÙWÜ\ÜÝÛÜ™‹\Ù\ˆ‹™\K\Ù\‹šYßJNÂ‚ˆ™\ËšœÛÛŠÈY\ÜØYÙNˆ“[ÝH\ÜÙH[ÙYšpêHˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆQHTÔÕÓÔ‘ˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆÚ[™Ù[Y[[ÝH\ÜÙHˆJNÂˆBŸJNÂ‚‹ÊˆUSTÐUUT”È
+‹Â˜\™Ù]
+‹Ý\Ù\œÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ›ÛHH›Ü›X[^™T›ÛJ™\K\Ù\Ëœ›ÛJNÂˆYˆ
+›ÛHOOH˜Ý\ÝÛY\ˆˆ›ÛHOOH˜ÛY[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêH]^][\Ø]]\œÈ[\›™\ËˆˆJNÂˆB‚ˆÛÛœÝÛÛ\[žRYH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂ‚ˆÛÛœÝ˜[Y\ÈH×NÂˆ]ÛÛ\[žQš[\ˆHˆŽÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆÛÛ\[žQš[\ˆH•ÒT‘HK˜ÛÛ\[žWÚYH	HŽÂˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕˆKšYTÈ\Ù\—ÚYˆKšYˆK™[˜[YKˆK™[XZ[ˆKœ›ÛKˆKš\×ØXÝ]™KˆKœ›Ùš[WÚ[XYÙWÝ\›ˆK˜˜YÙWØÛÙKˆK˜Ü™X]YØ]ˆKœØÚY[WÙÜ›Ý\ÚYˆÓÐSTÐÑJËœØÚY[WÙÜ›Ý\ÙË›˜[YK	ÉÊHTÈØÚY[WÙÜ›Ý\ˆÓÐSTÐÑJËœØ[\žWÝ\KKœ^[Y[Ý\K	ÉÊHTÈØ[\žWÝ\KˆÓÐSTÐÑJËšÝ\›WÜ˜]KKšÝ\›WÜ˜]K
+HTÈÝ\›WÜ˜]KˆÓÐSTÐÑJË™Z[WÜØ[\žKK™Z[WÜ˜]K
+HTÈZ[WÜ˜]KˆÓÐSTÐÑJË›[ÛWÜØ[\žK
+HTÈ[ÛWÜØ[\žKˆÓÐSTÐÑJËœÝ\Ý[YKÙËœÝ\Ý[YJHTÈÝ\Ý[YKˆÓÐSTÐÑJË™[™Ý[YKÙË™[™Ý[YJHTÈ[™Ý[YBˆ”“ÓH\Ù\œÈBˆQ•“ÒSˆ][™[˜ÙWÜÙ][™ÜÈÈÓˆË\Ù\—ÚYHKšYˆQ•“ÒSˆØÚY[WÙÜ›Ý\ÈÙÈÓˆÙËšYHKœØÚY[WÙÜ›Ý\ÚYˆ	ØÛÛ\[žQš[\ŸBˆÔ‘Tˆ–HKšYTÐØˆ˜[Y\Âˆ
+NÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜË›X\
+
+›ÝÊHOˆÝš\Ø[\žQšY[Ê›ÝË™\K\Ù\ŠJJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆXÝ\™H][\Ø]]\œÈˆJNÂˆBŸJNÂ‚˜\™Ù]
+‹Û[Ù[\È‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+XØ[XØÙ\ÜÐYZ[”Ù][™ÜÊ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ°ê\Ù\°êH0è8 &XYZ[š\Ý˜]]\ˆˆJNÂˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕ[Ù[WÚÙ^K[Ù[WÛ˜[YK\ØÜš\[Û‹\×ØXÝ]™Bˆ”“ÓH[Ù[\ÂˆÒT‘H\×ØXÝ]™O]YBˆÔ‘Tˆ–H[Ù[WÛ˜[YHTÐØˆ
+NÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÊNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆSÑSTÈˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆXÝ\™H[Ù[\ÈˆJNÂˆBŸJNÂ‚˜\™Ù]
+‹Ý\Ù\œËÎšYÜ\›Z\ÜÚ[ÛœÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+XØ[XØÙ\ÜÐYZ[”Ù][™ÜÊ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ°ê\Ù\°êH0è8 &XYZ[š\Ý˜]]\ˆˆJNÂˆB‚ˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJ”ÑSPÕYÛÛ\[žWÚY”“ÓH\Ù\œÈÒT‘HYIH‹Ü™\Kœ\˜[\ËšYJNÂˆÛÛœÝ\™Ù]\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+]\™Ù]\Ù\ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆYˆ
+™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYH	‰ˆ[X™\Š\™Ù]\Ù\‹˜ÛÛ\[žWÚY
+HOOH[X™\Š™\K\Ù\‹˜ÛÛ\[žWÚY
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ][\Ø]]\ˆÜœÈ[™\š\ÙHˆJNÂˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕ\Š‹K›[Ù[WÛ˜[YKK™\ØÜš\[Û‚ˆ”“ÓH\Ù\—Ü\›Z\ÜÚ[ÛœÈ\ˆQ•“ÒSˆ[Ù[\ÈHÓˆK›[Ù[WÚÙ^O]\›[Ù[WÚÙ^BˆÒT‘H\\Ù\—ÚYIBˆÔ‘Tˆ–H\›[Ù[WÚÙ^HTÐØˆÜ™\Kœ\˜[\ËšYBˆ
+NÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÊNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆTÑTˆT“RTÔÒSÓ”Èˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆXÝ\™H\›Z\ÜÚ[ÛœÈ][\Ø]]\ˆˆJNÂˆBŸJNÂ‚˜\œ]
+‹Ý\Ù\œËÎšYÜ\›Z\ÜÚ[ÛœÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+XØ[XØÙ\ÜÐYZ[”Ù][™ÜÊ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ°ê\Ù\°êH0è8 &XYZ[š\Ý˜]]\ˆˆJNÂˆB‚ˆÛÛœÝÈ\›Z\ÜÚ[ÛœÈH×HHH™\K˜›ÙNÂˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJ”ÑSPÕYÛÛ\[žWÚY”“ÓH\Ù\œÈÒT‘HYIH‹Ü™\Kœ\˜[\ËšYJNÂˆÛÛœÝ\™Ù]\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+]\™Ù]\Ù\ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆYˆ
+™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYH	‰ˆ[X™\Š\™Ù]\Ù\‹˜ÛÛ\[žWÚY
+HOOH[X™\Š™\K\Ù\‹˜ÛÛ\[žWÚY
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ][\Ø]]\ˆÜœÈ[™\š\ÙHˆJNÂˆB‚ˆÛÛœÝØ]™YH×NÂ‚ˆ›Üˆ
+ÛÛœÝ\›Z\ÜÚ[ÛˆÙˆ\›Z\ÜÚ[ÛœÊHÂˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È\Ù\—Ü\›Z\ÜÚ[ÛœÂˆ
+\Ù\—ÚY[Ù[WÚÙ^KØ[—ÝšY]ËØ[—ØÜ™X]KØ[—ÙY]Ø[—Ù[]KØ[—Ý˜[Y]K\]YØžJBˆSQTÈ
+	K	‹	Ë		K	‹	Ë	
+BˆÓˆÓÓ‘“PÕ
+\Ù\—ÚY[Ù[WÚÙ^JBˆÈTUHÑUˆØ[—ÝšY]ÏQVÓQQ˜Ø[—ÝšY]ËˆØ[—ØÜ™X]OQVÓQQ˜Ø[—ØÜ™X]KˆØ[—ÙY]QVÓQQ˜Ø[—ÙY]ˆØ[—Ù[]OQVÓQQ˜Ø[—Ù[]KˆØ[—Ý˜[Y]OQVÓQQ˜Ø[—Ý˜[Y]Kˆ\]YØžOQVÓQQ\]YØžKˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆ‘UT“’S‘È
+˜ˆÂˆ™\Kœ\˜[\ËšYˆ\›Z\ÜÚ[Û‹›[Ù[WÚÙ^Kˆ\›Z\ÜÚ[Û‹˜Ø[—ÝšY]ÈOOHYKˆ\›Z\ÜÚ[Û‹˜Ø[—ØÜ™X]HOOHYKˆ\›Z\ÜÚ[Û‹˜Ø[—ÙY]OOHYKˆ\›Z\ÜÚ[Û‹˜Ø[—Ù[]HOOHYKˆ\›Z\ÜÚ[Û‹˜Ø[—Ý˜[Y]HOOHYKˆ™\K\Ù\‹šY[ˆBˆ
+NÂ‚ˆØ]™Yœ\Ú
+™\Ý[œ›ÝÜÖÌJNÂˆB‚ˆ™\ËšœÛÛŠØ]™Y
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆTUHTÑTˆT“RTÔÒSÓ”Èˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆØ]]™YØ\™H\›Z\ÜÚ[ÛœÈ][\Ø]]\ˆˆJNÂˆBŸJNÂ‚˜\œ]
+‹Ý\Ù\œËÎšYØØZ\ÜÙH‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+XØ[“X[˜YÙPØZ\ÜÙ\Ê™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ°ê\Ù\°êH0è8 &XYZ[š\Ý˜]]\ˆˆJNÂˆB‚ˆÛÛœÝÈØZ\ÜÙWÚYHH™\K˜›ÙNÂˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJ”ÑSPÕYÛÛ\[žWÚY”“ÓH\Ù\œÈÒT‘HYIH‹Ü™\Kœ\˜[\ËšYJNÂˆÛÛœÝ\™Ù]\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+]\™Ù]\Ù\ŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆYˆ
+™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYH	‰ˆ[X™\Š\™Ù]\Ù\‹˜ÛÛ\[žWÚY
+HOOH[X™\Š™\K\Ù\‹˜ÛÛ\[žWÚY
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ][\Ø]]\ˆÜœÈ[™\š\ÙHˆJNÂˆB‚ˆYˆ
+ØZ\ÜÙWÚY
+HÂˆÛÛœÝØZ\ÜÙT™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕY”“ÓHØZ\ÜÙ\ÂˆÒT‘HYIHS‘XÝY]YBˆ	Ü™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYHÈˆˆˆS‘ÛÛ\[žWÚYIˆŸXˆ™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYHÈØØZ\ÜÙWÚYHˆØØZ\ÜÙWÚY™\K\Ù\‹˜ÛÛ\[žWÚYBˆ
+NÂ‚ˆYˆ
+XØZ\ÜÙT™\Ý[œ›ÝÜÖÌJHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆØZ\ÜÙH[›Ý]˜X›HˆJNÂˆBˆB‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆTUH\Ù\œÂˆÑUØZ\ÜÙWÚYIK\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYI‚ˆ‘UT“’S‘ÈY[˜[YK[XZ[›ÛKØZ\ÜÙWÚYˆØØZ\ÜÙWÚY[™\Kœ\˜[\ËšYBˆ
+NÂ‚ˆÛÛœÝ\]Y\Ú[Y[H™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+È˜XØÙ\Y‹˜XØÙ\0êH‹˜XØÙ\H‹˜[Y0êH‹˜[YH‹˜ÛÛ™š\›YY—Kš[˜ÛY\ÊÝš[™Ê\]Y\Ú[Y[ËœÝ]\ÈˆŠKÓÝÙ\Ø\ÙJ
+JJHÂˆ]ØZ]Ü™X]T]Y[œ›ÛPXØÙ\Y\Ú[Y[
+\]Y\Ú[Y[šY
+NÂˆB‚ˆ™\ËšœÛÛŠ\]Y\Ú[Y[
+NÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆTÑTˆÐRTÔÑHˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆY™™XÝ][ÛˆØZ\ÜÙH][\Ø]]\ˆˆJNÂˆBŸJNÂ‚‹ÊˆÔ‘PUHTÑTˆU‘PÈQÑH
+ÈTSpâ‘TÈÒS•QÑHUUÓPUTUQTÈ
+‹Â˜\œÜÝ
+ˆ‹Ý\Ù\œÈ‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÈ[˜[YK[XZ[\ÜÝÛÜ™›ÛKÛ™KÛÛ\[žWÚYHH™\K˜›ÙNÂˆÛÛœÝ™\]Y\ÝY›ÛHH›Ü›X[^™T›ÛJ›ÛH›XYØ\Ú[šY\ˆŠNÂ‚ˆYˆ
+™\]Y\ÝY›ÛHOOHœÝ\\—ØYZ[ˆˆ	‰ˆ™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXÝ[Ûˆ[\™]Hˆ°íHÝ\\ˆYZ[ˆ°ê\Ù\°êH‚ˆJNÂˆB‚ˆÛÛœÝ˜]Ô\ÜÝÛÜ™H\ÜÝÛÜ™Üž\Ëœ˜[™ÛPž]\Ê
+KÔÝš[™Ê˜˜\ÙMŠNÂˆÛÛœÝ\ÜÝÛÜ™\œ›ÜˆH˜[Y]T\ÜÝÛÜ™Ý™[™Ý
+˜]Ô\ÜÝÛÜ™
+NÂ‚ˆYˆ
+\ÜÝÛÜ™\œ›ÜŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ\ÜÝÛÜ™\œ›ÜˆJNÂˆB‚ˆÛÛœÝ\ÜÚYÛ™YÛÛ\[žRYBˆ™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYBˆÈÛÛ\[žWÚY™\K\Ù\‹˜ÛÛ\[žWÚY[ˆˆ™\K\Ù\‹˜ÛÛ\[žWÚYÂ‚ˆÛÛœÝ\Ù\”™\Ý[H]ØZ]ÛÛœ]Y\žJˆˆS”ÑT•S•È\Ù\œÂˆ
+ˆ[˜[YKˆ[XZ[ˆ\ÜÝÛÜ™ˆ›ÛKˆÛ™KˆÛÛ\[žWÚYˆ\×ÜÝ\\—ØYZ[‚ˆ
+BˆSQTÈ
+	K	‹	Ë		K	‹	ÊBˆ‘UT“’S‘È
+‚ˆˆÂˆ[˜[YKˆ[XZ[ˆ]ØZ]\Ú\ÜÝÛÜ™
+˜]Ô\ÜÝÛÜ™
+Kˆ™\]Y\ÝY›ÛH›XYØ\Ú[šY\ˆ‹ˆÛ™Hˆ‹ˆ\ÜÚYÛ™YÛÛ\[žRYˆ™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYH	‰ˆ™\]Y\ÝY›ÛHOOHœÝ\\—ØYZ[ˆ‚ˆBˆ
+NÂ‚ˆÛÛœÝ\Ù\ˆH\Ù\”™\Ý[œ›ÝÜÖÌNÂ‚ˆÛÛœÝ˜YÙPÛÙHH’PS‘ÓKQSTIÝ\Ù\‹šYXÂ‚ˆÛÛœÝ\]Y\Ù\ˆH]ØZ]ÛÛœ]Y\žJˆˆTUH\Ù\œÂˆÑU˜YÙWØÛÙHH	BˆÒT‘HYH	‚ˆ‘UT“’S‘È
+‚ˆˆØ˜YÙPÛÙK\Ù\‹šYBˆ
+NÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆˆS”ÑT•S•È][™[˜ÙWÜÙ][™ÜÂˆ
+ˆ\Ù\—ÚYˆØÚY[WÙÜ›Ý\ˆØ[\žWÝ\KˆÝ\›WÜ˜]KˆZ[WÜØ[\žKˆ[ÛWÜØ[\žKˆÝ\Ý[YKˆ[™Ý[YBˆ
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë	
+BˆÓˆÓÓ‘“PÕ
+\Ù\—ÚY
+HÈ“ÕS‘ÂˆˆÝ\Ù\‹šY”Ý[™\™‹šÜ˜Z\™H‹LŒŒŒ‹ŒMÎŒ—Bˆ
+NÂ‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠ\]Y\Ù\‹œ›ÝÜÖÌJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆÔ‘PUHTÑTˆˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ‘\œ™]\ˆÜ°êX][Ûˆ][\Ø]]\ˆ‚ˆJNÂˆBˆBŠNÂ‚˜\œ]
+ˆ‹Ý\Ù\œËÎšY‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÛÛ\[žRYH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝÈ[˜[YK[XZ[\ÜÝÛÜ™›ÛKÛ™K\×ØXÝ]™HHH™\K˜›ÙNÂˆÛÛœÝ™\]Y\ÝY›ÛHH›Ü›X[^™T›ÛJ›ÛH›XYØ\Ú[šY\ˆŠNÂ‚ˆYˆ
+™\]Y\ÝY›ÛHOOHœÝ\\—ØYZ[ˆˆ	‰ˆZ\ÔÝ\\YZ[ŠHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXÝ[Ûˆ[\™]Hˆ°íHÝ\\ˆYZ[ˆ°ê\Ù\°êH‚ˆJNÂˆB‚ˆÛÛœÝ˜[Y\ÈHÂˆ[˜[YKˆ[XZ[ˆ™\]Y\ÝY›ÛH›XYØ\Ú[šY\ˆ‹ˆÛ™Hˆ‹ˆ\×ØXÝ]™HOOH˜[ÙKˆNÂ‚ˆ]]Y\žHHˆTUH\Ù\œÂˆÑU[˜[YOIKˆ[XZ[I‹ˆ›ÛOIËˆÛ™OIˆ\×ØXÝ]™OIKˆ\×ÜÝ\\—ØYZ[IÚ\ÔÝ\\YZ[ˆÈ‰ˆˆˆš\×ÜÝ\\—ØYZ[ˆŸBˆÂ‚ˆYˆ
+\ÔÝ\\YZ[ŠHÂˆ˜[Y\Ëœ\Ú
+™\]Y\ÝY›ÛHOOHœÝ\\—ØYZ[ˆŠNÂˆB‚ˆYˆ
+\ÜÝÛÜ™	‰ˆÝš[™Ê\ÜÝÛÜ™
+Kš[J
+HOOHˆŠHÂˆÛÛœÝ\ÜÝÛÜ™\œ›ÜˆH˜[Y]T\ÜÝÛÜ™Ý™[™Ý
+\ÜÝÛÜ™
+NÂˆYˆ
+\ÜÝÛÜ™\œ›ÜŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ\ÜÝÛÜ™\œ›ÜˆJNÂˆB‚ˆ˜[Y\Ëœ\Ú
+]ØZ]\Ú\ÜÝÛÜ™
+\ÜÝÛÜ™
+JNÂˆ]Y\žH
+ÏH\ÜÝÛÜ™I	Ý˜[Y\Ë›[™ÝXÂˆB‚ˆ˜[Y\Ëœ\Ú
+Y
+NÂˆ]Y\žH
+ÏHÒT‘HYI	Ý˜[Y\Ë›[™ÝXÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆ]Y\žH
+ÏHS‘ÛÛ\[žWÚYI	Ý˜[Y\Ë›[™ÝXÂˆB‚ˆ]Y\žH
+ÏH‘UT“’S‘ÈY[˜[YK[XZ[›ÛKÛ™K\×ØXÝ]™K˜YÙWØÛÙK›Ùš[WÚ[XYÙWÝ\›ÛÛ\[žWÚYÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJ]Y\žK˜[Y\ÊNÂ‚ˆYˆ
+™\Ý[œ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÖÌJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆTUHTÑTˆˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ\œ›Ü‹›Y\ÜØYÙH‘\œ™]\ˆ[ÙYšXØ][Ûˆ][\Ø]]\ˆ‚ˆJNÂˆBˆBŠNÂ‚˜\œÜÝ
+ˆ‹Ý\Ù\œËÎšYÜ™\Ù]\\ÜÝÛÜ™‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+XØ[XØÙ\ÜÐYZ[”Ù][™ÜÊ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈYZ[š\Ý˜]]\ˆ™\]Z\ËˆˆJNÂˆB‚ˆÛÛœÝ[\\ÜÝÛÜ™HšX[™ÛKIØÜž\Ëœ˜[™ÛPž]\Ê
+KÔÝš[™Êš^Š_KLŒ˜ÂˆÛÛœÝ\ÚY\ÜÝÛÜ™H]ØZ]\Ú\ÜÝÛÜ™
+[\\ÜÝÛÜ™
+NÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\K™\K\Ù\‹˜ÛÛ\[žWÚY
+NÂˆÛÛœÝ\ÔÝ\\YZ[ˆH\ÔÝ\\YZ[•\Ù\Š™\K\Ù\ŠNÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆTUH\Ù\œÂˆÑU\ÜÝÛÜ™IKˆ›Ü˜ÙWÜ\ÜÝÛÜ™ØÚ[™ÙO]YKˆ\]YØ]PÕT”‘S•ÕSQTÕSTˆÒT‘HYI‚ˆ	Ú\ÔÝ\\YZ[ˆÈˆˆˆS‘ÛÛ\[žWÚYIÈŸBˆ‘UT“’S‘ÈY[˜[YK[XZ[›ÛKÛÛ\[žWÚYˆ\ÔÝ\\YZ[ˆÈÚ\ÚY\ÜÝÛÜ™™\Kœ\˜[\ËšYHˆÚ\ÚY\ÜÝÛÜ™™\Kœ\˜[\ËšYÛÛ\[žRYBˆ
+NÂ‚ˆYˆ
+™\Ý[œ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆ]ØZ]ÙÐ]Y]
+ˆ™\Kˆœ™\Ù]Ü\ÜÝÛÜ™‹ˆ\Ù\ˆ‹ˆ™\Kœ\˜[\ËšYˆÈ\™Ù]Ù[XZ[ˆ™\Ý[œ›ÝÜÖÌK™[XZ[Bˆ
+NÂ‚ˆ][XZ[ÜÙ[H˜[ÙNÂˆ][XZ[ÛY\ÜØYÙHH”ÓU›ÛˆÛÛ™šYÝ\°êHˆÛÛ[][š\]Y^ˆH[ÝH\ÜÙH[\Ü˜Z\™HX[Y[[Y[ˆŽÂ‚ˆYˆ
+›ØÙ\ÜË™[‹”ÓUÒÔÕ	‰ˆ›ØÙ\ÜË™[‹”ÓUÕTÑTˆ	‰ˆ›ØÙ\ÜË™[‹”ÓUÔTÔÈ	‰ˆ™\Ý[œ›ÝÜÖÌK™[XZ[
+HÂˆžHÂˆÛÛœÝ˜[œÜÜ\ˆH›Ù[XZ[\‹˜Ü™X]U˜[œÜÜ
+ÂˆÜÝˆ›ØÙ\ÜË™[‹”ÓUÒÔÕˆÜˆ[X™\Š›ØÙ\ÜË™[‹”ÓUÔÔ•NÊKˆÙXÝ\™Nˆ[X™\Š›ØÙ\ÜË™[‹”ÓUÔÔ•NÊHOOHKˆ]]ˆÂˆ\Ù\Žˆ›ØÙ\ÜË™[‹”ÓUÕTÑT‹ˆ\ÜÎˆ›ØÙ\ÜË™[‹”ÓUÔTÔÂˆBˆJNÂ‚ˆ]ØZ]˜[œÜÜ\‹œÙ[™XZ[
+Âˆœ›ÛNˆ›ØÙ\ÜË™[‹”ÓUÑ”“ÓH›ØÙ\ÜË™[‹”ÓUÕTÑT‹ˆÎˆ™\Ý[œ›ÝÜÖÌK™[XZ[ˆÝXš™XÝˆ”°êZ[š]X[\Ø][Ûˆ[ÝH\ÜÙHšX[™ÛHÓTÈ›È‹ˆ[ˆˆ›Ûš›Ý\ˆ	Ü™\Ý[œ›ÝÜÖÌK™[˜[YHˆŸKÜ‚ˆ•›Ý™H[ÝH\ÜÙH[\Ü˜Z\™HšX[™ÛHÓTÈ›È\ÝÜ‚ˆÝ[OH™›Û\Ú^™NŒNÙ›Û]ÙZYÚ˜›Û‰Ý[\\ÜÝÛÜ™OÜ‚ˆÛÛ›™XÝ^‹]›Ý\ÈZ\È[ÙYšY^ˆ›Ý™H[ÝH\ÜÙKÜ‚ˆˆJNÂˆ[XZ[ÜÙ[HYNÂˆ[XZ[ÛY\ÜØYÙHH‘[XZ[H°êZ[š]X[\Ø][Ûˆ[›ÞpêKˆŽÂˆHØ]Ú
+XZ[\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆSPRS‘TÑUTÔÕÓÔ‘ˆ‹XZ[\œ›ÜŠNÂˆ[XZ[ÛY\ÜØYÙHH”ÓUÛÛ™šYÝ\°êHXZ\È8 &Y[›ÚH[XZ[H0êXÚÝpêKˆŽÂˆBˆB‚ˆ™\ËšœÛÛŠÂˆY\ÜØYÙNˆ[XZ[ÛY\ÜØYÙKˆ\Ù\Žˆ™\Ý[œ›ÝÜÖÌKˆ[\Ü˜\žWÜ\ÜÝÛÜ™ˆ[\\ÜÝÛÜ™ˆ[XZ[ÜÙ[ˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆ‘TÑUTÔÕÓÔ‘ˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ°êZ[š]X[\Ø][Ûˆ[ÝH\ÜÙHˆJNÂˆBˆBŠNÂ‚˜\™[]Jˆ‹Ý\Ù\œËÎšY‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÛÛ\[žRYH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂ‚ˆYˆ
+[X™\Š™\K\Ù\‹šY
+HOOH[X™\ŠY
+JHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÂˆ\œ›ÜŽˆ•›Ý\È™HÝ]™^ˆ\ÈÝ\š[Y\ˆ›Ý™H›Ü™HÛÛ\Kˆ‚ˆJNÂˆB‚ˆÛÛœÝ˜[Y\ÈHÚYNÂˆ]š[\ˆH•ÒT‘HYIHŽÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆš[\ˆ
+ÏHˆS‘ÛÛ\[žWÚYIˆŽÂˆB‚ˆ]ØZ]ÛÛœ]Y\žJˆSUH”“ÓH][™[˜ÙWÜÙ][™ÜÈÒT‘H\Ù\—ÚYIXˆÚYBˆ
+NÂˆ]ØZ]ÛÛœ]Y\žJˆSUH”“ÓH][™[˜ÙWÜ™XÛÜ™ÈÒT‘H\Ù\—ÚYIXˆÚYBˆ
+NÂˆ]ØZ]ÛÛœ]Y\žJˆSUH”“ÓH][™[˜ÙWÚ\ÝÜžHÒT‘H\Ù\—ÚYIXˆÚYBˆ
+NÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆSUH”“ÓH\Ù\œÈ	Ùš[\ŸH‘UT“’S‘ÈY[˜[YK[XZ[ˆ˜[Y\Âˆ
+NÂ‚ˆYˆ
+™\Ý[œ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ•][\Ø]]\ˆ[›Ý]˜X›HˆJNÂˆB‚ˆ™\ËšœÛÛŠÂˆY\ÜØYÙNˆ•][\Ø]]\ˆÝ\š[pêH‹ˆ\Ù\Žˆ™\Ý[œ›ÝÜÖÌBˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ‘T”‘UTˆSUHTÑTˆˆ‹\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ\œ›Ü‹›Y\ÜØYÙH‘\œ™]\ˆÝ\™\ÜÚ[Ûˆ][\Ø]]\ˆ‚ˆJNÂˆBˆBŠNÂ‚‹Êˆ“ÑRUÈÐPTÈ
+‹Â˜\™Ù]
+‹Ü›ÙXÝÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂˆÛÛœÝÛÛ\[žRYH\ÔÝ\\YZ[ˆÈÙ]Y™™XÝ]™PÛÛ\[žRY
+™\JHˆ™\K\Ù\‹˜ÛÛ\[žWÚYÂ‚ˆ]]Y\žHHˆÑSPÕ›ÙXÝËŠ‹ØØ][ÛœË™[\XÙ[Y[ØÛÙKË›˜[YHTÈÛÛ\[žWÛ˜[YBˆ”“ÓH›ÙXÝÂˆQ•“ÒSˆØØ][ÛœÈˆÓˆ›ÙXÝË›ØØ][Û—ÚYHØØ][ÛœËšYˆQ•“ÒSˆÛÛ\[šY\ÈÈÓˆËšY\›ÙXÝË˜ÛÛ\[žWÚYˆÂ‚ˆ]˜[Y\ÈH×NÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ˆÛÛ\[žRY
+HÂˆ]Y\žH
+ÏHÒT‘H›ÙXÝË˜ÛÛ\[žWÚYH	HÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆB‚ˆ]Y\žH
+ÏHÔ‘Tˆ–H›ÙXÝËšYTÐØÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJ]Y\žK˜[Y\ÊNÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÊNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ‘\œ™]\ˆ°êXÝ\0ê\˜][Ûˆ›ÙZ]ÈØXTÈ‚ˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹Ü›ÙXÝÈ‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\Ô™XYÛ›T›ÛJ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈXÝ\™HÙ][KˆˆJNÂˆB‚ˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\K™\K\Ù\‹˜ÛÛ\[žWÚY
+NÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂ‚ˆYˆ
+XÛÛ\[žRY
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”ðê[XÝ[Û›™^ˆ[™H[™\š\ÙHXÝ]™H]˜[HÜ°êY\ˆ[ˆ›ÙZ]ˆˆJNÂˆB‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆÛÛœÝ[Z]ÈH]ØZ]Ù]ÛÛ\[žT[“[Z]ÊÛÛ\[žRY
+NÂ‚ˆÛÛœÝÛÝ[™\Ý[H]ØZ]ÛÛœ]Y\žJˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓH›ÙXÝÈÒT‘HÛÛ\[žWÚYH	H‹ˆØÛÛ\[žRYBˆ
+NÂ‚ˆÛÛœÝÝ\œ™[›ÙXÝÈH[X™\ŠÛÝ[™\Ý[œ›ÝÜÖÌK˜ÛÝ[
+NÂˆÛÛœÝX^›ÙXÝÈH[X™\Š[Z]ÏË›X^Ü›ÙXÝÈ
+NÂ‚ˆYˆ
+X^›ÙXÝÈˆ	‰ˆÝ\œ™[›ÙXÝÈHX^›ÙXÝÊHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽ‚ˆ“[Z]H›ÙZ]È]Z[HÝ\ˆ›Ý™H›Ü›][Kˆ™]Z[^ˆ\ÜÙ\ˆ0è[™H›Ü›][HÝ\0ê\šY]\™Kˆ‚ˆJNÂˆBˆB‚ˆÛÛœÝÂˆ™Y™\™[˜ÙKˆ˜[YKˆØ]YÛÜžKˆÝØÚËˆØ\™ZÝ\ÙKˆÝ]\Ëˆ[š]ˆÙZYÚˆ[Y[œÚ[ÛœËˆ˜\˜ÛÙKˆ\ØÜš\[Û‹ˆ\×ØXÝ]™KˆØØ][Û—ÚYˆØØ][Û—ØÛÙKˆZ[š[][WÜÝØÚËˆ[XYÙWÝ\›ˆ\˜Ú\ÙWÜšXÙKˆØ[WÜšXÙKˆ™[[ÜšXÙKˆZ[WÜšXÙKˆ[ÛWÜšXÙKˆ\×ÜÙ[X›Kˆ\×Ü™[X›Kˆ\×Ù\˜X›Kˆ›ÙXÝÝ\Kˆ\Ù\—Û˜[YKˆ\Ù\—Ü›ÛBˆHH™\K˜›ÙNÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È›ÙXÝÂˆ
+ˆ™Y™\™[˜ÙKˆ˜[YKˆØ]YÛÜžKˆÝØÚËˆØ\™ZÝ\ÙKˆÝ]\Ëˆ[š]ˆÙZYÚˆ[Y[œÚ[ÛœËˆ˜\˜ÛÙKˆ\ØÜš\[Û‹ˆ\×ØXÝ]™KˆØØ][Û—ÚYˆØØ][Û—ØÛÙKˆZ[š[][WÜÝØÚËˆ[XYÙWÝ\›ˆ\˜Ú\ÙWÜšXÙKˆØ[WÜšXÙKˆ™[[ÜšXÙKˆZ[WÜšXÙKˆ[ÛWÜšXÙKˆ\×ÜÙ[X›Kˆ\×Ü™[X›Kˆ\×Ù\˜X›Kˆ›ÙXÝÝ\KˆÛÛ\[žWÚYˆ
+BˆSQTÈ
+ˆ	K	‹	Ë		K	‹	Ë	ˆ	K	L	LK	L‹	LË	M	MK	M‹ˆ	MË	N	NK	Œ	ŒK	Œ‹	ŒË		K	‚ˆ
+Bˆ‘UT“’S‘È
+˜ˆÂˆ™Y™\™[˜ÙKˆ˜[YKˆØ]YÛÜžKˆ[X™\ŠÝØÚÈ
+KˆØ\™ZÝ\ÙKˆÝ]\È‘\ÜÛšX›H‹ˆ[š]œpêÙH‹ˆ[X™\ŠÙZYÚ
+Kˆ[Y[œÚ[ÛœÈˆ‹ˆ˜\˜ÛÙHˆ‹ˆ\ØÜš\[Ûˆˆ‹ˆ\×ØXÝ]™HOOH˜[ÙKˆØØ][Û—ÚY[ˆØØ][Û—ØÛÙHˆ‹ˆ[X™\ŠZ[š[][WÜÝØÚÈJKˆ[XYÙWÝ\›ˆ‹ˆ[X™\Š\˜Ú\ÙWÜšXÙH
+Kˆ[X™\ŠØ[WÜšXÙH
+Kˆ[X™\Š™[[ÜšXÙH
+Kˆ[X™\ŠZ[WÜšXÙH
+Kˆ[X™\Š[ÛWÜšXÙH
+Kˆ\×ÜÙ[X›HOOH˜[ÙKˆ\×Ü™[X›HOOHYKˆ\×Ù\˜X›HOOHYKˆ›ÙXÝÝ\HœÝØÚ×Û›Ü›X[‹ˆÛÛ\[žRYˆBˆ
+NÂ‚ˆ]ØZ]ÙÐXÝ]š]Jˆ\Ù\—Û˜[YKˆ\Ù\—Ü›ÛKˆZ›Ý]›ÙZ]‹ˆ”›ÙZ]È‹ˆ›ÙZ]Z›Ý]0êHˆ	Ü™Y™\™[˜Ù_HH	Û˜[Y_Xˆ
+NÂ‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠ™\Ý[œ›ÝÜÖÌJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆZ›Ý]›ÙZ]ˆJNÂˆBŸJNÂ‚˜\œ]
+ˆ‹Ü›ÙXÝËÎšY‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\Ô™XYÛ›T›ÛJ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈXÝ\™HÙ][KˆˆJNÂˆB‚ˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\K™\K\Ù\‹˜ÛÛ\[žWÚY
+NÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂ‚ˆYˆ
+XÛÛ\[žRY
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”ðê[XÝ[Û›™^ˆ[™H[™\š\ÙHXÝ]™H]˜[H[ÙYšY\ˆ[ˆ›ÙZ]ˆˆJNÂˆB‚ˆÛÛœÝÂˆ™Y™\™[˜ÙKˆ˜[YKˆØ]YÛÜžKˆÝØÚËˆØ\™ZÝ\ÙKˆÝ]\Ëˆ[š]ˆÙZYÚˆ[Y[œÚ[ÛœËˆ˜\˜ÛÙKˆ\ØÜš\[Û‹ˆ\×ØXÝ]™KˆØØ][Û—ÚYˆØØ][Û—ØÛÙKˆZ[š[][WÜÝØÚËˆ[XYÙWÝ\›ˆ\˜Ú\ÙWÜšXÙKˆØ[WÜšXÙKˆ™[[ÜšXÙKˆZ[WÜšXÙKˆ[ÛWÜšXÙKˆ\×ÜÙ[X›Kˆ\×Ü™[X›Kˆ\×Ù\˜X›Kˆ›ÙXÝÝ\Kˆ\Ù\—Û˜[YKˆ\Ù\—Ü›ÛBˆHH™\K˜›ÙNÂ‚ˆÛÛœÝ˜[Y\ÈHÂˆ™Y™\™[˜ÙKˆ˜[YKˆØ]YÛÜžKˆ[X™\ŠÝØÚÈ
+KˆØ\™ZÝ\ÙKˆÝ]\Ëˆ[š]œpêÙH‹ˆ[X™\ŠÙZYÚ
+Kˆ[Y[œÚ[ÛœÈˆ‹ˆ˜\˜ÛÙHˆ‹ˆ\ØÜš\[Ûˆˆ‹ˆ\×ØXÝ]™HOOH˜[ÙKˆØØ][Û—ÚY[ˆØØ][Û—ØÛÙHˆ‹ˆ[X™\ŠZ[š[][WÜÝØÚÈJKˆ[XYÙWÝ\›ˆ‹ˆ[X™\Š\˜Ú\ÙWÜšXÙH
+Kˆ[X™\ŠØ[WÜšXÙH
+Kˆ[X™\Š™[[ÜšXÙH
+Kˆ[X™\ŠZ[WÜšXÙH
+Kˆ[X™\Š[ÛWÜšXÙH
+Kˆ\×ÜÙ[X›HOOH˜[ÙKˆ\×Ü™[X›HOOHYKˆ\×Ù\˜X›HOOHYKˆ›ÙXÝÝ\HœÝØÚ×Û›Ü›X[‹ˆYˆNÂ‚ˆ]]Y\žHHˆTUH›ÙXÝÂˆÑU™Y™\™[˜ÙOIK˜[YOI‹Ø]YÛÜžOIËÝØÚÏIØ\™ZÝ\ÙOIKˆÝ]\ÏI‹[š]IËÙZYÚI[Y[œÚ[ÛœÏIK˜\˜ÛÙOILˆ\ØÜš\[ÛILK\×ØXÝ]™OIL‹ØØ][Û—ÚYILËØØ][Û—ØÛÙOIMˆZ[š[][WÜÝØÚÏIMK[XYÙWÝ\›IM‹\˜Ú\ÙWÜšXÙOIMËˆØ[WÜšXÙOIN™[[ÜšXÙOINKZ[WÜšXÙOIŒˆ[ÛWÜšXÙOIŒK\×ÜÙ[X›OIŒ‹\×Ü™[X›OIŒËˆ\×Ù\˜X›OI›ÙXÝÝ\OIBˆÒT‘HYI‚ˆÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆ]Y\žH
+ÏHS‘ÛÛ\[žWÚYI	Ý˜[Y\Ë›[™ÝXÂˆB‚ˆ]Y\žH
+ÏH‘UT“’S‘È
+˜Â‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆ]Y\žKˆ˜[Y\Âˆ
+NÂ‚ˆYˆ
+™\Ý[œ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÙZ][›Ý]˜X›HˆJNÂˆB‚ˆ]ØZ]ÙÐXÝ]š]Jˆ\Ù\—Û˜[YKˆ\Ù\—Ü›ÛKˆ“[ÙYšXØ][Ûˆ›ÙZ]‹ˆ”›ÙZ]È‹ˆ›ÙZ][ÙYšpêHˆ	Ü™Y™\™[˜Ù_HH	Û˜[Y_Xˆ
+NÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÖÌJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆ[ÙYšXØ][Ûˆ›ÙZ]ˆJNÂˆBŸJNÂ‚˜\™[]Jˆ‹Ü›ÙXÝËÎšY‹ˆ]][XØ]UÚÙ[‹ˆ]]Üš^™T›Û\Ê˜YZ[ˆ‹œÝ\\—ØYZ[ˆŠKˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\Ô™XYÛ›T›ÛJ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈXÝ\™HÙ][KˆˆJNÂˆB‚ˆÛÛœÝÛÛ\[žRYH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂˆÛÛœÝ˜[Y\ÈHÜ™\Kœ\˜[\ËšYNÂˆ]]Y\žHH‘SUH”“ÓH›ÙXÝÈÒT‘HYIHŽÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆ]Y\žH
+ÏHˆS‘ÛÛ\[žWÚYIˆŽÂˆB‚ˆ]Y\žH
+ÏHˆ‘UT“’S‘ÈYŽÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJ]Y\žK˜[Y\ÊNÂ‚ˆYˆ
+™\Ý[œ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”›ÙZ][›Ý]˜X›HˆJNÂˆB‚ˆ]ØZ]ÙÐXÝ]š]JˆYZ[š\Ý˜]]\ˆ‹ˆ˜YZ[ˆ‹ˆ”Ý\™\ÜÚ[Ûˆ›ÙZ]‹ˆ”›ÙZ]È‹ˆ›ÙZ]Ý\š[pêHQˆ	Ü™\Kœ\˜[\ËšYXˆ
+NÂ‚ˆ™\ËšœÛÛŠÈY\ÜØYÙNˆ”›ÙZ]Ý\š[pêHˆJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆÝ\™\ÜÚ[Ûˆ›ÙZ]ˆJNÂˆBŸJNÂ‚‹ÊˆSÕU‘SQS•ÈÕÐÒÈÐPTÈ
+‹Â˜\™Ù]
+‹ÜÝØÚË[[Ý™[Y[È‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆÛÛœÝÛÛ\[žRYH™\K\Ù\‹˜ÛÛ\[žWÚYÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂ‚ˆ]]Y\žHHˆÑSPÕ
+ˆ”“ÓHÝØÚ×Û[Ý™[Y[ÂˆÂ‚ˆ]˜[Y\ÈH×NÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ŠHÂˆ]Y\žH
+ÏHÒT‘HÛÛ\[žWÚYH	HÂˆ˜[Y\Ëœ\Ú
+ÛÛ\[žRY
+NÂˆB‚ˆ]Y\žH
+ÏHÔ‘Tˆ–HYTÐØÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJ]Y\žK˜[Y\ÊNÂ‚ˆ™\ËšœÛÛŠ™\Ý[œ›ÝÜÊNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÂˆ\œ›ÜŽˆ‘\œ™]\ˆ[Ý]™[Y[ÈÝØÚÈØXTÈ‚ˆJNÂˆBŸJNÂ‚˜\œÜÝ
+‹ÜÝØÚË[[Ý™[Y[È‹]][XØ]UÚÙ[‹\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+\Ô™XYÛ›T›ÛJ™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÈ\œ›ÜŽˆXØðêÈXÝ\™HÙ][KˆˆJNÂˆB‚ˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\K™\K\Ù\‹˜ÛÛ\[žWÚY
+NÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂˆYˆ
+XÛÛ\[žRY
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”ðê[XÝ[Û›™^ˆ[™H[™\š\ÙHXÝ]™H]˜[HÜ°êY\ˆ[ˆ[Ý]™[Y[ÝØÚËˆˆJNÂˆB‚ˆÛÛœÝÂˆ\Kˆ›ÙXÝÜ™Y™\™[˜ÙKˆ›ÙXÝÛ˜[YKˆ]X[]KˆÛÝ\˜ÙWÝØ\™ZÝ\ÙKˆ\Ý[˜][Û—ÝØ\™ZÝ\ÙKˆØØ][Û—ØÛÙKˆØ\™ZÝ\ÙWÚYˆØØ][Û—ÚYˆ\™\—ÚYH[ˆ\™\—Û˜[YHHˆ‹ˆ\™\—Ý\HHˆ‹ˆ\WÜšXÙHH˜[ÙKˆ[š]ÜšXÙHHˆ™X\ÛÛ‹ˆ\Ù\—Û˜[YKˆ\Ù\—Ü›ÛBˆHH™\K˜›ÙNÂ‚ˆÛÛœÝ›ÙXÝÚXÚÈH]ØZ]ÛÛœ]Y\žJˆÑSPÕ
+‚ˆ”“ÓH›ÙXÝÂˆÒT‘H™Y™\™[˜ÙOIBˆS‘ÛÛ\[žWÚYI‚ˆSRUXˆÜ›ÙXÝÜ™Y™\™[˜ÙKÛÛ\[žRYBˆ
+NÂ‚ˆYˆ
+›ÙXÝÚXÚËœ›ÝÜË›[™ÝOOH
+HÂˆ™]\›ˆ™\ÂˆœÝ]\Ê
+BˆšœÛÛŠÈ\œ›ÜŽˆ”›ÙZ][›Ý]˜X›HÝ\ˆÙ]H[™\š\ÙHˆJNÂˆB‚ˆÛÛœÝ›ÙXÝH›ÙXÝÚXÚËœ›ÝÜÖÌNÂˆÛÛœÝšXÙP\YYH\WÜšXÙHOOHYH\WÜšXÙHOOHYHŽÂˆÛÛœÝ[Ý™[Y[[š]šXÙHHšXÙP\YYÈ[X™\Š[š]ÜšXÙH
+HˆÂˆÛÛœÝ[Ý™[Y[Ý[[[Ý[HšXÙP\YYˆÈ[X™\Š]X[]H
+H
+ˆ[Ý™[Y[[š]šXÙBˆˆÂ‚ˆÛÛœÝ™\Ý[H]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•ÈÝØÚ×Û[Ý™[Y[Âˆ
+\K›ÙXÝÜ™Y™\™[˜ÙK›ÙXÝÛ˜[YK]X[]KÛÝ\˜ÙWÝØ\™ZÝ\ÙKˆ\Ý[˜][Û—ÝØ\™ZÝ\ÙK™X\ÛÛ‹Ý]\ËÛÛ\[žWÚYÜ™X]YØžKˆÜ™X]YØžWÛ˜[YKÜ™X]YØžWÜ›ÛKØØ][Û—ØÛÙKØ\™ZÝ\ÙWÚYˆ\›Ý˜[ÜÝ]\ËÜšYÚ[˜[Ü]X[]Kš[˜[Ü]X[]K›ÙXÝÚYØØ][Û—ÚYˆ\™\—ÚY\™\—Û˜[YK\™\—Ý\K\WÜšXÙK[š]ÜšXÙKÝ[Ø[[Ý[
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë		K	L	LK	L‹	LË	M	MK	M‹	MË	N	NK	Œ	ŒK	Œ‹	ŒË		JBˆ‘UT“’S‘È
+˜ˆÂˆ\Kˆ›ÙXÝÜ™Y™\™[˜ÙKˆ›ÙXÝÛ˜[YH›ÙXÝ›˜[YKˆ[X™\Š]X[]JKˆÛÝ\˜ÙWÝØ\™ZÝ\ÙH›ÙXÝØ\™ZÝ\ÙHˆ‹ˆ\Ý[˜][Û—ÝØ\™ZÝ\ÙKˆ™X\ÛÛ‹ˆ‘[ˆ][H‹ˆÛÛ\[žRYˆ™\K\Ù\‹šYˆ\Ù\—Û˜[YH™\K\Ù\‹™[XZ[•][\Ø]]\ˆ‹ˆ\Ù\—Ü›ÛH™\K\Ù\‹œ›ÛH“›Ûˆ0êYš[šH‹ˆØØ][Û—ØÛÙH›ÙXÝ›ØØ][Û—ØÛÙHˆ‹ˆØ\™ZÝ\ÙWÚY[ˆ‘[ˆ][H‹ˆ[X™\Š]X[]JKˆ[X™\Š]X[]JKˆ›ÙXÝšYˆØØ][Û—ÚY›ÙXÝ›ØØ][Û—ÚY[ˆ\™\—ÚY[ˆ\™\—Û˜[YHˆ‹ˆ\™\—Ý\Hˆ‹ˆšXÙP\YYˆ[Ý™[Y[[š]šXÙKˆ[Ý™[Y[Ý[[[Ý[ˆBˆ
+NÂ‚ˆYˆ
+\HOOH’[™[Z\™HŠHÂˆÛÛœÝÞ\Ý[TÝØÚÈH[X™\Š›ÙXÝËœÝØÚÈ
+NÂˆÛÛœÝ™X[ÝØÚÈH[X™\Š]X[]H
+NÂˆÛÛœÝY™™\™[˜ÙHH™X[ÝØÚÈHÞ\Ý[TÝØÚÎÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆS”ÑT•S•È[™[ÜžWÚ\ÝÜžBˆ
+›ÙXÝÜ™Y™\™[˜ÙK›ÙXÝÛ˜[YKÞ\Ý[WÜÝØÚË™X[ÜÝØÚËY™™\™[˜ÙKˆØ\™ZÝ\ÙKØØ][Û—ØÛÙK\Ù\—Û˜[YK\Ù\—Ü›ÛKÝ]\ËØœÙ\˜][Û‹ÛÛ\[žWÚY
+BˆSQTÈ
+	K	‹	Ë		K	‹	Ë		K	L	LK	LŠXˆÂˆ›ÙXÝÜ™Y™\™[˜ÙKˆ›ÙXÝÛ˜[YH›ÙXÝ›˜[YKˆÞ\Ý[TÝØÚËˆ™X[ÝØÚËˆY™™\™[˜ÙKˆÛÝ\˜ÙWÝØ\™ZÝ\ÙH›ÙXÝËØ\™ZÝ\ÙHˆ‹ˆ›ÙXÝË›ØØ][Û—ØÛÙHˆ‹ˆ\Ù\—Û˜[YH“XYØ\Ú[šY\ˆ‹ˆ\Ù\—Ü›ÛH›XYØ\Ú[šY\ˆ‹ˆ‘[ˆ][H‹ˆ™X\ÛÛˆˆ‹ˆÛÛ\[žRYˆBˆ
+NÂˆB‚ˆ]ØZ]ÙÐXÝ]š]Jˆ\Ù\—Û˜[YKˆ\Ù\—Ü›ÛKˆÜ°êX][Ûˆ[Ý]™[Y[ÝØÚÈ‹ˆ”ÝØÚÜÈ‹ˆ	Ý\_HÜ°êpêYHÝ\ˆ	Ü›ÙXÝÜ™Y™\™[˜Ù_Xˆ
+NÂ‚ˆÛÛœÝYZ[•\Ù\œÈH]ØZ]ÛÛœ]Y\žJˆÑSPÕY”“ÓH\Ù\œÂˆÒT‘HÛÛ\[žWÚYIBˆS‘
+›ÛOIØYZ[‰ÈÔˆ›ÛOIÜÝ\\—ØYZ[‰ÈÔˆ\×ÜÝ\\—ØYZ[]YJXˆØÛÛ\[žRYBˆ
+NÂ‚ˆ›Üˆ
+ÛÛœÝYZ[ˆÙˆYZ[•\Ù\œËœ›ÝÜÊHÂˆYˆ
+YZ[‹šYOOH™\K\Ù\‹šY
+HÂˆ]ØZ]Ü™X]S›ÝYšXØ][ÛŠÂˆ\Ù\—ÚYˆYZ[‹šYˆ]Nˆ“[Ý]™[Y[ÝØÚÈ0è˜[Y\ˆ‹ˆY\ÜØYÙNˆ	Âˆ™\K\Ù\‹™[XZ[•[ˆ][\Ø]]\ˆ‚ˆHHÜ°êpêH[™H[X[™H	Ý\_HÝ\ˆ	Ü›ÙXÝÜ™Y™\™[˜Ù_K˜ˆ\N‚ˆ\HOOH•˜[œÙ™\‚ˆÈ˜[œÙ™\—Ü[™[™È‚ˆˆ\HOOH’[™[Z\™H‚ˆÈš[™[ÜžWØY\ÝY[Ü[™[™È‚ˆˆœÝØÚ×Û[Ý™[Y[Ü[™[™È‹ˆÛÛ\[žWÚYˆÛÛ\[žRYˆš[Üš]NˆšYÚ‹ˆ™[]YÙ[]WÝ\NˆœÝØÚ×Û[Ý™[Y[‹ˆ™[]YÙ[]WÚYˆ™\Ý[œ›ÝÜÖÌKšYˆXÝ[Û—Ý\›ˆÜÝØÚÜÏÛ[Ý™[Y[IÜ™\Ý[œ›ÝÜÖÌKšYXˆÜ™X]YØžNˆ™\K\Ù\‹šYˆ\ÜÚYÛ™YÝÎˆYZ[‹šYˆØ\™ZÝ\ÙWÚYˆØ\™ZÝ\ÙWÚY[ˆJNÂˆBˆB‚ˆ™\ËœÝ]\ÊŒJKšœÛÛŠ™\Ý[œ›ÝÜÖÌJNÂˆHØ]Ú
+\œ›ÜŠHÂˆÛÛœÛÛK™\œ›ÜŠ\œ›ÜŠNÂˆ™\ËœÝ]\ÊL
+KšœÛÛŠÈ\œ›ÜŽˆ‘\œ™]\ˆÜ°êX][Ûˆ[Ý]™[Y[ˆJNÂˆBŸJNÂ‚˜\œ]
+ˆ‹ÜÝØÚË[[Ý™[Y[ËÎšYÝ˜[Y]H‹ˆ]][XØ]UÚÙ[‹ˆ\Þ[˜È
+™\K™\ÊHOˆÂˆžHÂˆYˆ
+XØ[•˜[Y]TÝØÚÓ[Ý™[Y[
+™\K\Ù\ŠJHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆXØðêÈ™Y\ðêHˆ›Ý\È™HÝ]™^ˆ\È˜[Y\ˆÙH[Ý]™[Y[ˆ‚ˆJNÂˆB‚ˆÛÛœÝÈYHH™\Kœ\˜[\ÎÂˆÛÛœÝÛÛ\[žRYHÙ]Y™™XÝ]™PÛÛ\[žRY
+™\K™\K\Ù\‹˜ÛÛ\[žWÚY
+NÂˆÛÛœÝ\ÔÝ\\YZ[ˆH™\K\Ù\‹š\×ÜÝ\\—ØYZ[ˆOOHYNÂˆYˆ
+XÛÛ\[žRY
+HÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ”ðê[XÝ[Û›™^ˆ[™H[™\š\ÙHXÝ]™H]˜[H˜[Y\ˆ[ˆ[Ý]™[Y[ÝØÚËˆˆJNÂˆBˆÛÛœÝÈš[˜[Ü]X[]KÛÜœ™XÝ[Û—Û›ÝHHH™\K˜›ÙHßNÂ‚ˆÛÛœÝ[Ý™[Y[™\Ý[H]ØZ]ÛÛœ]Y\žJˆÑSPÕ
+ˆ”“ÓHÝØÚ×Û[Ý™[Y[ÂˆÒT‘HYIHS‘ÛÛ\[žWÚYI˜ˆÚYÛÛ\[žRYBˆ
+NÂ‚ˆÛÛœÝ[Ý™[Y[H[Ý™[Y[™\Ý[œ›ÝÜÖÌNÂ‚ˆYˆ
+[[Ý™[Y[
+Bˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“[Ý]™[Y[[›Ý]˜X›HˆJNÂ‚ˆYˆ
+Z\ÔÝ\\YZ[ˆ	‰ˆ[X™\Š[Ý™[Y[˜Ü™X]YØžJHOOH[X™\Š™\K\Ù\‹šY
+JHÂˆ™]\›ˆ™\ËœÝ]\ÊÊKšœÛÛŠÂˆ\œ›ÜŽˆ•›Ý\È™HÝ]™^ˆ\È˜[Y\ˆ›Ý™H›Ü™H[X[™Kˆ‚ˆJNÂˆB‚ˆYˆ
+[Ý™[Y[œÝ]\ÈOOH‘[ˆ][HŠHÂˆ™]\›ˆ™\ËœÝ]\Ê
+KšœÛÛŠÈ\œ›ÜŽˆ“[Ý]™[Y[0êZ°è˜Z]0êHˆJNÂˆB‚ˆÛÛœÝ\›Ý™Y]X[]HBˆš[˜[Ü]X[]HOOH[™Yš[™Y	‰ˆš[˜[Ü]X[]HOOH[ˆÈ[X™\Šš[˜[Ü]X[]JBˆˆ[X™\Š[Ý™[Y[œ]X[]JNÂ‚ˆYˆ
+[Ý™[Y[\HOOH‘[°êYHŠHÂˆ]ØZ]ÛÛœ]Y\žJˆTUH›ÙXÝÈÑUÝØÚÈHÝØÚÈ
+È	BˆÒT‘H™Y™\™[˜ÙHH	ˆS‘ÛÛ\[žWÚYIØˆØ\›Ý™Y]X[]K[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜ÙKÛÛ\[žRYBˆ
+NÂˆB‚ˆYˆ
+[Ý™[Y[\HOOH”ÛÜYHŠHÂˆ]ØZ]ÛÛœ]Y\žJˆTUH›ÙXÝÈÑUÝØÚÈHÔ‘PUTÕ
+ÝØÚÈH	K
+BˆÒT‘H™Y™\™[˜ÙHH	ˆS‘ÛÛ\[žWÚYIØˆØ\›Ý™Y]X[]K[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜ÙKÛÛ\[žRYBˆ
+NÂˆB‚ˆYˆ
+[Ý™[Y[\HOOH•˜[œÙ™\ŠHÂˆ]ØZ]ÛÛœ]Y\žJˆTUH›ÙXÝÈÑUØ\™ZÝ\ÙHH	BˆÒT‘H™Y™\™[˜ÙHH	ˆS‘ÛÛ\[žWÚYIØˆÛ[Ý™[Y[™\Ý[˜][Û—ÝØ\™ZÝ\ÙHˆ‹[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜ÙKÛÛ\[žRYBˆ
+NÂˆB‚ˆYˆ
+[Ý™[Y[\HOOH’[™[Z\™HŠHÂˆ]ØZ]ÛÛœ]Y\žJˆTUH›ÙXÝÈÑUÝØÚÈH	BˆÒT‘H™Y™\™[˜ÙHH	ˆS‘ÛÛ\[žWÚYIØˆØ\›Ý™Y]X[]K[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜ÙKÛÛ\[žRYBˆ
+NÂ‚ˆ]ØZ]ÛÛœ]Y\žJˆTUH[™[ÜžWÚ\ÝÜžBˆÑUÝ]\ÏIÕ˜[Y0êIÂˆÒT‘H›ÙXÝÜ™Y™\™[˜ÙOIHS‘Ý]\ÏIÑ[ˆ][IÂˆS‘ÛÛ\[žWÚYI˜ˆÛ[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜ÙKÛÛ\[žRYBˆ
+NÂˆB‚ˆÛÛœÝ\]YH]ØZ]ÛÛœ]Y\žJˆTUHÝØÚ×Û[Ý™[Y[ÂˆÑUÝ]\ÏIÕ˜[Y0êIËˆ\›Ý˜[ÜÝ]\ÏIÕ˜[Y0êIËˆš[˜[Ü]X[]OIKˆ˜[Y]YØžOI‹ˆ˜[Y]YØ]PÕT”‘S•ÕSQTÕSTˆ[ÙYšYYØžOPÐTÑHÒSˆ	ÎŽ˜›ÛÛX[ˆSˆ	ˆSÑH[ÙYšYYØžHS‘ˆ[ÙYšYYØ]PÐTÑHÒSˆ	ÎŽ˜›ÛÛX[ˆSˆÕT”‘S•ÕSQTÕSTSÑH[ÙYšYYØ]S‘ˆÛÜœ™XÝ[Û—Û›ÝOIˆÒT‘HYIHS‘ÛÛ\[žWÚYI‚ˆ‘UT“’S‘È
+˜ˆÂˆ\›Ý™Y]X[]Kˆ™\K\Ù\‹šYˆ\›Ý™Y]X[]HOOH[X™\Š[Ý™[Y[œ]X[]JKˆÛÜœ™XÝ[Û—Û›ÝHˆ‹ˆYˆÛÛ\[žRYˆBˆ
+NÂ‚ˆ]ØZ]ÙÐXÝ]š]JˆYZ[š\Ý˜]]\ˆ‹ˆ˜YZ[ˆ‹ˆ•˜[Y][Ûˆ[Ý]™[Y[ÝØÚÈ‹ˆ”ÝØÚÜÈ‹ˆ	Û[Ý™[Y[\_H˜[Y0êHÝ\ˆ	Û[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜Ù_Xˆ
+NÂ‚ˆYˆ
+[Ý™[Y[˜Ü™X]YØžJHÂˆ]ØZ]Ü™X]S›ÝYšXØ][ÛŠÂˆ\Ù\—ÚYˆ[Ý™[Y[˜Ü™X]YØžKˆ]Nˆ“[Ý]™[Y[ÝØÚÈ˜[Y0êH‹ˆY\ÜØYÙNˆ›Ý™H[X[™H	Û[Ý™[Y[\_HÝ\ˆ	Û[Ý™[Y[œ›ÙXÝÜ™Y™\™[˜Ù_HH0ê]0êH˜[Y0êYK˜ˆ\NˆœÝØÚ×Û[Ý™[Y[Ý˜[Y]Y‹ˆÛÛ\[žWÚYˆ[Ý™[Y[˜ÛÛ\[žWÚYÛÛ\[žRYˆš[Üš]Nˆ››Ü›X[‹ˆ™[]YÙ[]WÝ\NˆœÝØÚ×Û[Ý™[Y[‹ˆ™[]YÙ[]WÚYˆ[X™\ŠY
+KˆXÝ[Û—Ý\›ˆÜÝØÚÜÏÛ[Ý™[Y[IÚYXˆÜ™X]YØžNˆ™\K\Ù\‹šYˆ\ÜÚYÛ™YÝÎˆ[Ý™[Y[˜Ü™X]YØžKˆØuÛMuæÚ$z{-®éÜj×rt_time,
         s.end_time,
 
         ar.id AS attendance_id,
@@ -19400,6 +6366,12 @@ app.use("/", createCamerasRouter({ pool, authenticateToken, getEffectiveCompanyI
 
 const createMarketingRouter = require("./routes/marketing");
 app.use("/", createMarketingRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
+
+const createPharmacyRouter = require("./routes/pharmacy");
+app.use("/", createPharmacyRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
+
+const createNetworkRouter = require("./routes/network");
+app.use("/", createNetworkRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
 
 // Profil public MaliLink (opt-in) : l'entreprise l'Ã©dite ici ; la lecture
 // publique (page /boutique, annuaire, sitemap) est dans routes/public-seo.
