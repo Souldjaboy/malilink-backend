@@ -51,6 +51,8 @@ const SUBMODULES = {
   cameras: ["sites", "enregistreurs", "identifiants", "visualisation"],
   // Le profil public MaliLink relève de « Paramètres » (toutes offres), pas du marketing.
   marketing: ["comptes", "publications", "campagnes"],
+  pharmacie: ["medicaments", "lots", "stock", "ordonnances", "patients", "prescripteurs", "ventes", "achats", "fournisseurs", "peremptions", "inventaires", "transferts", "retours", "rapports", "parametres", "sites"],
+  reseau: ["sites", "equipements", "adresses", "topologie", "incidents", "maintenance", "supervision", "parametres", "export"],
   // Triangle WMS Pro (logistique / entrepôt / ressources humaines)
   logistique: ["mouvements", "transferts", "demandes", "reception", "expedition", "inventaire"],
   rh: ["employes", "contrats", "conges", "paie", "pointage"],
@@ -63,6 +65,7 @@ const MODULE_LABELS = {
   laboratoire: "Laboratoire", finance: "Finance / Gestion", administration: "Administration",
   ia: "IA / Communication", logistique: "Logistique / Entrepôt", rh: "Ressources humaines",
   cameras: "Caméras & Sécurité", marketing: "Marketing & Réseaux sociaux",
+  pharmacie: "Pharmacie", reseau: "Réseau & Infrastructure",
 };
 
 /** Toutes les clés (modules + sous-modules) connues. */
@@ -124,13 +127,19 @@ const ROLE_SCOPES = {
   agent_securite: ["cameras"],
   marketing: ["marketing"],
   community_manager: ["marketing"],
+  proprietaire_pharmacie: ["pharmacie"],
+  pharmacien_responsable: ["pharmacie"],
+  pharmacien: ["pharmacie"],
+  preparateur: ["pharmacie"],
+  technicien_reseau: ["reseau"],
+  administrateur_reseau: ["reseau"],
 };
 
 /* Modules sensibles : pour un rôle qui n'est ni direction ni dans leur
    périmètre, le défaut est AUCUN accès — pas même « Voir ». Un magasinier ne
    voit pas les caméras, un caissier ne gère pas les réseaux sociaux, sauf
    droit accordé explicitement dans « Droits & permissions ». */
-const SENSITIVE_MODULES = new Set(["cameras", "marketing"]);
+const SENSITIVE_MODULES = new Set(["cameras", "marketing", "pharmacie", "reseau"]);
 
 const WRITE_ACTIONS = new Set(["view", "create", "update", "export", "print"]);
 

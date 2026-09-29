@@ -37,6 +37,13 @@ test("libellés scolaires, restauration, santé reconnus sans accents", () => {
   assert.strictEqual(access.normalizeBusinessType(""), "autre");
 });
 
+test("le profil Pharmacie active sa verticale sans ouvrir les autres", () => {
+  assert.strictEqual(access.normalizeBusinessType("Pharmacie"), "pharmacie");
+  const p = access.profileModules("pharmacie");
+  assert.ok(p.has("pharmacie"));
+  for (const k of ["education", "restaurant", "immobilier", "automobile", "voyage", "reseau", "cameras"]) assert.ok(!p.has(k), k);
+});
+
 test("le profil commerce n'inclut aucune verticale d'un autre métier", () => {
   const p = access.profileModules("commerce");
   for (const k of ["restaurant", "education", "immobilier", "hotel", "automobile", "laboratoire", "voyage", "livraison", "cameras", "marketing"]) {
@@ -109,6 +116,13 @@ test("les alias anciens pointent vers la bonne clé (reseaux_sociaux → marketi
   assert.strictEqual(access.normalizeKey("reseaux_sociaux"), "marketing");
   assert.strictEqual(access.normalizeKey("stocks"), "stock");
   assert.strictEqual(access.normalizeKey("assistant_ia"), "ia");
+  assert.strictEqual(access.normalizeKey("pharmacy"), "pharmacie");
+  assert.strictEqual(access.normalizeKey("network"), "reseau");
+});
+
+test("Pharmacie et Réseau restent fermés hors profil sans activation société", () => {
+  assert.strictEqual(access.companyModuleState(ctx(), "pharmacie").enabled, false);
+  assert.strictEqual(access.companyModuleState(ctx(), "reseau").enabled, false);
 });
 
 console.log("Niveau utilisateur");

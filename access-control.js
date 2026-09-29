@@ -93,10 +93,12 @@ const MODULE_CATALOG = [
   { key: "laboratoire", label: "Laboratoire / Santé", group: "verticales", vertical: true, permission: ["laboratoire"] },
   { key: "livraison", label: "Livraison", group: "verticales", vertical: true, permission: ["livraison"] },
   { key: "voyage", label: "MaliLink Voyage", group: "verticales", vertical: true, permission: ["voyage"] },
+  { key: "pharmacie", label: "Pharmacie", group: "verticales", vertical: true, permission: ["pharmacie"] },
 
   // Options (jamais actives par défaut hors profil ; soumises au plan)
   { key: "cameras", label: "Caméras & Sécurité", group: "options", vertical: true, permission: ["cameras"] },
   { key: "marketing", label: "Marketing & Réseaux sociaux", group: "options", vertical: true, permission: ["marketing"] },
+  { key: "reseau", label: "Réseau & Infrastructure", group: "options", vertical: true, permission: ["reseau"] },
 ];
 
 const CATALOG_BY_KEY = new Map(MODULE_CATALOG.map((m) => [m.key, m]));
@@ -129,6 +131,8 @@ const KEY_ALIASES = {
   restaurants: "restaurant",
   alerte: "alertes",
   reseaux_sociaux: "marketing",
+  pharmacy: "pharmacie",
+  network: "reseau",
 };
 
 function normalizeKey(key) {
@@ -172,6 +176,10 @@ const BUSINESS_PROFILES = {
     label: "Laboratoire",
     modules: [...COMMUN, "laboratoire", "paiements", "recus", "clients", ...FINANCE],
   },
+  pharmacie: {
+    label: "Pharmacie",
+    modules: [...COMMUN, "pharmacie", ...VENTE, ...STOCK, ...FINANCE],
+  },
   sante: {
     label: "Santé / Clinique",
     modules: [...COMMUN, "laboratoire", "paiements", "recus", "clients", ...FINANCE],
@@ -205,7 +213,8 @@ const BUSINESS_TYPE_PATTERNS = [
   ["ecole", ["ecole", "education", "scolaire", "universite", "institut", "formation", "lycee", "college"]],
   ["restaurant", ["restaurant", "restauration", "cafe", "maquis", "fast", "traiteur"]],
   ["laboratoire", ["laboratoire", "labo"]],
-  ["sante", ["sante", "clinique", "pharmacie", "cabinet medical", "hopital"]],
+  ["pharmacie", ["pharmacie", "pharmacy", "officine"]],
+  ["sante", ["sante", "clinique", "cabinet medical", "hopital"]],
   ["immobilier", ["immobilier", "hotel", "hebergement", "residence"]],
   ["automobile", ["automobile", "garage", "auto", "vehicule"]],
   ["logistique", ["logistique", "livraison", "transport", "coursier"]],
@@ -471,6 +480,8 @@ const API_ROUTE_RULES = [
   { prefix: "/marketplace/vendor", module: "marketplace", readAlso: ["commandes_recues"] },
   { prefix: "/cameras", module: "cameras" },
   { prefix: "/marketing", module: "marketing" },
+  { prefix: "/pharmacy", module: "pharmacie" },
+  { prefix: "/network", module: "reseau" },
   /* Sous-modules : le droit accordé sur un sous-module (ex. « Valider » sur
      marketing.publications) doit suffire, même si le parent ne porte pas
      cette action. Pas d'élargissement de lecture ici : un « Voir » refusé
