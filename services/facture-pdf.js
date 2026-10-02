@@ -54,9 +54,14 @@ function entete(doc, titre, numero, lignesDroite) {
 function pied(doc) {
   const y = doc.page.height - 50;
   doc.moveTo(40, y).lineTo(doc.page.width - 40, y).lineWidth(0.5).strokeColor(OR).stroke();
+  /* Le pied s'écrit SOUS la marge basse : sans la lever le temps de l'écrire,
+     pdfkit ouvrait une seconde page qui ne portait que cette ligne. */
+  const marge = doc.page.margins.bottom;
+  doc.page.margins.bottom = 0;
   doc.fillColor(GRIS).font("Helvetica").fontSize(8)
     .text("MaliLink Global — malilinkglobal.com — Document généré électroniquement.", 40, y + 8,
-      { width: doc.page.width - 80, align: "center" });
+      { width: doc.page.width - 80, align: "center", lineBreak: false });
+  doc.page.margins.bottom = marge;
 }
 
 function blocClient(doc, client, y) {

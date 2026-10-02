@@ -89,6 +89,8 @@ async function main() {
     verifier("PDF : vraie ligne de remise -175 000", p.texte.includes("Réduction exceptionnelle") && p.texte.includes("-175 000 FCFA"), p.texte.slice(0, 600));
     verifier("PDF : prix standard 250 000 et net 75 000", p.texte.includes("250 000 FCFA") && p.texte.includes("75 000 FCFA"));
     verifier("PDF : « Abonnement mensuel non inclus dans la présente facture. »", p.texte.includes("Abonnement mensuel non inclus dans la présente facture."));
+    const pages = (p.tampon.toString("latin1").match(/\/Type\s*\/Page[^s]/g) || []).length;
+    verifier("PDF : une seule page (le pied de page ne crée pas de page vide)", pages === 1, `${pages} pages`);
     verifier("PDF : mensualité affichée pour information (50 000 / mois)", p.texte.includes("50 000 FCFA / mois"));
     verifier("PDF : montant en lettres", p.texte.includes("Soixante-quinze mille francs CFA"));
     verifier("PDF : client, site, signature", p.texte.includes("ADA SERVICES") && p.texte.includes("malilinkglobal.com") && p.texte.includes("Signature et cachet"));
@@ -145,6 +147,7 @@ async function main() {
     const recuId = f.paiements[0].id;
     const r = await pdf(`/super-admin/companies/${ada.id}/payments/${recuId}/recu`, SA);
     verifier("reçu PDF numéroté", r.status === 200 && /REC-\d{4}-\d{6}/.test(r.texte), r.texte.slice(0, 200));
+    verifier("reçu PDF sur une seule page", (r.tampon.toString("latin1").match(/\/Type\s*\/Page[^s]/g) || []).length === 1);
     const reconf = await appel("POST", `/super-admin/companies/${ada.id}/payments/${recuId}/confirm`, SA);
     verifier("reconfirmer un paiement confirmé : sans effet (idempotent)", reconf.status === 200 && reconf.data?.deja === true);
   }
