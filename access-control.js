@@ -467,6 +467,13 @@ const API_ROUTE_RULES = [
   { prefix: "/chat", module: "chat" },
   { prefix: "/meetings", module: "reunions" },
   { prefix: "/attendance", module: "pointage", readAlso: ["pointage_qr", "parametres_pointage"] },
+  /* Libre-service : tout le personnel pointe pour LUI-MÊME dès que le module
+     est actif pour la société. Pointer un collègue est contrôlé par la route
+     (« Valider » sur Pointage QR ou Pointage). Sans cela, un magasinier ou
+     un caissier — lecture seule hors de leur périmètre — ne pouvait plus
+     pointer son arrivée. */
+  { prefix: "/attendance/scan", module: "pointage_qr", companyOnly: true },
+  { prefix: "/attendance/check", module: "pointage", companyOnly: true },
   { prefix: "/attendance-sites", module: "parametres_pointage", readAlso: ["pointage"] },
   { prefix: "/attendance-report", module: "pointage" },
   { prefix: "/alerts", module: "alertes" },
