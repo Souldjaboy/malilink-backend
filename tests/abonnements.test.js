@@ -265,6 +265,39 @@ async function main() {
     verifier("refus d'une déclaration avec motif", r.status === 200 && r.data?.paiement?.status === "failed");
   }
 
+  section("MÊME RÉFÉRENCE DE TRANSACTION, DEUX APPELS : UN SEUL EFFET");
+  {
+    const soc = await creerSociete({ nom: "Référence Unique", planCode: "starter" });
+    await finAbonnement(soc.id, jour(-20));
+    verifier("société échue : verrouillée", (await appel("GET", "/products", soc.token)).status === 402);
+    const factures = async () => (await q(`SELECT count(*)::int AS n FROM invoices WHERE company_id = $1`, [soc.id]))[0].n;
+    const confirmes = async () => (await q(`SELECT count(*)::int AS n FROM subscription_payments
+                                             WHERE company_id = $1 AND status = 'confirmed'`, [soc.id]))[0].n;
+    const facturesAvant = await factures();
+    const corps = { method: "wave", transaction_reference: "WV-UNIQUE-2026", months: 1 };
+    const d1 = await appel("POST", "/abonnement/paiements", soc.token, corps);
+    const d2 = await appel("POST", "/abonnement/paiements", soc.token, corps);
+    verifier("1er appel : déclaration en attente", d1.status === 201 && d1.data?.paiement?.status === "pending", JSON.stringify(d1.data));
+    verifier("2e appel, même référence, sans clé d'idempotence : 409", d2.status === 409 && d2.data?.code === "REFERENCE_DUPLIQUEE", JSON.stringify(d2.data));
+    const casse = await appel("POST", "/abonnement/paiements", soc.token, { ...corps, transaction_reference: "wv-unique-2026" });
+    verifier("… même en changeant la casse : 409", casse.status === 409);
+    const admin = await appel("POST", `/super-admin/companies/${soc.id}/payments`, SA,
+      { amount: plans.starter.mensuel, method: "wave", transaction_reference: "WV-UNIQUE-2026", confirm: true });
+    verifier("… même saisie par le super-admin : 409", admin.status === 409 && admin.data?.code === "REFERENCE_DUPLIQUEE");
+    const c1 = await appel("POST", `/super-admin/companies/${soc.id}/payments/${d1.data.paiement.id}/confirm`, SA);
+    const fin1 = (await appel("GET", "/abonnement/etat", soc.token)).data.etat.next_due_date;
+    const c2 = await appel("POST", `/super-admin/companies/${soc.id}/payments/${d1.data.paiement.id}/confirm`, SA);
+    const fin2 = (await appel("GET", "/abonnement/etat", soc.token)).data.etat.next_due_date;
+    verifier("confirmation : prolongé d'un mois et déverrouillé", c1.status === 200 && c1.data?.prolongation?.mois === 1
+      && c1.data?.etat?.verrouille === false, JSON.stringify(c1.data).slice(0, 300));
+    verifier("2e confirmation : sans effet (aucune double prolongation)", c2.data?.deja === true && fin2 === fin1);
+    verifier("un seul paiement confirmé", (await confirmes()) === 1);
+    verifier("une seule facture créée (aucun doublon)", (await factures()) === facturesAvant + 1);
+    const deverrouillages = (await q(`SELECT count(*)::int AS n FROM company_billing_events
+                                       WHERE company_id = $1 AND event_type = 'deverrouillage'`, [soc.id]))[0].n;
+    verifier("un seul déverrouillage journalisé", deverrouillages === 1, String(deverrouillages));
+  }
+
   section("SUPER-ADMIN : SUSPENDRE, RÉACTIVER, PROLONGER, DÉVERROUILLER");
   {
     const s = await appel("POST", `/super-admin/companies/${autre.id}/subscription/suspend`, SA, { reason: "Demande du client" });
