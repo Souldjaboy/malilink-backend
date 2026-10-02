@@ -2833,142 +2833,188 @@ app.post("/login", async (req, res) => {
       ]);
     }
 
-    const isSuperAdmin =
-      user.is_super_admin === true ||
-      user.is_super_admin === "true" ||
-      user.is_super_admin === 1 ||
-      String(user.role || "").toLowerCase() === "super_admin" ||
-      SUPER_ADMIN_EMAILS.has(normalizedEmail) ||
-      SUPER_ADMIN_EMAILS.has(String(user.email || "").trim().toLowerCase());
-
-    const isCustomerAccount = normalizeRole(user.role) === "customer";
-
-    if (!isSuperAdmin) {
-      // Comptes sans entreprise (client, livreur) : pas de vérification
-      // entreprise à exiger.
-      const hasNoCompany = !user.company_id;
-      const userVerified = user.email_verified === true || user.phone_verified === true;
-      const companyVerified =
-        isCustomerAccount ||
-        hasNoCompany ||
-        user.company_email_verified === true ||
-        user.company_phone_verified === true;
-      const accountPending =
-        String(user.account_status || "").toLowerCase() === "pending_verification" ||
-        (!isCustomerAccount && !hasNoCompany && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
-        user.verification_required === true;
-
-      if (!userVerified || !companyVerified || accountPending) {
-        return res.status(403).json({
-          error: "Vérification obligatoire avant connexion complète.",
-          code: "verification_required",
-          redirect: "/verification-required",
-          user_id: user.id,
-          company_id: user.company_id,
-          target_type: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? "email" : "phone",
-          target_value: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? user.email : user.phone
-        });
-      }
-
-      if (!isCustomerAccount && user.company_status === "suspended") {
-        return res.status(403).json({
-          error: "Entreprise suspendue. Veuillez contacter l’administration."
-        });
-      }
-
-      const subscriptionEnd =
-        user.company_subscription_expires_at ||
-        user.company_trial_end_date ||
-        user.subscription_end_date;
-      if (!isCustomerAccount && subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
-        await pool.query(
-          "UPDATE companies SET subscription_status='expired' WHERE id=$1",
-          [user.company_id]
-        ).catch(() => {});
-        return res.status(403).json({
-          error: "Votre essai gratuit ou abonnement est terminé.",
-          code: "subscription_expired",
-          redirect: "/abonnement-expire"
-        });
-      }
-
-      if (
-        !isCustomerAccount &&
-        (
-          user.subscription_status === "expired" ||
-          user.subscription_status === "suspended" ||
-          user.subscription_status === "cancelled"
-        )
-      ) {
-        return res.status(403).json({
-          error: "Abonnement inactif. Veuillez renouveler votre abonnement."
-        });
-      }
-    }
-
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        company_id: user.company_id,
-        tenant_id: tenantId,
-        is_super_admin: isSuperAdmin,
-        subscription_status: user.subscription_status || ""
-      },
-      JWT_SECRET,
-      { expiresIn: "1d" }
-    );
-
-    await logActivity(
-      user.fullname,
-      user.role,
-      "Connexion utilisateur",
-      "Authentification",
-      `${user.fullname} s'est connecté`
-    );
-    await logAudit(
-      { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: user.company_id } },
-      "login",
-      "user",
-      user.id,
-      { email: user.email }
-    );
-
-    const companyModules = isSuperAdmin ? await getCompanyModules(null) : await getCompanyModules(user.company_id);
-
-    setSecureAuthCookies(req, res, token, tenantId);
-
-    res.json({
-      message: "Connexion réussie",
-      token,
-      user: {
-        id: user.id,
-        fullname: user.fullname,
-        email: user.email,
-        role: isSuperAdmin ? "super_admin" : user.role,
-        company_id: user.company_id,
-        tenant_id: tenantId,
-        company_name: user.company_name || "",
-        company_status: user.company_status || "",
-        is_super_admin: isSuperAdmin,
-        subscription_status: user.subscription_status || "",
-        subscription_end_date: user.subscription_end_date || "",
-        trial_end_date: user.company_trial_end_date || "",
-        subscription_expires_at: user.company_subscription_expires_at || "",
-        plan_name: user.plan_name || "",
-        profile_image_url: user.profile_image_url || "",
-        business_type: user.business_type || "",
-        preferred_language: user.preferred_language || "",
-        force_password_change: user.force_password_change === true,
-        modules: companyModules
-      }
-    });
+    return finaliserConnexion(req, res, user, "mot_de_passe");
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur login SaaS" });
   }
 });
+
+/* La même requête pour toutes les méthodes de connexion. */
+const SELECT_UTILISATEUR_CONNEXION = `SELECT
+        u.*,
+        c.name AS company_name,
+        c.status AS company_status,
+        c.account_status AS company_account_status,
+        c.email_verified AS company_email_verified,
+        c.phone_verified AS company_phone_verified,
+        c.business_type AS business_type,
+        c.trial_end_date AS company_trial_end_date,
+        c.subscription_expires_at AS company_subscription_expires_at,
+        s.status AS subscription_status,
+        s.end_date AS subscription_end_date,
+        sp.name AS plan_name
+       FROM users u
+       LEFT JOIN companies c ON u.company_id = c.id
+       LEFT JOIN subscriptions s ON c.id = s.company_id
+       LEFT JOIN subscription_plans sp ON s.plan_id = sp.id`;
+
+/**
+ * Fin de connexion COMMUNE au mot de passe et à la passkey : tenant, compte
+ * actif, vérification, entreprise suspendue, abonnement, jeton, cookies,
+ * journal. Une passkey ne contourne donc aucun contrôle.
+ */
+async function finaliserConnexion(req, res, user, methode) {
+  const tenantId = getTenantFromRequest(req);
+  if (!(await companyBelongsToTenant(user.company_id, tenantId))) {
+    return res.status(403).json({
+      error: "Accès refusé : ce compte n’appartient pas à cette version."
+    });
+  }
+  if (user.is_active === false) {
+    return res.status(403).json({ error: "Compte désactivé" });
+  }
+
+  const isSuperAdmin =
+    user.is_super_admin === true ||
+    user.is_super_admin === "true" ||
+    user.is_super_admin === 1 ||
+    String(user.role || "").toLowerCase() === "super_admin" ||
+    SUPER_ADMIN_EMAILS.has(String(user.email || "").trim().toLowerCase());
+
+  const isCustomerAccount = normalizeRole(user.role) === "customer";
+
+  if (!isSuperAdmin) {
+    // Comptes sans entreprise (client, livreur) : pas de vérification
+    // entreprise à exiger.
+    const hasNoCompany = !user.company_id;
+    const userVerified = user.email_verified === true || user.phone_verified === true;
+    const companyVerified =
+      isCustomerAccount ||
+      hasNoCompany ||
+      user.company_email_verified === true ||
+      user.company_phone_verified === true;
+    const accountPending =
+      String(user.account_status || "").toLowerCase() === "pending_verification" ||
+      (!isCustomerAccount && !hasNoCompany && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
+      user.verification_required === true;
+
+    if (!userVerified || !companyVerified || accountPending) {
+      return res.status(403).json({
+        error: "Vérification obligatoire avant connexion complète.",
+        code: "verification_required",
+        redirect: "/verification-required",
+        user_id: user.id,
+        company_id: user.company_id,
+        target_type: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? "email" : "phone",
+        target_value: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? user.email : user.phone
+      });
+    }
+
+    if (!isCustomerAccount && user.company_status === "suspended") {
+      return res.status(403).json({
+        error: "Entreprise suspendue. Veuillez contacter l’administration."
+      });
+    }
+
+    const subscriptionEnd =
+      user.company_subscription_expires_at ||
+      user.company_trial_end_date ||
+      user.subscription_end_date;
+    if (!isCustomerAccount && subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
+      await pool.query(
+        "UPDATE companies SET subscription_status='expired' WHERE id=$1",
+        [user.company_id]
+      ).catch(() => {});
+      return res.status(403).json({
+        error: "Votre essai gratuit ou abonnement est terminé.",
+        code: "subscription_expired",
+        redirect: "/abonnement-expire"
+      });
+    }
+
+    if (
+      !isCustomerAccount &&
+      (
+        user.subscription_status === "expired" ||
+        user.subscription_status === "suspended" ||
+        user.subscription_status === "cancelled"
+      )
+    ) {
+      return res.status(403).json({
+        error: "Abonnement inactif. Veuillez renouveler votre abonnement."
+      });
+    }
+  }
+
+  const token = jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      company_id: user.company_id,
+      tenant_id: tenantId,
+      is_super_admin: isSuperAdmin,
+      subscription_status: user.subscription_status || ""
+    },
+    JWT_SECRET,
+    { expiresIn: "1d" }
+  );
+
+  await logActivity(
+    user.fullname,
+    user.role,
+    "Connexion utilisateur",
+    "Authentification",
+    `${user.fullname} s'est connecté (${methode === "passkey" ? "passkey" : "mot de passe"})`
+  );
+  await logAudit(
+    { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: user.company_id } },
+    "login",
+    "user",
+    user.id,
+    { email: user.email, method: methode }
+  );
+
+  const companyModules = isSuperAdmin ? await getCompanyModules(null) : await getCompanyModules(user.company_id);
+
+  setSecureAuthCookies(req, res, token, tenantId);
+
+  res.json({
+    message: "Connexion réussie",
+    token,
+    user: {
+      id: user.id,
+      fullname: user.fullname,
+      email: user.email,
+      role: isSuperAdmin ? "super_admin" : user.role,
+      company_id: user.company_id,
+      tenant_id: tenantId,
+      company_name: user.company_name || "",
+      company_status: user.company_status || "",
+      is_super_admin: isSuperAdmin,
+      subscription_status: user.subscription_status || "",
+      subscription_end_date: user.subscription_end_date || "",
+      trial_end_date: user.company_trial_end_date || "",
+      subscription_expires_at: user.company_subscription_expires_at || "",
+      plan_name: user.plan_name || "",
+      profile_image_url: user.profile_image_url || "",
+      business_type: user.business_type || "",
+      preferred_language: user.preferred_language || "",
+      force_password_change: user.force_password_change === true,
+      modules: companyModules
+    }
+  });
+}
+
+/* Connexion par passkey : le serveur a vérifié la signature WebAuthn ; il
+   ne reste qu'à charger la personne et appliquer les mêmes contrôles. */
+async function finaliserConnexionParId(req, res, userId, methode) {
+  const { rows } = await pool.query(
+    `${SELECT_UTILISATEUR_CONNEXION} WHERE u.id = $1 ORDER BY s.id DESC LIMIT 1`, [userId]);
+  if (!rows[0]) return res.status(401).json({ error: "Compte introuvable.", code: "COMPTE_INTROUVABLE" });
+  return finaliserConnexion(req, res, rows[0], methode);
+}
 
 app.get("/support/config", async (req, res) => {
   res.json({
