@@ -68,7 +68,14 @@ app.use(
   })
 )
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({
+  limit: "1mb",
+  /* Corps brut conservé pour la SEULE route signée par les terminaux
+     biométriques : la signature HMAC porte sur les octets reçus. */
+  verify: (req, res, buf) => {
+    if (String(req.originalUrl || req.url || "").includes("/biometrics/devices/events")) req.rawBody = Buffer.from(buf);
+  },
+}));
 
 app.use((req, res, next) => {
   if (req.url.startsWith("/api/")) {
@@ -19287,6 +19294,28 @@ app.use("/", createNetworkRouter({ pool, authenticateToken, getEffectiveCompanyI
 // publique (page /boutique, annuaire, sitemap) est dans routes/public-seo.
 const createProfilPublicRouter = require("./routes/profil-public");
 app.use("/", createProfilPublicRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission }));
+
+// Biométrie et passkeys : noyau commun (biometrie/), adaptateur MaliLink.
+// Visage et empreinte : module « Biométrie » fermé par défaut, gabarits
+// chiffrés par BIOMETRIC_ENC_KEY. Passkeys : WEBAUTHN_RP_ID / WEBAUTHN_ORIGINS.
+const { creerServiceBiometrie } = require("./biometrie/core/service");
+const { creerPasskeys } = require("./biometrie/passkeys");
+const { creerRouteurBiometrie } = require("./biometrie/routes");
+const hoteBiometrie = require("./biometrie/hote-malilink")({
+  pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, access, accessContextFor,
+  pointageEngine, finaliserConnexionParId, logAudit,
+});
+const serviceBiometrie = creerServiceBiometrie({ pool, hote: hoteBiometrie });
+const passkeysMaliLink = creerPasskeys({ pool });
+const biometrieMaliLink = creerRouteurBiometrie({
+  hote: hoteBiometrie,
+  service: serviceBiometrie,
+  passkeys: passkeysMaliLink,
+  limiteur: require("./middleware/rateLimit").createRateLimiter({
+    windowMs: 60 * 1000, max: 60, message: "Trop de tentatives biométriques : patientez une minute.",
+  }),
+});
+app.use("/", biometrieMaliLink.router);
 
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
