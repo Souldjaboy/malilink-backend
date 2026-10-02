@@ -1458,6 +1458,38 @@ async function moduleAccessGuard(req, res, next) {
 }
 app.use(moduleAccessGuard);
 
+/* VERROUILLAGE D'ABONNEMENT — au-delà de la fin de période + délai de grâce
+   (ou sur suspension), les fonctions métier sont bloquées (402). Restent
+   ouverts : connexion, abonnement, paiement, factures, support, déconnexion.
+   Aucune donnée n'est supprimée. Super-admin et comptes clients non concernés. */
+const { creerFacturation } = require("./services/facturation");
+const facturation = creerFacturation({ pool });
+const CHEMINS_HORS_VERROU = ["/abonnement", "/support", "/auth", "/login", "/logout", "/rbac/me",
+  "/company-settings/current", "/public", "/verification", "/password-reset"];
+async function verrouAbonnement(req, res, next) {
+  const chemin = String(req.path || "");
+  if (CHEMINS_HORS_VERROU.some((c) => chemin === c || chemin.startsWith(`${c}/`))) return next();
+  const user = resolveRequestUser(req);
+  if (!user || !user.company_id) return next();
+  if (isSuperAdminUser(user) || normalizeRole(user.role) === "customer") return next();
+  try {
+    const etat = await facturation.etatEnCache(Number(user.company_id));
+    if (!etat.verrouille) return next();
+    return res.status(402).json({
+      error: etat.statut === "suspendu"
+        ? "Votre abonnement MaliLink est suspendu. Contactez le support pour le réactiver."
+        : "Votre abonnement MaliLink a expiré. Réglez votre abonnement pour retrouver l'accès : vos données sont conservées.",
+      code: "ABONNEMENT_VERROUILLE",
+      statut: etat.statut,
+      redirect: "/abonnement-expire",
+    });
+  } catch (error) {
+    console.error("verrou abonnement :", error.message);
+    return next();
+  }
+}
+app.use(verrouAbonnement);
+
 const METHOD_ACTION = {
   GET: "view", HEAD: "view", OPTIONS: "view",
   POST: "create", PUT: "update", PATCH: "update", DELETE: "delete",
@@ -2924,33 +2956,18 @@ async function finaliserConnexion(req, res, user, methode) {
       });
     }
 
-    const subscriptionEnd =
-      user.company_subscription_expires_at ||
-      user.company_trial_end_date ||
-      user.subscription_end_date;
-    if (!isCustomerAccount && subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
-      await pool.query(
-        "UPDATE companies SET subscription_status='expired' WHERE id=$1",
-        [user.company_id]
-      ).catch(() => {});
-      return res.status(403).json({
-        error: "Votre essai gratuit ou abonnement est terminé.",
-        code: "subscription_expired",
-        redirect: "/abonnement-expire"
-      });
-    }
+  }
 
-    if (
-      !isCustomerAccount &&
-      (
-        user.subscription_status === "expired" ||
-        user.subscription_status === "suspended" ||
-        user.subscription_status === "cancelled"
-      )
-    ) {
-      return res.status(403).json({
-        error: "Abonnement inactif. Veuillez renouveler votre abonnement."
-      });
+  /* Abonnement expiré ou suspendu : la connexion reste POSSIBLE (page
+     abonnement, paiement, factures, support) ; les fonctions métier sont
+     verrouillées côté API (verrouAbonnement) et côté écran (cookie). */
+  let etatAbonnement = null;
+  if (!isSuperAdmin && !isCustomerAccount && user.company_id) {
+    etatAbonnement = await facturation.etat(Number(user.company_id)).catch(() => null);
+    if (etatAbonnement?.verrouille) {
+      user.subscription_status = etatAbonnement.statut === "suspendu" ? "suspended" : "expired";
+      await pool.query("UPDATE companies SET subscription_status=$2 WHERE id=$1",
+        [user.company_id, user.subscription_status]).catch(() => {});
     }
   }
 
@@ -3009,7 +3026,11 @@ async function finaliserConnexion(req, res, user, methode) {
       business_type: user.business_type || "",
       preferred_language: user.preferred_language || "",
       force_password_change: user.force_password_change === true,
-      modules: companyModules
+      modules: companyModules,
+      subscription_locked: etatAbonnement?.verrouille === true,
+      subscription_state: etatAbonnement ? {
+        statut: etatAbonnement.statut, fin: etatAbonnement.subscription_end, montant_du: etatAbonnement.montant_du,
+      } : null
     }
   });
 }
@@ -16482,87 +16503,25 @@ app.post("/assistant/query", authenticateToken, async (req, res) => {
    `user` depuis req.body (usurpation de company_id possible). */
 
 /* PAIEMENT MANUEL SAAS */
-app.post("/payments/manual", authenticateToken, async (req, res) => {
-  try {
-    const {
-      company_id,
-      subscription_id,
-      amount,
-      payment_method,
-      payment_reference,
-      notes
-    } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO payments
-      (
-        company_id,
-        subscription_id,
-        amount,
-        currency,
-        payment_method,
-        payment_reference,
-        status,
-        notes,
-        paid_at
-      )
-      VALUES ($1,$2,$3,'FCFA',$4,$5,'paid',$6,CURRENT_TIMESTAMP)
-      RETURNING *`,
-      [
-        company_id,
-        subscription_id || null,
-        Number(amount || 0),
-        payment_method,
-        payment_reference || "",
-        notes || ""
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur enregistrement paiement manuel"
-    });
-  }
+/* Anciennes routes d'abonnement — FERMÉES (audit du 2026-10-02) :
+   /payments/manual laissait tout utilisateur connecté enregistrer un
+   paiement « payé » pour n'importe quelle société et n'importe quel
+   montant ; /subscriptions/renew laissait tout utilisateur prolonger
+   n'importe quel abonnement gratuitement. Remplacées par la facturation
+   (routes/facturation.js) : montants calculés par le serveur, références
+   uniques, validation par le super-admin, historique. */
+app.post("/payments/manual", authenticateToken, (req, res) => {
+  res.status(410).json({
+    error: "Route retirée. Le paiement d'abonnement se déclare depuis la page Abonnement et se valide par MaliLink.",
+    code: "ROUTE_RETIREE",
+  });
 });
 
-/* RENOUVELLEMENT ABONNEMENT */
-app.post("/subscriptions/renew", authenticateToken, async (req, res) => {
-  try {
-    const { subscription_id, months } = req.body;
-
-    const subscriptionResult = await pool.query(
-      `SELECT * FROM subscriptions
-       WHERE id = $1`,
-      [subscription_id]
-    );
-
-    if (subscriptionResult.rows.length === 0) {
-      return res.status(404).json({
-        error: "Abonnement introuvable"
-      });
-    }
-
-    await pool.query(
-      `UPDATE subscriptions
-       SET
-         status = 'active',
-         end_date = COALESCE(end_date, CURRENT_DATE)
-         + ($1::text || ' month')::INTERVAL
-       WHERE id = $2`,
-      [Number(months || 1), subscription_id]
-    );
-
-    res.json({
-      message: "Abonnement renouvelé avec succès"
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur renouvellement abonnement"
-    });
-  }
+app.post("/subscriptions/renew", authenticateToken, (req, res) => {
+  res.status(410).json({
+    error: "Route retirée. La prolongation d'un abonnement passe par un paiement validé ou par le super-admin (motif obligatoire).",
+    code: "ROUTE_RETIREE",
+  });
 });
 
 /* UPLOAD AUDIO CHAT */
@@ -16685,6 +16644,9 @@ app.put("/super-admin/subscriptions/:companyId/renew", authenticateToken, author
        RETURNING *`,
       [Number(months || 1), payment_mode || "manual", req.params.companyId]
     );
+    facturation.invalider(Number(req.params.companyId));
+    await facturation.evenement(null, { companyId: Number(req.params.companyId), type: "prolongation",
+      details: { mois: Number(months || 1), source: "renouvellement_super_admin" }, par: req.user.id }).catch(() => {});
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -16705,6 +16667,9 @@ app.put("/super-admin/subscriptions/:companyId/free", authenticateToken, authori
        RETURNING *`,
       [req.params.companyId]
     );
+    facturation.invalider(Number(req.params.companyId));
+    await facturation.evenement(null, { companyId: Number(req.params.companyId), type: "periode_gratuite",
+      details: { source: "acces_gratuit_super_admin" }, par: req.user.id }).catch(() => {});
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -17985,56 +17950,14 @@ app.put("/super-admin/subscriptions/:companyId/renew", authenticateToken, author
 
 const axios = require("axios");
 
-app.post("/payments/create", authenticateToken, async (req, res) => {
-  try {
-    const {
-      company_id,
-      plan_id,
-      amount,
-      customer_name,
-      customer_email,
-      customer_phone
-    } = req.body;
-
-    const transaction_id = "TRX-" + Date.now();
-
-    const response = await axios.post(
-      "https://api-checkout.cinetpay.com/v2/payment",
-      {
-        apikey: process.env.CINETPAY_API_KEY,
-
-        site_id: process.env.CINETPAY_SITE_ID,
-
-        transaction_id,
-
-        amount,
-
-        currency: "XOF",
-
-        description: "Abonnement Triangle WMS Pro",
-
-        customer_name,
-
-        customer_email,
-
-        customer_phone_number: customer_phone,
-
-        notify_url: "http://localhost:5050/payments/notify",
-
-        return_url: "http://localhost:3000/payment-success",
-
-        channels: "ALL"
-      }
-    );
-
-    res.json(response.data);
-  } catch (error) {
-    console.error("PAYMENT ERROR :", error.response?.data || error);
-
-    res.status(500).json({
-      error: "Erreur paiement"
-    });
-  }
+/* Ancien paiement CinetPay : montant lu dans la requête et URLs de retour
+   en localhost — retiré. Aucun prestataire de paiement en ligne n'est
+   branché : paiement Orange Money / Wave déclaré puis validé. */
+app.post("/payments/create", authenticateToken, (req, res) => {
+  res.status(410).json({
+    error: "Paiement en ligne non disponible : réglez par Orange Money ou Wave puis déclarez la référence depuis la page Abonnement.",
+    code: "ROUTE_RETIREE",
+  });
 });
 
 /* ATTENDANCE QR SCAN */
@@ -19316,6 +19239,31 @@ const biometrieMaliLink = creerRouteurBiometrie({
   }),
 });
 app.use("/", biometrieMaliLink.router);
+
+// Abonnements, paiements et facturation de la plateforme (routes/facturation.js).
+async function envoyerEmailFacture({ to, subject, text, attachments }) {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER) {
+    return { ok: false, code: "EMAIL_NON_CONFIGURE", status: 503,
+      message: "Envoi par email non configuré (SMTP_HOST, SMTP_USER, SMTP_PASS) : téléchargez le PDF et transmettez-le." };
+  }
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, text, attachments });
+    return { ok: true };
+  } catch (error) {
+    console.error("email facture :", error.message);
+    return { ok: false, code: "EMAIL_ECHEC", status: 502, message: "L'envoi de l'email a échoué." };
+  }
+}
+app.use("/", require("./routes/facturation")({
+  pool, facturation, authenticateToken, authorizeRoles, getEffectiveCompanyId, isSuperAdminUser, normalizeRole,
+  logAudit, controlerStepUp: biometrieMaliLink.controlerStepUp, envoyerEmail: envoyerEmailFacture,
+}));
 
 const listenPort = process.env.PORT || 5050;
 httpServer.listen(listenPort, () => {
