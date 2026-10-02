@@ -821,22 +821,60 @@ function creerServiceBiometrie({ pool, hote, env = process.env }) {
     };
   }
 
+  /** Noms lisibles des personnes, fournis par l'hôte (comptes ou fiches employé). */
+  async function nommer(companyId, liste) {
+    const noms = await hote.nomsSujets(companyId, liste.map((x) => ({
+      type: x.subject_type, userId: x.user_id, employeeId: x.employee_id })));
+    return liste.map((x) => ({ ...x,
+      subject_name: noms.get(`${x.subject_type}:${x.subject_type === "employee" ? x.employee_id : x.user_id}`) || "" }));
+  }
+
   async function listerProfils(companyId, { statut: filtre } = {}) {
     const { rows } = await pool.query(
       `SELECT * FROM biometric_profiles WHERE company_id = $1 AND ($2::text IS NULL OR status = $2)
         ORDER BY enrolled_at DESC LIMIT 500`, [companyId, filtre || null]);
-    return rows.map(profilPublic);
+    return nommer(companyId, rows.map(profilPublic));
+  }
+
+  /** Le personnel de la société, avec son état biométrique (sans aucun gabarit). */
+  async function personnes(companyId) {
+    const personnel = await hote.listerPersonnel(companyId);
+    const [profils, consentements] = await Promise.all([
+      pool.query(`SELECT subject_type, user_id, employee_id, biometric_type, count(*)::int AS n
+                    FROM biometric_profiles WHERE company_id = $1 AND status = 'actif'
+                   GROUP BY 1, 2, 3, 4`, [companyId]),
+      pool.query(`SELECT DISTINCT ON (subject_type, user_id, employee_id) subject_type, user_id, employee_id,
+                         id, modalities, purposes, method
+                    FROM biometric_consents WHERE company_id = $1 AND withdrawn_at IS NULL
+                   ORDER BY subject_type, user_id, employee_id, id DESC`, [companyId]),
+    ]);
+    const cle = (t, u, e) => `${t}:${t === "employee" ? e : u}`;
+    const parProfil = new Map();
+    for (const r of profils.rows) {
+      const k = cle(r.subject_type, r.user_id, r.employee_id);
+      const v = parProfil.get(k) || { face: 0, fingerprint: 0 };
+      v[r.biometric_type] = r.n;
+      parProfil.set(k, v);
+    }
+    const parConsent = new Map(consentements.rows.map((r) => [cle(r.subject_type, r.user_id, r.employee_id), r]));
+    return personnel.map((p) => {
+      const k = cle(p.type, p.userId, p.employeeId);
+      const c = parConsent.get(k);
+      return { subject_type: p.type, user_id: p.userId || null, employee_id: p.employeeId || null, nom: p.nom,
+        role: p.role || "", profils: parProfil.get(k) || { face: 0, fingerprint: 0 },
+        consentement: c ? { id: c.id, modalities: c.modalities, purposes: c.purposes, method: c.method } : null };
+    });
   }
 
   async function evenements(companyId, { limite = 100, action, resultat } = {}) {
-    const { rows } = await pool.query(
+    const { rows: brutes } = await pool.query(
       `SELECT id, subject_type, user_id, employee_id, profile_id, biometric_type, action, purpose, result,
               reason_code, confidence, threshold, provider, device_id, performed_by, created_at
          FROM biometric_events WHERE company_id = $1
           AND ($2::text IS NULL OR action = $2) AND ($3::text IS NULL OR result = $3)
         ORDER BY id DESC LIMIT $4`,
       [companyId, action || null, resultat || null, Math.min(Math.max(Number(limite) || 100, 1), 500)]);
-    return rows;
+    return nommer(companyId, brutes);
   }
 
   // ═════════════════════════════════════════════ ÉVÉNEMENTS D'APPAREILS
@@ -966,6 +1004,7 @@ function creerServiceBiometrie({ pool, hote, env = process.env }) {
     profilDe,
     statut,
     listerProfils,
+    personnes,
     evenements,
     traiterEvenementsAppareil,
     purger,

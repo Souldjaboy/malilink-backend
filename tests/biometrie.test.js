@@ -434,6 +434,12 @@ async function main() {
       && !brut.includes("bv1.") && !brut.includes("template"));
     verifier("refus journalisés avec leur motif", ["DEFI_REJOUE", "VIVANT_REFUSE", "CONSENTEMENT_ABSENT", "NON_CORRESPONDANT"]
       .every((c) => j.data.evenements.some((e) => e.reason_code === c)));
+    verifier("le journal porte le nom des personnes", j.data.evenements.some((e) => e.subject_name === "Awa Diarra"));
+    const pp = await appel("GET", "/biometrics/people", a.token);
+    const awaP = pp.data?.personnes?.find((x) => x.user_id === awa.id);
+    verifier("liste du personnel : état par personne, sans compte client", pp.status === 200 && awaP?.profils?.fingerprint === 2
+      && !pp.data.personnes.some((x) => x.user_id === client.id), JSON.stringify(awaP));
+    verifier("liste du personnel refusée au magasinier", (await appel("GET", "/biometrics/people", awa.token)).status === 403);
     const id = await appel("POST", "/biometrics/identify", a.token, { biometric_type: "face", capture: visage("awa"), ...appareil });
     verifier("identification 1:N désactivée par défaut : 403", id.status === 403 && id.data?.code === "IDENTIFICATION_INTERDITE");
     const purge = await appel("POST", "/biometrics/purge", a.token, {});

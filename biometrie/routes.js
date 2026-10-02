@@ -15,7 +15,7 @@
  *   GET  /biometrics/config                 état, fournisseurs, texte de consentement
  *   GET  /biometrics/settings               PUT /biometrics/settings
  *   GET  /biometrics/status                 (soi, ou biometrie.voir)
- *   GET  /biometrics/profiles               GET /biometrics/events
+ *   GET  /biometrics/profiles               GET /biometrics/events   GET /biometrics/people
  *   POST /biometrics/consents               POST /biometrics/consents/:id/withdraw
  *   POST /biometrics/challenges
  *   POST /biometrics/enroll-face            POST /biometrics/verify-face
@@ -162,6 +162,16 @@ function creerRouteurBiometrie({ hote, service, passkeys, limiteur, env = proces
       res.json({ profils: await service.listerProfils(c.companyId, { statut: req.query.status || null }) });
     } catch (e) {
       repondreErreur(res, e, "profiles");
+    }
+  });
+
+  router.get("/biometrics/people", auth, async (req, res) => {
+    try {
+      const c = ctx(req);
+      await exiger(req, "biometrie.voir");
+      res.json({ personnes: await service.personnes(c.companyId) });
+    } catch (e) {
+      repondreErreur(res, e, "people");
     }
   });
 

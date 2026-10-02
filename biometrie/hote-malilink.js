@@ -94,6 +94,22 @@ module.exports = function creerHoteMaliLink(d) {
 
     verifierPersonnel,
 
+    async listerPersonnel(companyId) {
+      const { rows } = await pool.query(
+        `SELECT id, fullname, role FROM users
+          WHERE company_id = $1 AND COALESCE(is_active, TRUE) = TRUE
+            AND lower(COALESCE(role, '')) NOT IN ('customer', 'client', 'patient')
+          ORDER BY fullname LIMIT 1000`, [companyId]);
+      return rows.map((u) => ({ type: "user", userId: u.id, employeeId: null, nom: u.fullname, role: u.role }));
+    },
+
+    async nomsSujets(companyId, sujets) {
+      const ids = [...new Set(sujets.filter((s) => s.type === "user" && s.userId).map((s) => Number(s.userId)))];
+      if (!ids.length) return new Map();
+      const { rows } = await pool.query(`SELECT id, fullname FROM users WHERE company_id = $1 AND id = ANY($2)`, [companyId, ids]);
+      return new Map(rows.map((u) => [`user:${u.id}`, u.fullname]));
+    },
+
     async enregistrerPointage(o) {
       try {
         return await pointageEngine.enregistrerPointage(pool, {
