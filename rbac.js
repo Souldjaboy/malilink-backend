@@ -49,6 +49,8 @@ const SUBMODULES = {
   ia: ["assistant", "social", "chat", "notifications", "recherche", "reunions"],
   // Modules génériques optionnels
   cameras: ["sites", "enregistreurs", "identifiants", "visualisation"],
+  // biometrie.voir = « Voir » sur biometrie ; les autres droits sur leur sous-module.
+  biometrie: ["enrolement", "verification", "revocation", "audit", "appareils", "parametres", "pointage"],
   // Le profil public MaliLink relève de « Paramètres » (toutes offres), pas du marketing.
   marketing: ["comptes", "publications", "campagnes"],
   pharmacie: ["medicaments", "lots", "stock", "ordonnances", "patients", "prescripteurs", "ventes", "achats", "fournisseurs", "peremptions", "inventaires", "transferts", "retours", "rapports", "parametres", "sites"],
@@ -64,7 +66,7 @@ const MODULE_LABELS = {
   immobilier: "Immobilier / Hôtel", automobile: "Automobile", education: "Éducation",
   laboratoire: "Laboratoire", finance: "Finance / Gestion", administration: "Administration",
   ia: "IA / Communication", logistique: "Logistique / Entrepôt", rh: "Ressources humaines",
-  cameras: "Caméras & Sécurité", marketing: "Marketing & Réseaux sociaux",
+  cameras: "Caméras & Sécurité", marketing: "Marketing & Réseaux sociaux", biometrie: "Biométrie",
   pharmacie: "Pharmacie", reseau: "Réseau & Infrastructure",
 };
 
@@ -139,7 +141,7 @@ const ROLE_SCOPES = {
    périmètre, le défaut est AUCUN accès — pas même « Voir ». Un magasinier ne
    voit pas les caméras, un caissier ne gère pas les réseaux sociaux, sauf
    droit accordé explicitement dans « Droits & permissions ». */
-const SENSITIVE_MODULES = new Set(["cameras", "marketing", "pharmacie", "reseau"]);
+const SENSITIVE_MODULES = new Set(["cameras", "marketing", "pharmacie", "reseau", "biometrie"]);
 
 const WRITE_ACTIONS = new Set(["view", "create", "update", "export", "print"]);
 

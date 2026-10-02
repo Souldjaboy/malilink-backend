@@ -98,6 +98,8 @@ const MODULE_CATALOG = [
   // Options (jamais actives par défaut hors profil ; soumises au plan)
   { key: "cameras", label: "Caméras & Sécurité", group: "options", vertical: true, permission: ["cameras"] },
   { key: "marketing", label: "Marketing & Réseaux sociaux", group: "options", vertical: true, permission: ["marketing"] },
+  // Données sensibles : fermé par défaut (migration 082), ouvert par décision explicite.
+  { key: "biometrie", label: "Biométrie", group: "options", vertical: true, permission: ["biometrie"] },
   { key: "reseau", label: "Réseau & Infrastructure", group: "options", vertical: true, permission: ["reseau"] },
 ];
 
@@ -486,6 +488,9 @@ const API_ROUTE_RULES = [
   { prefix: "/users", module: "utilisateurs", readAlso: ["chat", "pointage", "parametres_pointage", "pos", "reunions"] },
   { prefix: "/marketplace/vendor", module: "marketplace", readAlso: ["commandes_recues"] },
   { prefix: "/cameras", module: "cameras" },
+  /* Biométrie : le module de la société décide ; chaque route vérifie le
+     droit précis (biometrie.voir, .enroler…) ou « soi-même ». */
+  { prefix: "/biometrics", module: "biometrie", companyOnly: true },
   { prefix: "/marketing", module: "marketing" },
   { prefix: "/pharmacy", module: "pharmacie" },
   { prefix: "/network", module: "reseau" },
@@ -557,6 +562,7 @@ const PAGE_ROUTE_RULES = [
   ["/automobile", "automobile"], ["/laboratoire", "laboratoire"], ["/travel/partenaire", "voyage"],
   ["/livreur", "livraison"], ["/client/livraison", "livraison"],
   ["/cameras", "cameras"], ["/marketing", "marketing"],
+  ["/parametres/securite/biometrie", "biometrie"],
   ["/parametres/profil-public", "parametres"],
 ];
 
