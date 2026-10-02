@@ -68,7 +68,23 @@ function creerRouteurBiometrie({ hote, service, passkeys, limiteur, env = proces
 
   /** Le sujet visé ; par défaut, soi-même. */
   const sujetDe = (req, source) => hote.sujetDeLaRequete(req, source || {});
-  const estSoi = (req, sujet) => sujet.type === "user" && Number(sujet.userId) === Number(req.user.id);
+  /* « Soi » : le compte connecté EST la personne visée. Pour un sujet
+     « employé » (fiche sans compte propre, Triangle), l'hôte indique le compte
+     rattaché dans `compteId`, lu dans SA base — jamais dans la requête. */
+  const estSoi = (req, sujet) => {
+    if (!sujet) return false;
+    const compte = sujet.type === "user" ? sujet.userId : sujet.compteId;
+    return Number(compte || 0) > 0 && Number(compte) === Number(req.user.id);
+  };
+
+  /** Même question pour une ligne déjà enregistrée (consentement, profil). */
+  async function ligneEstSoi(req, companyId, ligne) {
+    if (ligne.subject_type === "user") return Number(ligne.user_id) === Number(req.user.id);
+    if (typeof hote.compteDuSujet !== "function") return false;
+    const compte = await hote.compteDuSujet(companyId,
+      { type: ligne.subject_type, userId: ligne.user_id, employeeId: ligne.employee_id });
+    return Number(compte || 0) > 0 && Number(compte) === Number(req.user.id);
+  }
 
   /** Validation renforcée : exigée si la société l'impose ou si l'utilisateur a une passkey. */
   async function controlerStepUp(req, scope) {
@@ -222,7 +238,7 @@ function creerRouteurBiometrie({ hote, service, passkeys, limiteur, env = proces
         `SELECT subject_type, user_id, employee_id FROM biometric_consents WHERE id = $1 AND company_id = $2`,
         [Number(req.params.id), c.companyId]);
       if (!rows[0]) throw new BiometrieError("Consentement introuvable.", "CONSENTEMENT_INTROUVABLE", 404);
-      const soi = rows[0].subject_type === "user" && Number(rows[0].user_id) === Number(req.user.id);
+      const soi = await ligneEstSoi(req, c.companyId, rows[0]);
       if (!soi) await exiger(req, "biometrie.revoquer");
       res.json(await service.retirerConsentement({ ...c, consentId: Number(req.params.id), motif: req.body?.reason }));
     } catch (e) {
@@ -335,7 +351,7 @@ function creerRouteurBiometrie({ hote, service, passkeys, limiteur, env = proces
       const c = ctx(req);
       const profil = await service.profilDe(c.companyId, req.body?.profile_id);
       if (!profil) throw new BiometrieError("Profil introuvable.", "PROFIL_INTROUVABLE", 404);
-      const soi = profil.subject_type === "user" && Number(profil.user_id) === Number(req.user.id);
+      const soi = await ligneEstSoi(req, c.companyId, profil);
       if (!soi) {
         await exiger(req, "biometrie.revoquer");
         await controlerStepUp(req, "biometrie.revoquer");
