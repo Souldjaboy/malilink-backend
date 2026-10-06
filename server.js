@@ -19124,6 +19124,9 @@ app.use(
 );
 
 const createEducationRouter = require("./routes/education");
+/* Photos d'élèves, logo, sceau, signature et cachet d'établissement : lus
+   par URL signée et limitée dans le temps, jamais par le dossier public. */
+app.get("/education-fichiers/:type/:dossier/:fichier", require("./routes/education-parcours").serveFichier);
 app.use(
   "/education",
   requireCompanyModule("education"),

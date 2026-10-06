@@ -40,22 +40,107 @@ const MONEY_ROLES = ["super_admin", "school_admin", "director", "accountant", "s
 module.exports = function createEducationRouter({ pool, authenticateToken, authorizeRoles }) {
   const router = express.Router();
   router.use(authenticateToken);
+  // Parcours d'inscription (routes/education-parcours.js), branché en fin de fichier.
+  let parcours = null;
+
+  /* Rôle effectif dans le module. Les comptes d'administration d'une société
+     (« admin », « direction »…, créés à l'inscription MaliLink) valent
+     direction d'établissement : sans cette équivalence, l'administrateur
+     d'une école se voyait refuser son propre module (« rôle insuffisant »). */
+  const ADMIN_ENTREPRISE = new Set([
+    "admin", "administrateur", "administrateur_entreprise", "direction", "directeur", "gerant", "manager",
+  ]);
+  router.use((req, res, next) => {
+    const brut = String(req.user?.role || "").trim().toLowerCase();
+    req.eduRole = req.user?.is_super_admin === true || brut === "super_admin"
+      ? "super_admin"
+      : ADMIN_ENTREPRISE.has(brut) ? "school_admin" : brut;
+    next();
+  });
 
   // Établissement effectif de l'utilisateur (super_admin peut cibler via ?company_id)
   function schoolId(req) {
-    if (req.user.role === "super_admin" && req.query.company_id) {
+    if (req.eduRole === "super_admin" && req.query.company_id) {
       return Number(req.query.company_id);
     }
     return Number(req.user.company_id);
   }
 
+  /* Cloisonnement des écritures. Tout identifiant reçu dans le corps d'une
+     création ou d'une modification (classe, année, matière, période,
+     professeur, élève, frais, échéance, utilisateur…) doit appartenir à
+     l'établissement, y compris dans les listes (appel, notes). Un seul
+     identifiant étranger rejette toute la requête : on ne relie jamais une
+     donnée de l'école A à un enregistrement de l'école B. */
+  const REFERENCES_CORPS = {
+    school_year_id: "edu_school_years", active_school_year_id: "edu_school_years",
+    class_id: "edu_classes", subject_id: "edu_subjects", term_id: "edu_terms",
+    teacher_id: "edu_teachers", assignment_id: "edu_teacher_assignments",
+    student_id: "edu_students", eleve_id: "edu_students",
+    fee_id: "edu_fees", installment_id: "edu_feeplan_installments",
+    plan_id: "edu_feeplans", fee_plan_id: "edu_feeplans",
+    course_id: "edu_courses", exam_id: "edu_exams", enrollment_id: "edu_enrollments",
+    user_id: "users", parent_user_id: "users", main_teacher_user_id: "users",
+    teacher_user_id: "users", recipient_user_id: "users", paid_by_user_id: "users",
+  };
+  function collecterReferences(valeur, acc, profondeur = 0) {
+    if (profondeur > 4 || valeur == null || typeof valeur !== "object") return acc;
+    if (Array.isArray(valeur)) {
+      for (const v of valeur.slice(0, 500)) collecterReferences(v, acc, profondeur + 1);
+      return acc;
+    }
+    for (const [cle, v] of Object.entries(valeur)) {
+      const table = REFERENCES_CORPS[cle];
+      if (table && v !== null && v !== undefined && v !== "") {
+        const id = Number(v);
+        if (!Number.isInteger(id) || id <= 0) { acc.invalide = cle; continue; }
+        (acc.tables[table] ||= new Set()).add(id);
+      } else if (v && typeof v === "object") {
+        collecterReferences(v, acc, profondeur + 1);
+      }
+    }
+    return acc;
+  }
+  router.use(async (req, res, next) => {
+    if (!["POST", "PUT", "PATCH"].includes(req.method) || !req.body || typeof req.body !== "object") return next();
+    const refs = collecterReferences(req.body, { tables: {}, invalide: null });
+    if (refs.invalide) return res.status(400).json({ error: `Identifiant invalide (${refs.invalide}).`, code: "REFERENCE_INVALIDE" });
+    try {
+      const cid = schoolId(req);
+      for (const [table, ids] of Object.entries(refs.tables)) {
+        const liste = [...ids];
+        const { rows } = await pool.query(
+          `SELECT COUNT(*)::int AS n FROM ${table} WHERE id = ANY($1::int[]) AND company_id = $2`, [liste, cid]
+        );
+        if (rows[0].n !== liste.length) {
+          return res.status(404).json({
+            error: "Une référence n'appartient pas à votre établissement.", code: "REFERENCE_HORS_ETABLISSEMENT",
+          });
+        }
+      }
+      next();
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur de vérification des références" }); }
+  });
+
   function requireRoles(roles) {
     return (req, res, next) => {
-      if (!roles.includes(req.user.role)) {
+      if (!roles.includes(req.eduRole)) {
         return res.status(403).json({ error: "Accès refusé (rôle insuffisant)" });
       }
       next();
     };
+  }
+
+  // Vrai si chaque élève de la liste est dans la classe (et l'établissement).
+  async function elevesDeLaClasse(companyId, classId, studentIds) {
+    const ids = [...new Set(studentIds.map(Number))];
+    if (ids.some((id) => !Number.isInteger(id) || id <= 0)) return false;
+    if (ids.length === 0) return true;
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM edu_students WHERE company_id=$1 AND class_id=$2 AND id = ANY($3::int[])`,
+      [companyId, Number(classId), ids]
+    );
+    return rows[0].n === ids.length;
   }
 
   async function teacherClassIds(req) {
@@ -86,7 +171,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     const student = rows[0];
     if (!student) return null;
 
-    const role = req.user.role;
+    const role = req.eduRole;
     if (STAFF_ROLES.includes(role) || MONEY_ROLES.includes(role)) return student;
     if (role === "teacher") {
       const classes = await teacherClassIds(req);
@@ -191,7 +276,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
 
   router.get("/classes", async (req, res) => {
     try {
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const ids = await teacherClassIds(req);
         if (ids.length === 0) return res.json([]);
         const { rows } = await pool.query(
@@ -214,13 +299,21 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const { name, level, school_year_id, main_teacher_user_id } = req.body || {};
       if (!name) return res.status(400).json({ error: "Nom requis" });
+      if (school_year_id) await parcours.verifierReferences(pool, schoolId(req), { yearId: Number(school_year_id) });
+      if (main_teacher_user_id) {
+        const prof = await pool.query(`SELECT 1 FROM users WHERE id=$1 AND company_id=$2`, [Number(main_teacher_user_id), schoolId(req)]);
+        if (!prof.rows[0]) return res.status(404).json({ error: "Professeur introuvable dans votre établissement." });
+      }
       const { rows } = await pool.query(
         `INSERT INTO edu_classes (company_id, name, level, school_year_id, main_teacher_user_id)
          VALUES ($1,$2,$3,$4,$5) RETURNING *`,
         [schoolId(req), name, level || null, school_year_id || null, main_teacher_user_id || null]
       );
       res.status(201).json(rows[0]);
-    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur classe" }); }
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error(e); res.status(500).json({ error: "Erreur classe" });
+    }
   });
 
   router.get("/subjects", async (req, res) => {
@@ -641,10 +734,17 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const amount = Number(b.amount || 0);
       if (!(amount > 0)) return res.status(400).json({ error: "Montant invalide." });
       const enr = await pool.query(
-        `SELECT id, enrollment_fee, amount_paid FROM edu_enrollments WHERE id=$1 AND company_id=$2`,
+        `SELECT id, enrollment_fee, amount_paid, fee_plan_id FROM edu_enrollments WHERE id=$1 AND company_id=$2`,
         [req.params.id, schoolId(req)]
       );
       if (!enr.rows[0]) return res.status(404).json({ error: "Inscription introuvable" });
+      if (enr.rows[0].fee_plan_id) {
+        // Inscription récente : un seul échéancier porte tous les paiements.
+        return res.status(409).json({
+          error: "Ce dossier se règle par son échéancier unique (Frais & paiements).",
+          code: "ECHEANCIER_UNIQUE", fee_plan_id: enr.rows[0].fee_plan_id,
+        });
+      }
       const receipt = await nextReceiptRef(schoolId(req));
       const signature = edupdf.signRef(["RECU", receipt]);
       const { rows } = await pool.query(
@@ -654,6 +754,11 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         [schoolId(req), req.params.id, receipt, amount, b.method || "", b.reference || "", signature, b.notes || "", req.user.id]
       );
       const enrollment = await recomputeEnrollment(schoolId(req), req.params.id);
+      const ecriture = await parcours?.ecrireCompta(pool, {
+        companyId: schoolId(req), montant: amount, sens: "entrée", libelle: `Reçu ${receipt} — inscription`,
+        sourceId: rows[0].id, methode: b.method, userId: req.user.id,
+      });
+      if (ecriture) await pool.query(`UPDATE edu_enrollment_payments SET accounting_transaction_id=$1 WHERE id=$2`, [ecriture, rows[0].id]);
       res.status(201).json({ payment: rows[0], enrollment });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur enregistrement du paiement" }); }
   });
@@ -663,10 +768,15 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const { rows } = await pool.query(
         `UPDATE edu_enrollment_payments SET status='cancelled'
-          WHERE id=$1 AND company_id=$2 AND status='paid' RETURNING enrollment_id`,
+          WHERE id=$1 AND company_id=$2 AND status='paid' RETURNING id, enrollment_id, amount, method, receipt_number`,
         [req.params.id, schoolId(req)]
       );
       if (!rows[0]) return res.status(404).json({ error: "Paiement introuvable ou déjà annulé." });
+      await parcours?.ecrireCompta(pool, {
+        companyId: schoolId(req), montant: Number(rows[0].amount), sens: "sortie",
+        libelle: `Annulation du reçu ${rows[0].receipt_number || rows[0].id}`, sourceId: rows[0].id,
+        methode: rows[0].method, userId: req.user.id,
+      });
       const enrollment = await recomputeEnrollment(schoolId(req), rows[0].enrollment_id);
       res.json({ ok: true, enrollment });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur annulation du paiement" }); }
@@ -888,6 +998,13 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         [req.params.id, schoolId(req)]
       )).rows[0];
       if (!plan) return res.status(404).json({ error: "Plan introuvable" });
+      if (b.installment_id) {
+        const ech = await pool.query(
+          `SELECT 1 FROM edu_feeplan_installments WHERE id=$1 AND plan_id=$2 AND company_id=$3`,
+          [b.installment_id, plan.id, schoolId(req)]
+        );
+        if (!ech.rows[0]) return res.status(422).json({ error: "Cette échéance n'appartient pas à ce plan.", code: "ECHEANCE_HORS_PLAN" });
+      }
       const receipt = await nextReceiptRef(schoolId(req));
       const signature = edupdf.signRef(["RECU", receipt]);
       const pay = (await pool.query(
@@ -898,6 +1015,12 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
          b.method || "", b.reference || "", signature, b.notes || "", req.user.id]
       )).rows[0];
       const planState = await recomputeFeePlan(schoolId(req), req.params.id);
+      const ecriture = await parcours?.ecrireCompta(pool, {
+        companyId: schoolId(req), montant: amount, sens: "entrée", libelle: `Reçu ${receipt} — scolarité`,
+        sourceId: pay.id, methode: b.method, userId: req.user.id,
+      });
+      if (ecriture) await pool.query(`UPDATE edu_feeplan_payments SET accounting_transaction_id=$1 WHERE id=$2`, [ecriture, pay.id]);
+      await parcours?.synchroniserInscription(pool, schoolId(req), req.params.id);
       res.status(201).json({ payment: pay, plan: planState });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur enregistrement du paiement" }); }
   });
@@ -906,11 +1029,18 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const { rows } = await pool.query(
         `UPDATE edu_feeplan_payments SET status='cancelled'
-          WHERE id=$1 AND company_id=$2 AND status='paid' RETURNING plan_id`,
+          WHERE id=$1 AND company_id=$2 AND status='paid' RETURNING id, plan_id, amount, method, receipt_number`,
         [req.params.id, schoolId(req)]
       );
       if (!rows[0]) return res.status(404).json({ error: "Paiement introuvable ou déjà annulé." });
       const plan = await recomputeFeePlan(schoolId(req), rows[0].plan_id);
+      // Un encaissement annulé laisse une trace comptable inverse, jamais un effacement.
+      await parcours?.ecrireCompta(pool, {
+        companyId: schoolId(req), montant: Number(rows[0].amount), sens: "sortie",
+        libelle: `Annulation du reçu ${rows[0].receipt_number || rows[0].id}`, sourceId: rows[0].id,
+        methode: rows[0].method, userId: req.user.id,
+      });
+      await parcours?.synchroniserInscription(pool, schoolId(req), rows[0].plan_id);
       res.json({ ok: true, plan });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur annulation" }); }
   });
@@ -1161,7 +1291,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   router.get("/students", async (req, res) => {
     try {
       const classFilter = req.query.class_id ? Number(req.query.class_id) : null;
-      if (req.user.role === "parent") {
+      if (req.eduRole === "parent") {
         const ids = await parentStudentIds(req);
         if (ids.length === 0) return res.json([]);
         const { rows } = await pool.query(
@@ -1172,7 +1302,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         );
         return res.json(rows);
       }
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (classes.length === 0) return res.json([]);
         const { rows } = await pool.query(
@@ -1184,17 +1314,21 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         );
         return res.json(rows);
       }
-      if (!STAFF_ROLES.includes(req.user.role) && !MONEY_ROLES.includes(req.user.role)) {
+      if (!STAFF_ROLES.includes(req.eduRole) && !MONEY_ROLES.includes(req.eduRole)) {
         return res.status(403).json({ error: "Accès refusé" });
       }
+      const archives = req.query.archives === "1";
+      const recherche = String(req.query.q || "").trim().slice(0, 60);
       const { rows } = await pool.query(
-        `SELECT s.*, c.name AS class_name FROM edu_students s
+        `SELECT s.*, c.name AS class_name, c.level AS class_level FROM edu_students s
          LEFT JOIN edu_classes c ON c.id=s.class_id
          WHERE s.company_id=$1 AND ($2::int IS NULL OR s.class_id=$2)
-         ORDER BY s.last_name LIMIT 500`,
-        [schoolId(req), classFilter]
+           AND (CASE WHEN $3::boolean THEN s.archived_at IS NOT NULL ELSE s.archived_at IS NULL END)
+           AND ($4::text = '' OR s.last_name ILIKE '%'||$4||'%' OR s.first_name ILIKE '%'||$4||'%' OR s.matricule ILIKE '%'||$4||'%')
+         ORDER BY s.last_name, s.first_name LIMIT 1000`,
+        [schoolId(req), classFilter, archives, recherche]
       );
-      res.json(rows);
+      res.json(rows.map(({ photo_key, ...r }) => ({ ...r, photo_url: parcours.urlFichier("eleve", photo_key) })));
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur élèves" }); }
   });
 
@@ -1204,12 +1338,15 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const { first_name, last_name, gender, birth_date, class_id, parent_user_id } = req.body || {};
       if (!first_name || !last_name) return res.status(400).json({ error: "Nom et prénom requis" });
 
-      const year = new Date().getFullYear();
-      const seq = await pool.query(
-        "SELECT COUNT(*)::int + 1 AS n FROM edu_students WHERE company_id=$1",
-        [schoolId(req)]
-      );
-      const matricule = `ML${year}-${String(schoolId(req)).padStart(3, "0")}-${String(seq.rows[0].n).padStart(4, "0")}`;
+      // L'écran d'inscription est le seul parcours de l'interface ; cette route
+      // reste pour l'import et les intégrations, avec les mêmes garde-fous.
+      if (class_id) await parcours.verifierReferences(pool, schoolId(req), { classId: Number(class_id) });
+      if (parent_user_id) {
+        const parent = await pool.query(`SELECT 1 FROM users WHERE id=$1 AND company_id=$2`, [Number(parent_user_id), schoolId(req)]);
+        if (!parent.rows[0]) return res.status(404).json({ error: "Parent introuvable dans votre établissement." });
+      }
+      const etab = await parcours.etablissement(pool, schoolId(req));
+      const matricule = await parcours.genererMatricule(pool, schoolId(req), etab.matricule_prefix);
       const qrCode = `EDU-${crypto.randomBytes(12).toString("hex")}`;
 
       const { rows } = await pool.query(
@@ -1227,7 +1364,10 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         );
       }
       res.status(201).json(student);
-    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur création élève" }); }
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error(e); res.status(500).json({ error: "Erreur création élève" });
+    }
   });
 
   // Badge QR (data URL PNG) — imprimable
@@ -1319,14 +1459,19 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       if (!class_id || !Array.isArray(entries)) {
         return res.status(400).json({ error: "class_id et entries requis" });
       }
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(Number(class_id))) {
           return res.status(403).json({ error: "Classe non affectée à ce professeur" });
         }
       }
+      // Toute la liste doit appartenir à la classe appelée (même établissement).
+      const lot = entries.slice(0, 200);
+      if (!(await elevesDeLaClasse(schoolId(req), class_id, lot.map((e) => e.student_id)))) {
+        return res.status(422).json({ error: "Un élève de la liste n'appartient pas à cette classe.", code: "ELEVE_HORS_CLASSE" });
+      }
       let count = 0;
-      for (const entry of entries.slice(0, 200)) {
+      for (const entry of lot) {
         const st = ["present", "retard", "absent", "absence_justifiee"].includes(entry.status)
           ? entry.status : "present";
         await pool.query(
@@ -1357,8 +1502,8 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         return res.json(rows);
       }
 
-      if (!GRADE_ROLES.includes(req.user.role)) return res.status(403).json({ error: "Accès refusé" });
-      if (req.user.role === "teacher" && classId) {
+      if (!GRADE_ROLES.includes(req.eduRole)) return res.status(403).json({ error: "Accès refusé" });
+      if (req.eduRole === "teacher" && classId) {
         const classes = await teacherClassIds(req);
         if (!classes.includes(classId)) return res.status(403).json({ error: "Classe non affectée" });
       }
@@ -1384,7 +1529,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       if (!class_id || !subject_id || !title) {
         return res.status(400).json({ error: "Classe, matière et titre requis" });
       }
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(Number(class_id))) return res.status(403).json({ error: "Classe non affectée" });
       }
@@ -1424,12 +1569,15 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       );
       const exam = exams[0];
       if (!exam) return res.status(404).json({ error: "Évaluation introuvable" });
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(exam.class_id)) return res.status(403).json({ error: "Classe non affectée" });
       }
 
       const grades = Array.isArray(req.body?.grades) ? req.body.grades.slice(0, 200) : [];
+      if (!(await elevesDeLaClasse(schoolId(req), exam.class_id, grades.map((g) => g.student_id)))) {
+        return res.status(422).json({ error: "Un élève de la liste n'appartient pas à la classe de l'évaluation.", code: "ELEVE_HORS_CLASSE" });
+      }
       let count = 0;
       for (const g of grades) {
         const score = Number(g.score);
@@ -1710,38 +1858,64 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       }
       const student = await assertStudentAccess(req, student_id);
       if (!student) return res.status(404).json({ error: "Élève introuvable" });
+      const fee = await pool.query(`SELECT id FROM edu_fees WHERE id=$1 AND company_id=$2`, [Number(fee_id), schoolId(req)]);
+      if (!fee.rows[0]) return res.status(404).json({ error: "Frais introuvable" });
+      if (!(Number(amount) > 0)) return res.status(400).json({ error: "Montant invalide." });
+      /* Ancien circuit « frais » : il écrivait par erreur dans
+         edu_feeplan_payments (colonnes inexistantes → erreur 500). */
       const { rows } = await pool.query(
-        `INSERT INTO edu_feeplan_payments (company_id, fee_id, student_id, amount, payment_method, reference, paid_by_user_id, recorded_by_user_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-        [schoolId(req), fee_id, student_id, amount, payment_method || "especes",
-         reference || null, paid_by_user_id || null, req.user.id]
+        `INSERT INTO edu_fee_payments (company_id, fee_id, student_id, amount, payment_method, reference, paid_by_user_id, recorded_by_user_id)
+         VALUES ($1,$2,$3,$4,$5,$6,NULL,$7) RETURNING *`,
+        [schoolId(req), fee.rows[0].id, student.id, Number(amount), payment_method || "especes",
+         reference || null, req.user.id]
       );
       res.status(201).json(rows[0]);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur paiement" }); }
   });
 
-  // Situation financière d'un élève (parent, direction, comptable)
+  // Situation financière d'un élève (parent, direction, comptable) :
+  // anciens frais, échéanciers (inscription + mensualités) et tous les reçus.
   router.get("/students/:id/finances", async (req, res) => {
     try {
       const student = await assertStudentAccess(req, req.params.id);
       if (!student) return res.status(403).json({ error: "Accès refusé" });
-      const fees = await pool.query(
-        `SELECT f.*, COALESCE(p.paid, 0) AS paid,
-                (f.amount - COALESCE(p.paid, 0)) AS remaining
-         FROM edu_fees f
-         LEFT JOIN LATERAL (
-           SELECT SUM(amount) AS paid FROM edu_feeplan_payments
-           WHERE fee_id=f.id AND student_id=$1
-         ) p ON true
-         WHERE f.company_id=$2 AND (f.class_id IS NULL OR f.class_id=$3)
-         ORDER BY f.due_date NULLS LAST`,
-        [student.id, schoolId(req), student.class_id]
-      );
-      const payments = await pool.query(
-        `SELECT * FROM edu_feeplan_payments WHERE student_id=$1 ORDER BY paid_at DESC LIMIT 100`,
-        [student.id]
-      );
-      res.json({ fees: fees.rows, payments: payments.rows });
+      const cid = schoolId(req);
+      const [fees, payments, plans] = await Promise.all([
+        pool.query(
+          `SELECT f.*, COALESCE(p.paid, 0) AS paid, (f.amount - COALESCE(p.paid, 0)) AS remaining
+             FROM edu_fees f
+             LEFT JOIN LATERAL (
+               SELECT SUM(amount) AS paid FROM edu_fee_payments
+                WHERE fee_id=f.id AND student_id=$1 AND company_id=$2
+             ) p ON true
+            WHERE f.company_id=$2 AND (f.class_id IS NULL OR f.class_id=$3)
+            ORDER BY f.due_date NULLS LAST`,
+          [student.id, cid, student.class_id]
+        ),
+        pool.query(
+          `SELECT * FROM (
+             SELECT 'frais' AS source, id, amount, payment_method AS method, reference, NULL::text AS receipt_number,
+                    'paid' AS status, COALESCE(paid_at, created_at) AS created_at
+               FROM edu_fee_payments WHERE student_id=$1 AND company_id=$2
+             UNION ALL
+             SELECT 'echeancier', fp.id, fp.amount, fp.method, fp.reference, fp.receipt_number, fp.status, fp.created_at
+               FROM edu_feeplan_payments fp JOIN edu_feeplans p ON p.id=fp.plan_id
+              WHERE p.student_id=$1 AND fp.company_id=$2
+             UNION ALL
+             SELECT 'inscription', ep.id, ep.amount, ep.method, ep.reference, ep.receipt_number, ep.status, ep.created_at
+               FROM edu_enrollment_payments ep JOIN edu_enrollments e ON e.id=ep.enrollment_id
+              WHERE e.student_id=$1 AND ep.company_id=$2
+           ) x ORDER BY created_at DESC LIMIT 200`,
+          [student.id, cid]
+        ),
+        pool.query(
+          `SELECT p.id, p.label, p.total_amount, p.status,
+                  COALESCE((SELECT SUM(amount) FROM edu_feeplan_payments fp WHERE fp.plan_id=p.id AND fp.status='paid'),0) AS total_paid
+             FROM edu_feeplans p WHERE p.company_id=$1 AND p.student_id=$2 ORDER BY p.created_at DESC`,
+          [cid, student.id]
+        ),
+      ]);
+      res.json({ fees: fees.rows, payments: payments.rows, plans: plans.rows });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur finances" }); }
   });
 
@@ -1749,8 +1923,8 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
 
   // Classes visibles selon le rôle (null = toutes celles de l'établissement).
   async function visibleClassIds(req) {
-    if (req.user.role === "teacher") return await teacherClassIds(req);
-    if (req.user.role === "parent") {
+    if (req.eduRole === "teacher") return await teacherClassIds(req);
+    if (req.eduRole === "parent") {
       const kids = await parentStudentIds(req);
       if (kids.length === 0) return [];
       const { rows } = await pool.query(
@@ -1758,7 +1932,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       );
       return rows.map((r) => r.class_id);
     }
-    if (req.user.role === "student") {
+    if (req.eduRole === "student") {
       const { rows } = await pool.query(
         "SELECT class_id FROM edu_students WHERE user_id=$1 AND company_id=$2", [req.user.id, schoolId(req)]
       );
@@ -1782,7 +1956,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const b = req.body || {};
       const { class_id, subject_id, course_type, title, content, file_url, file_name, video_url, due_date } = b;
       if (!class_id || !title) return res.status(400).json({ error: "Classe et titre requis" });
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(Number(class_id))) return res.status(403).json({ error: "Classe non affectée" });
       }
@@ -1805,7 +1979,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const type = req.query.type ? String(req.query.type) : null;
       const allowedClasses = await visibleClassIds(req);
       // Les élèves et parents ne voient que les cours publiés.
-      const publishedOnly = ["student", "parent"].includes(req.user.role);
+      const publishedOnly = ["student", "parent"].includes(req.eduRole);
       const { rows } = await pool.query(
         `SELECT co.*, c.name AS class_name, s.name AS subject_name,
                 COALESCE(u.fullname,'') AS teacher_name
@@ -1832,7 +2006,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         `SELECT * FROM edu_courses WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]
       )).rows[0];
       if (!existing) return res.status(404).json({ error: "Cours introuvable" });
-      if (req.user.role === "teacher" && existing.teacher_user_id !== req.user.id) {
+      if (req.eduRole === "teacher" && existing.teacher_user_id !== req.user.id) {
         return res.status(403).json({ error: "Vous ne pouvez modifier que vos cours." });
       }
       const b = req.body || {};
@@ -1855,7 +2029,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         `SELECT * FROM edu_courses WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]
       )).rows[0];
       if (!existing) return res.status(404).json({ error: "Cours introuvable" });
-      if (req.user.role === "teacher" && existing.teacher_user_id !== req.user.id) {
+      if (req.eduRole === "teacher" && existing.teacher_user_id !== req.user.id) {
         return res.status(403).json({ error: "Vous ne pouvez supprimer que vos cours." });
       }
       // Supprime le fichier local associé s'il est dans uploads/education.
@@ -1896,7 +2070,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const classId = req.query.class_id ? Number(req.query.class_id) : null;
       const allowedClasses = await visibleClassIds(req);
-      const publishedOnly = ["student", "parent"].includes(req.user.role);
+      const publishedOnly = ["student", "parent"].includes(req.eduRole);
       const { rows } = await pool.query(
         `SELECT co.*, c.name AS class_name, s.name AS subject_name, COALESCE(u.fullname,'') AS teacher_name,
                 (SELECT COUNT(*) FROM edu_assignment_submissions sub WHERE sub.course_id=co.id) AS submissions_count,
@@ -1922,7 +2096,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const b = req.body || {};
       if (!b.class_id || !b.title) return res.status(400).json({ error: "Classe et titre requis" });
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(Number(b.class_id))) return res.status(403).json({ error: "Classe non affectée" });
       }
@@ -1958,7 +2132,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       if (!devoir) return res.status(404).json({ error: "Devoir introuvable" });
       const b = req.body || {};
       let studentId = b.student_id ? Number(b.student_id) : null;
-      if (req.user.role === "student") {
+      if (req.eduRole === "student") {
         const me = await currentStudentId(req);
         if (!me) return res.status(403).json({ error: "Profil élève introuvable." });
         studentId = me.id;
@@ -1968,6 +2142,9 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         // Staff/prof/parent : vérifier l'accès à l'élève.
         const st = await assertStudentAccess(req, studentId);
         if (!st) return res.status(403).json({ error: "Accès à cet élève refusé." });
+      }
+      if (devoir.class_id && !(await elevesDeLaClasse(schoolId(req), devoir.class_id, [studentId]))) {
+        return res.status(422).json({ error: "Cet élève n'est pas dans la classe du devoir.", code: "ELEVE_HORS_CLASSE" });
       }
       const { rows } = await pool.query(
         `INSERT INTO edu_assignment_submissions
@@ -1989,7 +2166,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const devoir = await assignmentById(schoolId(req), req.params.id);
       if (!devoir) return res.status(404).json({ error: "Devoir introuvable" });
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(devoir.class_id)) return res.status(403).json({ error: "Classe non affectée" });
       }
@@ -2016,7 +2193,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const devoir = await assignmentById(schoolId(req), req.params.id);
       if (!devoir) return res.status(404).json({ error: "Devoir introuvable" });
       let studentId = req.query.student_id ? Number(req.query.student_id) : null;
-      if (req.user.role === "student") {
+      if (req.eduRole === "student") {
         const me = await currentStudentId(req);
         if (!me) return res.json(null);
         studentId = me.id;
@@ -2044,7 +2221,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         [req.params.id, schoolId(req)]
       )).rows[0];
       if (!sub) return res.status(404).json({ error: "Rendu introuvable" });
-      if (req.user.role === "teacher") {
+      if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
         if (!classes.includes(sub.class_id)) return res.status(403).json({ error: "Classe non affectée" });
       }
@@ -2102,7 +2279,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const { recipient_user_id, student_id, class_id, subject, body, is_announcement } = req.body || {};
       if (!body) return res.status(400).json({ error: "Message vide" });
-      const canAnnounce = STAFF_ROLES.includes(req.user.role) || req.user.role === "teacher";
+      const canAnnounce = STAFF_ROLES.includes(req.eduRole) || req.eduRole === "teacher";
       if (is_announcement && !canAnnounce) return res.status(403).json({ error: "Accès refusé" });
       const { rows } = await pool.query(
         `INSERT INTO edu_messages (company_id, sender_user_id, recipient_user_id, student_id, class_id, subject, body, is_announcement)
@@ -2146,13 +2323,17 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
            FROM edu_attendance WHERE company_id=$1 AND attendance_date=CURRENT_DATE`,
           [cid]
         ),
+        /* Reste dû : échéances non soldées (dont l'inscription) + inscriptions
+           anciennes sans échéancier. L'ancienne requête lisait une colonne
+           inexistante (edu_feeplan_payments.fee_id) et faisait tomber la page. */
         pool.query(
-          `SELECT COALESCE(SUM(f.amount), 0) - COALESCE(SUM(p.total_paid), 0) AS impaye
-           FROM edu_fees f
-           LEFT JOIN LATERAL (
-             SELECT SUM(amount) AS total_paid FROM edu_feeplan_payments WHERE fee_id=f.id
-           ) p ON true
-           WHERE f.company_id=$1`,
+          `SELECT
+             COALESCE((SELECT SUM(i.amount - i.amount_paid) FROM edu_feeplan_installments i
+                        JOIN edu_feeplans p ON p.id=i.plan_id AND p.status <> 'cancelled'
+                       WHERE i.company_id=$1 AND i.status <> 'paid'),0)
+           + COALESCE((SELECT SUM(GREATEST(e.enrollment_fee - e.amount_paid, 0)) FROM edu_enrollments e
+                       WHERE e.company_id=$1 AND e.fee_plan_id IS NULL
+                         AND e.enrollment_state NOT IN ('abandon','transfere')),0) AS impaye`,
           [cid]
         ),
         pool.query(
@@ -2172,6 +2353,11 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         top_students: topStudents.rows
       });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur tableau de bord" }); }
+  });
+
+  parcours = require("./education-parcours")(router, {
+    pool, schoolId, requireRoles, STAFF_ROLES, MONEY_ROLES, edupdf,
+    nextEnrollmentRef, nextReceiptRef, recomputeFeePlan, buildInstallments, assertStudentAccess,
   });
 
   return router;
