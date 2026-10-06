@@ -145,8 +145,19 @@ async function main() {
     const d = await appel("GET", `/education/students/${dossier.eleve.id}/dossier`, a.token);
     verifier("dossier complet : élève, inscription, échéancier", d.status === 200 && d.data?.inscriptions?.length === 1
       && d.data?.echeanciers?.[0]?.echeances?.length === 11 && Boolean(d.data.eleve.photo_url) && !("photo_key" in d.data.eleve));
+    verifier("date de naissance rendue telle quelle (pas de décalage de fuseau)", d.data?.eleve?.birth_date === "2014-03-09"
+      && /^\d{4}-\d{2}-\d{2}$/.test(d.data?.inscriptions?.[0]?.enrollment_date || ""), `${d.data?.eleve?.birth_date} ${d.data?.inscriptions?.[0]?.enrollment_date}`);
+    const annees = (await appel("GET", "/education/school-years", a.token)).data;
+    verifier("début d'année scolaire rendu « 2026-10-01 »", annees.some((y) => y.start_date === "2026-10-01"), JSON.stringify(annees).slice(0, 120));
     const m = await appel("PATCH", `/education/students/${dossier.eleve.id}`, a.token, { guardian_phone: "+223 66 11 22 33", class_id: a.classe.id });
     verifier("modifier le dossier", m.status === 200 && m.data?.eleve?.guardian_phone === "+223 66 11 22 33");
+    const classeB = (await appel("POST", "/education/classes", a.token, { name: "6e B", level: "6e", school_year_id: a.annee.id })).data;
+    const change = await appel("PATCH", `/education/students/${dossier.eleve.id}`, a.token, { class_id: classeB.id });
+    const suivi = await q(`SELECT e.class_id AS insc, p.class_id AS plan FROM edu_enrollments e JOIN edu_feeplans p ON p.enrollment_id=e.id WHERE e.id=$1`,
+      [dossier.inscription.id]);
+    verifier("changement de classe : l'inscription et l'échéancier suivent", change.status === 200
+      && suivi[0]?.insc === classeB.id && suivi[0]?.plan === classeB.id, JSON.stringify(suivi));
+    await appel("PATCH", `/education/students/${dossier.eleve.id}`, a.token, { class_id: a.classe.id });
     const ar = await appel("POST", `/education/students/${dossier.eleve.id}/archive`, a.token);
     const liste = (await appel("GET", "/education/students", a.token)).data;
     verifier("élève archivé : absent de la liste courante", ar.status === 200 && !liste.some((x) => x.id === dossier.eleve.id));

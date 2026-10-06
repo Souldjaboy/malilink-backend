@@ -746,6 +746,24 @@ module.exports = function registerParcoursRoutes(router, ctx) {
         [eleve.id, cid, e.first_name, e.last_name, e.gender, e.birth_date, e.birth_place, e.address, e.phone, e.email,
          e.guardian_name, e.guardian_relation, e.guardian_phone, e.guardian_email, classId, matricule]
       );
+      // Changement de classe = nouvelle affectation : l'inscription en cours
+      // (et son échéancier) suivent, pour que listes et finances par classe
+      // restent justes.
+      if (classId && classId !== eleve.class_id) {
+        const insc = (await pool.query(
+          `UPDATE edu_enrollments e SET class_id=$3, updated_at=NOW()
+             FROM edu_classes c
+            WHERE c.id=$3 AND c.company_id=$1 AND e.company_id=$1 AND e.student_id=$2
+              AND e.enrollment_state NOT IN ('abandon','transfere','termine')
+              AND (c.school_year_id IS NULL OR e.school_year_id = c.school_year_id)
+          RETURNING e.id`,
+          [cid, eleve.id, classId]
+        )).rows;
+        if (insc.length) {
+          await pool.query(`UPDATE edu_feeplans SET class_id=$2, updated_at=NOW() WHERE company_id=$1 AND enrollment_id = ANY($3::int[])`,
+            [cid, classId, insc.map((r) => r.id)]);
+        }
+      }
       const { photo_key, ...donnees } = rows[0];
       res.json({ success: true, eleve: { ...donnees, photo_url: urlFichier("eleve", photo_key) } });
     } catch (e) {

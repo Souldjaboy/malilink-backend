@@ -40,6 +40,32 @@ const MONEY_ROLES = ["super_admin", "school_admin", "director", "accountant", "s
 module.exports = function createEducationRouter({ pool, authenticateToken, authorizeRoles }) {
   const router = express.Router();
   router.use(authenticateToken);
+
+  /* Dates calendaires (naissance, échéance, inscription…). Le pilote pg en
+     fait des objets Date à minuit local, que JSON convertit en UTC : une
+     date de naissance du 18 février partait « 2014-02-17T23:00:00Z » et
+     s'affichait la veille. Elles repartent en « AAAA-MM-JJ », sans fuseau. */
+  const COLONNES_JOUR = new Set([
+    "attendance_date", "birth_date", "conduct_date", "due_date", "end_date", "enrollment_date", "exam_date",
+    "hire_date", "start_date", "valid_from", "valid_to", "valid_until", "first_due_date",
+  ]);
+  const deux = (n) => String(n).padStart(2, "0");
+  function datesEnJours(valeur, profondeur = 0) {
+    if (profondeur > 6 || valeur == null || typeof valeur !== "object" || valeur instanceof Date || Buffer.isBuffer(valeur)) return valeur;
+    if (Array.isArray(valeur)) return valeur.map((v) => datesEnJours(v, profondeur + 1));
+    const copie = {};
+    for (const [cle, v] of Object.entries(valeur)) {
+      copie[cle] = v instanceof Date && COLONNES_JOUR.has(cle) && !Number.isNaN(v.getTime())
+        ? `${v.getFullYear()}-${deux(v.getMonth() + 1)}-${deux(v.getDate())}`
+        : datesEnJours(v, profondeur + 1);
+    }
+    return copie;
+  }
+  router.use((req, res, next) => {
+    const json = res.json.bind(res);
+    res.json = (corps) => json(datesEnJours(corps));
+    next();
+  });
   // Parcours d'inscription (routes/education-parcours.js), branché en fin de fichier.
   let parcours = null;
 
