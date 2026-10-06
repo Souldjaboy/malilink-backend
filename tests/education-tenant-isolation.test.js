@@ -258,6 +258,42 @@ async function main() {
     refuse("le professeur de A ne lit pas un élève de B", vuProf);
   }
 
+  section("DANS UNE MÊME ÉCOLE : CHAQUE FAMILLE NE VOIT QUE SES DOSSIERS");
+  {
+    const voisin = (await appel("POST", "/education/inscriptions", tA, {
+      eleve: { first_name: "Mariam", last_name: "Touré", gender: "F" },
+      inscription: { school_year_id: A.annee.id, class_id: A.classe2.id },
+      frais: { inscription: 15000, mensualite: 0, mois: 0 }, paiement: { montant: 15000, mode: "orange_money" },
+    })).data;
+    await q(`INSERT INTO edu_student_parents (student_id, parent_user_id, relation) VALUES ($1,$2,'pere')`, [A.eleve.id, A.parent.id]);
+    const tParent = jeton({ id: A.parent.id, role: "parent", company_id: A.id });
+    for (const [titre, chemin] of [
+      ["la liste de toutes les inscriptions", "/education/enrollments"],
+      ["la liste de tous les échéanciers", "/education/fee-plans"],
+      ["l'inscription d'un autre enfant", `/education/enrollments/${voisin.inscription.id}`],
+      ["la fiche PDF d'un autre enfant", `/education/enrollments/${voisin.inscription.id}/pdf`],
+      ["l'échéancier d'un autre enfant", `/education/fee-plans/${voisin.echeancier.id}`],
+      ["l'échéancier PDF d'un autre enfant", `/education/fee-plans/${voisin.echeancier.id}/schedule/pdf`],
+      ["le reçu d'un autre enfant", `/education/fee-payments/${voisin.paiement.id}/receipt`],
+      ["le dossier d'un autre enfant", `/education/students/${voisin.eleve.id}/dossier`],
+      ["la fiche d'un professeur", `/education/teachers/${A.prof.id}`],
+    ]) {
+      refuse(`un parent ne lit pas ${titre}`, await appel("GET", chemin, tParent));
+    }
+    const moi = await appel("GET", `/education/fee-payments/${A.dossier.paiement.id}/receipt`, tParent);
+    const monPlan = await appel("GET", `/education/fee-plans/${A.dossier.echeancier.id}`, tParent);
+    const maFiche = await appel("GET", `/education/enrollments/${A.dossier.inscription.id}/pdf`, tParent);
+    verifier("le parent lit le reçu, l'échéancier et la fiche de SON enfant", moi.status === 200 && monPlan.status === 200 && maFiche.status === 200,
+      `${moi.status} ${monPlan.status} ${maFiche.status}`);
+    const profs = await appel("GET", "/education/teachers", tParent);
+    verifier("la liste des professeurs vue par un parent ne contient ni téléphone ni adresse",
+      profs.status === 200 && profs.data.length > 0 && profs.data.every((t) => !("phone" in t) && !("address" in t) && !("birth_date" in t)),
+      JSON.stringify(profs.data).slice(0, 160));
+    const liste = await appel("GET", "/education/students", tParent);
+    verifier("la liste d'élèves d'un parent ne contient que son enfant, sans clé interne de photo",
+      liste.status === 200 && liste.data.length === 1 && liste.data[0].id === A.eleve.id && !("photo_key" in liste.data[0]));
+  }
+
   section("INVARIANT : AUCUNE LIGNE NE RELIE DEUX ÉCOLES");
   {
     const paires = [

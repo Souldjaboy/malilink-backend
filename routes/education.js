@@ -187,6 +187,30 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     return null;
   }
 
+  /* Documents d'un élève (inscription, échéancier, reçus, bulletin) : la
+     direction et la comptabilité voient tout l'établissement ; un parent,
+     un élève ou un professeur seulement les dossiers auxquels il a droit. */
+  const ROLES_GESTION = [...new Set([...STAFF_ROLES, ...MONEY_ROLES])];
+  const PROPRIETAIRE_DOCUMENT = {
+    inscription: `SELECT student_id FROM edu_enrollments WHERE id=$1 AND company_id=$2`,
+    versement_inscription: `SELECT e.student_id FROM edu_enrollment_payments p JOIN edu_enrollments e ON e.id=p.enrollment_id
+                             WHERE p.id=$1 AND p.company_id=$2`,
+    echeancier: `SELECT student_id FROM edu_feeplans WHERE id=$1 AND company_id=$2`,
+    paiement: `SELECT p.student_id FROM edu_feeplan_payments fp JOIN edu_feeplans p ON p.id=fp.plan_id
+                WHERE fp.id=$1 AND fp.company_id=$2`,
+    bulletin: `SELECT student_id FROM edu_report_cards WHERE id=$1 AND company_id=$2`,
+  };
+  function reserveAuDossier(nature) {
+    return async (req, res, next) => {
+      if (ROLES_GESTION.includes(req.eduRole)) return next();
+      try {
+        const { rows } = await pool.query(PROPRIETAIRE_DOCUMENT[nature], [Number(req.params.id) || 0, schoolId(req)]);
+        if (rows[0] && (await assertStudentAccess(req, rows[0].student_id))) return next();
+        return res.status(404).json({ error: "Document introuvable" });
+      } catch (e) { console.error(e); return res.status(500).json({ error: "Erreur d'accès au document" }); }
+    };
+  }
+
   // ---------- ÉTABLISSEMENT / ANNÉES / PÉRIODES ----------
 
   router.get("/school", async (req, res) => {
@@ -451,8 +475,13 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     try {
       const q = req.query.q ? `%${String(req.query.q)}%` : null;
       const status = ["actif", "inactif"].includes(req.query.status) ? req.query.status : null;
+      // Hors direction : nom et spécialité seulement (pas de téléphone,
+      // d'adresse ni de date de naissance des professeurs).
+      const colonnes = ROLES_GESTION.includes(req.eduRole)
+        ? "t.*"
+        : "t.id, t.first_name, t.last_name, t.specialty, t.photo_url, t.status";
       const { rows } = await pool.query(
-        `SELECT t.*,
+        `SELECT ${colonnes},
                 (SELECT COUNT(*) FROM edu_teacher_assignments a WHERE a.teacher_id=t.id) AS assignment_count
            FROM edu_teachers t
           WHERE t.company_id=$1
@@ -490,7 +519,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     }
   });
 
-  router.get("/teachers/:id", async (req, res) => {
+  router.get("/teachers/:id", requireRoles(ROLES_GESTION), async (req, res) => {
     try {
       const t = await pool.query(`SELECT * FROM edu_teachers WHERE id=$1 AND company_id=$2`, [req.params.id, schoolId(req)]);
       if (!t.rows[0]) return res.status(404).json({ error: "Professeur introuvable" });
@@ -547,7 +576,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     return "partially_paid";
   }
 
-  router.get("/enrollments", async (req, res) => {
+  router.get("/enrollments", requireRoles(ROLES_GESTION), async (req, res) => {
     try {
       const { rows } = await pool.query(
         `SELECT e.*, s.first_name, s.last_name, s.matricule AS student_matricule, c.name AS class_name
@@ -605,14 +634,14 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     return rows[0] || null;
   }
 
-  router.get("/enrollments/:id", async (req, res) => {
+  router.get("/enrollments/:id", reserveAuDossier("inscription"), async (req, res) => {
     const d = await enrollmentDetail(schoolId(req), req.params.id);
     if (!d) return res.status(404).json({ error: "Inscription introuvable" });
     res.json(d);
   });
 
   // Fiche d'inscription PDF (§11) — QR de vérification signé.
-  router.get("/enrollments/:id/pdf", async (req, res) => {
+  router.get("/enrollments/:id/pdf", reserveAuDossier("inscription"), async (req, res) => {
     try {
       const d = await enrollmentDetail(schoolId(req), req.params.id);
       if (!d) return res.status(404).json({ error: "Inscription introuvable" });
@@ -708,7 +737,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   }
 
   // Historique des versements d'une inscription.
-  router.get("/enrollments/:id/payments", async (req, res) => {
+  router.get("/enrollments/:id/payments", reserveAuDossier("inscription"), async (req, res) => {
     try {
       const own = await pool.query(
         `SELECT 1 FROM edu_enrollments WHERE id=$1 AND company_id=$2`,
@@ -783,7 +812,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   });
 
   // Reçu de paiement PDF (§12) — QR de vérification signé.
-  router.get("/enrollment-payments/:id/receipt", async (req, res) => {
+  router.get("/enrollment-payments/:id/receipt", reserveAuDossier("versement_inscription"), async (req, res) => {
     try {
       const pay = (await pool.query(
         `SELECT p.*, e.reference AS enrollment_ref, e.enrollment_fee, e.amount_paid,
@@ -909,7 +938,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     return { ...rows[0], total_paid: totalPaid.toFixed(2) };
   }
 
-  router.get("/fee-plans", async (req, res) => {
+  router.get("/fee-plans", requireRoles(ROLES_GESTION), async (req, res) => {
     try {
       const { rows } = await pool.query(
         `SELECT p.*, s.first_name, s.last_name, s.matricule AS student_matricule, c.name AS class_name,
@@ -981,7 +1010,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     return plan;
   }
 
-  router.get("/fee-plans/:id", async (req, res) => {
+  router.get("/fee-plans/:id", reserveAuDossier("echeancier"), async (req, res) => {
     const d = await feePlanDetail(schoolId(req), req.params.id);
     if (!d) return res.status(404).json({ error: "Plan introuvable" });
     res.json(d);
@@ -1054,7 +1083,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   }
 
   // Échéancier PDF (§13) — tableau des mensualités.
-  router.get("/fee-plans/:id/schedule/pdf", async (req, res) => {
+  router.get("/fee-plans/:id/schedule/pdf", reserveAuDossier("echeancier"), async (req, res) => {
     try {
       const d = await feePlanDetail(schoolId(req), req.params.id);
       if (!d) return res.status(404).json({ error: "Plan introuvable" });
@@ -1090,7 +1119,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   });
 
   // Reçu de mensualité PDF (§13).
-  router.get("/fee-payments/:id/receipt", async (req, res) => {
+  router.get("/fee-payments/:id/receipt", reserveAuDossier("paiement"), async (req, res) => {
     try {
       const pay = (await pool.query(
         `SELECT fp.*, p.label AS plan_label, p.total_amount,
@@ -1300,7 +1329,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
            WHERE s.id = ANY($1) ORDER BY s.last_name`,
           [ids]
         );
-        return res.json(rows);
+        return res.json(rows.map(({ photo_key, ...r }) => ({ ...r, photo_url: parcours.urlFichier("eleve", photo_key) })));
       }
       if (req.eduRole === "teacher") {
         const classes = await teacherClassIds(req);
@@ -1312,7 +1341,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
            ORDER BY s.last_name`,
           [classes, classFilter]
         );
-        return res.json(rows);
+        return res.json(rows.map(({ photo_key, ...r }) => ({ ...r, photo_url: parcours.urlFichier("eleve", photo_key) })));
       }
       if (!STAFF_ROLES.includes(req.eduRole) && !MONEY_ROLES.includes(req.eduRole)) {
         return res.status(403).json({ error: "Accès refusé" });
@@ -1746,7 +1775,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   });
 
   // Bulletin PDF (§16) — tableau des matières, moyenne, rang, mention, QR signé.
-  router.get("/report-cards/:id/pdf", async (req, res) => {
+  router.get("/report-cards/:id/pdf", reserveAuDossier("bulletin"), async (req, res) => {
     try {
       const rc = (await pool.query(
         `SELECT rc.*, s.first_name, s.last_name, s.matricule AS student_matricule, s.gender,
