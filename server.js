@@ -19127,6 +19127,16 @@ const createEducationRouter = require("./routes/education");
 /* Photos d'élèves, logo, sceau, signature et cachet d'établissement : lus
    par URL signée et limitée dans le temps, jamais par le dossier public. */
 app.get("/education-fichiers/:type/:dossier/:fichier", require("./routes/education-parcours").serveFichier);
+// Vérification publique d'une carte ou d'un bulletin par QR (sans compte).
+app.get(
+  "/verification/:token",
+  require("./middleware/rateLimit").createRateLimiter({
+    windowMs: 60 * 1000,
+    max: 60,
+    message: "Trop de vérifications : patientez une minute.",
+  }),
+  require("./routes/education-parcours").verificationPublique(pool)
+);
 app.use(
   "/education",
   requireCompanyModule("education"),

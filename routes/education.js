@@ -1464,12 +1464,21 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
       const { qr_code, action = "entree" } = req.body || {};
       if (!qr_code) return res.status(400).json({ error: "QR manquant" });
 
-      const { rows } = await pool.query(
-        "SELECT * FROM edu_students WHERE qr_code=$1 AND company_id=$2",
-        [qr_code, schoolId(req)]
-      );
-      const student = rows[0];
-      if (!student) return res.status(404).json({ error: "Élève introuvable dans cet établissement" });
+      // Deux QR acceptés : l'ancien code de badge (EDU-…) et le QR de la
+      // carte scolaire (URL /verifier/<jeton>, carte valide uniquement).
+      const lu = String(qr_code).trim().slice(0, 300);
+      const jeton = (lu.match(/\/verifier\/([A-Za-z0-9_-]{20,64})/) || [])[1]
+        || (!lu.startsWith("EDU-") && /^[A-Za-z0-9_-]{20,64}$/.test(lu) ? lu : null);
+      const { rows } = jeton
+        ? await pool.query(
+          `SELECT s.* FROM edu_document_verifications v JOIN edu_students s ON s.id=v.student_id AND s.company_id=v.company_id
+            WHERE v.token=$1 AND v.company_id=$2 AND v.doc_type='carte' AND v.status='valide' AND s.archived_at IS NULL`,
+          [jeton, schoolId(req)])
+        : await pool.query("SELECT * FROM edu_students WHERE qr_code=$1 AND company_id=$2 AND archived_at IS NULL", [lu, schoolId(req)]);
+      const trouve = rows[0];
+      if (!trouve) return res.status(404).json({ error: "Élève introuvable dans cet établissement (ou carte remplacée)" });
+      const { photo_key, ...student } = trouve;
+      student.photo_url = parcours.urlFichier("eleve", photo_key);
 
       if (action === "sortie") {
         const upd = await pool.query(

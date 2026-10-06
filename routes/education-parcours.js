@@ -23,6 +23,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const QRCode = require("qrcode");
 
 const RACINE_UPLOADS = path.join(__dirname, "..", "uploads");
 const DOSSIERS = {
@@ -46,6 +47,7 @@ const ETATS_INSCRIPTION = ["inscrit", "preinscrit", "abandon", "transfere", "ter
 const MODELES_CARTE = ["academique", "moderne", "premium", "minimaliste", "institutionnel", "creatif"];
 const MODELES_BULLETIN = ["institutionnel", "academique", "moderne", "premium", "compact", "elegant"];
 const FICHIERS_ETABLISSEMENT = { logo: "logo_key", sceau: "seal_key", signature: "signature_key", cachet: "stamp_key" };
+const jourLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
 /* ----------------------------- Fichiers privés ----------------------------- */
 function detecterImage(fichier) {
@@ -154,6 +156,64 @@ function publicBaseUrl(req) {
   return `${proto}://${req.get("x-forwarded-host") || req.get("host")}`;
 }
 
+/* ---------------- Vérification publique d'un document (QR) ----------------
+   Route ouverte, sans compte : elle dit seulement si le document est
+   authentique et valide. Jamais de paiement, de téléphone, d'adresse, de
+   date de naissance ni de photo. Jeton aléatoire, non devinable. */
+const TYPES_DOCUMENT = {
+  carte: "Carte scolaire", bulletin: "Bulletin de notes", inscription: "Fiche d'inscription", recu: "Reçu de paiement",
+};
+const JETON_DOCUMENT = /^[A-Za-z0-9_-]{20,64}$/;
+const urlVerification = (req, token) => `${publicBaseUrl(req)}/verifier/${token}`;
+
+function verificationPublique(pool) {
+  return async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.set("X-Robots-Tag", "noindex, nofollow");
+    const token = String(req.params.token || "");
+    const inconnu = { authentique: false, message: "Ce document n'a pas été émis par un établissement MaliLink." };
+    if (!JETON_DOCUMENT.test(token)) return res.status(404).json(inconnu);
+    try {
+      const { rows } = await pool.query(
+        `SELECT v.id, v.company_id, v.doc_type, v.reference, v.school_year_label, v.class_label, v.status,
+                v.valid_until::text AS valid_until, v.issued_at, v.revoked_at,
+                s.first_name, s.last_name, t.label AS term_label,
+                COALESCE(NULLIF(es.official_name,''), NULLIF(cs.company_name,''), co.name) AS etablissement,
+                es.logo_key, es.color_primary
+           FROM edu_document_verifications v
+           JOIN companies co ON co.id = v.company_id
+           LEFT JOIN edu_schools es ON es.company_id = v.company_id
+           LEFT JOIN company_settings cs ON cs.company_id = v.company_id
+           LEFT JOIN edu_students s ON s.id = v.student_id AND s.company_id = v.company_id
+           LEFT JOIN edu_report_cards rc ON rc.id = v.report_card_id AND rc.company_id = v.company_id
+           LEFT JOIN edu_terms t ON t.id = rc.term_id
+          WHERE v.token = $1`, [token]);
+      const v = rows[0];
+      if (!v) return res.status(404).json(inconnu);
+      pool.query(`UPDATE edu_document_verifications SET last_checked_at=NOW(), checks_count=checks_count+1 WHERE id=$1`, [v.id]).catch(() => {});
+      const aujourdhui = new Date().toISOString().slice(0, 10);
+      const statut = v.status !== "valide" ? v.status : v.valid_until && v.valid_until < aujourdhui ? "expire" : "valide";
+      res.json({
+        authentique: true,
+        statut,
+        type: v.doc_type,
+        type_libelle: TYPES_DOCUMENT[v.doc_type] || "Document",
+        etablissement: { nom: v.etablissement, logo: urlFichier("etablissement", v.logo_key), couleur: v.color_primary || "#0f1b3d" },
+        eleve: [v.first_name, v.last_name].filter(Boolean).join(" "),
+        classe: v.class_label || "",
+        annee_scolaire: v.school_year_label || "",
+        periode: v.term_label || "",
+        reference: v.reference,
+        emis_le: new Date(v.issued_at).toISOString().slice(0, 10),
+        valide_jusqu_au: v.valid_until || null,
+      });
+    } catch (e) {
+      console.error("ERREUR VERIFICATION DOCUMENT :", e.message);
+      res.status(500).json({ error: "Vérification indisponible pour le moment." });
+    }
+  };
+}
+
 module.exports = function registerParcoursRoutes(router, ctx) {
   const {
     pool, schoolId, requireRoles, STAFF_ROLES, MONEY_ROLES, edupdf,
@@ -235,7 +295,18 @@ module.exports = function registerParcoursRoutes(router, ctx) {
   router.put("/etablissement", requireRoles(STAFF_ROLES), async (req, res) => {
     try {
       const cid = schoolId(req);
-      const b = req.body || {};
+      // Fusion : un champ absent garde sa valeur (un envoi partiel — l'année
+      // active seule, par exemple — n'efface plus le nom ni les couleurs).
+      const actuel = (await pool.query(`SELECT * FROM edu_schools WHERE company_id=$1`, [cid])).rows[0] || {};
+      const recu = req.body || {};
+      const b = {};
+      for (const cle of ["school_type", "grading_system", "grade_max", "director_name", "address", "phone", "official_name",
+        "short_name", "slogan", "whatsapp", "email", "website", "color_primary", "color_secondary", "active_school_year_id",
+        "matricule_prefix", "matricule_manual_allowed", "card_template", "card_options", "report_template", "report_options"]) {
+        b[cle] = Object.prototype.hasOwnProperty.call(recu, cle) ? recu[cle] : actuel[cle];
+      }
+      b.card_options = { ...(actuel.card_options || {}), ...(recu.card_options || {}) };
+      b.report_options = { ...(actuel.report_options || {}), ...(recu.report_options || {}) };
       const couleur = (v, defaut) => (/^#[0-9A-Fa-f]{6}$/.test(String(v || "")) ? String(v) : defaut);
       let anneeActive = null;
       if (b.active_school_year_id) {
@@ -343,6 +414,59 @@ module.exports = function registerParcoursRoutes(router, ctx) {
       if (!pris.rows[0]) return matricule;
     }
     throw erreur("Impossible de générer un matricule unique.", 500);
+  }
+
+  /* ---------- Carte scolaire : émise automatiquement, vérifiable par QR ----------
+     Le QR ne porte qu'une URL et un jeton aléatoire (aucune donnée
+     personnelle). Une carte valide par élève et par année ; une nouvelle
+     carte remplace l'ancienne (perte, changement), l'archivage la révoque. */
+  async function emettreCarte(db, { companyId, studentId, userId, remplacer = false }) {
+    const s = (await db.query(
+      `SELECT s.id, c.name AS class_name, c.school_year_id
+         FROM edu_students s LEFT JOIN edu_classes c ON c.id=s.class_id AND c.company_id=s.company_id
+        WHERE s.id=$1 AND s.company_id=$2`, [studentId, companyId])).rows[0];
+    if (!s) throw erreur("Élève introuvable.", 404);
+    const etab = await etablissement(db, companyId);
+    const yearId = s.school_year_id || etab.active_school_year_id;
+    const annee = yearId
+      ? (await db.query(`SELECT label, end_date::text AS fin FROM edu_school_years WHERE id=$1 AND company_id=$2`, [yearId, companyId])).rows[0]
+      : null;
+    const libelleAnnee = annee?.label || String(new Date().getFullYear());
+    const existante = (await db.query(
+      `SELECT * FROM edu_document_verifications
+        WHERE company_id=$1 AND student_id=$2 AND doc_type='carte' AND status='valide' AND school_year_label=$3
+        FOR UPDATE`, [companyId, s.id, libelleAnnee])).rows[0];
+    if (existante && !remplacer) {
+      if (existante.class_label !== (s.class_name || "")) {
+        await db.query(`UPDATE edu_document_verifications SET class_label=$2 WHERE id=$1`, [existante.id, s.class_name || ""]);
+        existante.class_label = s.class_name || "";
+      }
+      return existante;
+    }
+    if (existante) {
+      await db.query(`UPDATE edu_document_verifications SET status='remplace', revoked_at=NOW() WHERE id=$1`, [existante.id]);
+    }
+    const an = new Date().getFullYear();
+    const seq = (await db.query(
+      `INSERT INTO edu_card_counters (company_id, year, last_seq) VALUES ($1,$2,1)
+       ON CONFLICT (company_id, year) DO UPDATE SET last_seq = edu_card_counters.last_seq + 1 RETURNING last_seq`,
+      [companyId, an])).rows[0].last_seq;
+    const prefixe = (etab.short_name || etab.matricule_prefix || "CS").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8) || "CS";
+    const reference = `${prefixe}-C${an}-${String(seq).padStart(5, "0")}`;
+    const fin = annee?.fin || `${an + 1}-08-31`;
+    const { rows } = await db.query(
+      `INSERT INTO edu_document_verifications
+         (company_id, token, doc_type, student_id, reference, school_year_label, class_label, status, valid_until, issued_by)
+       VALUES ($1,$2,'carte',$3,$4,$5,$6,'valide',$7,$8) RETURNING *`,
+      [companyId, crypto.randomBytes(18).toString("base64url"), s.id, reference, libelleAnnee, s.class_name || "", fin, userId || null]
+    );
+    return rows[0];
+  }
+
+  async function revoquerCartes(db, companyId, studentId) {
+    await db.query(
+      `UPDATE edu_document_verifications SET status='revoque', revoked_at=NOW()
+        WHERE company_id=$1 AND student_id=$2 AND doc_type='carte' AND status='valide'`, [companyId, studentId]);
   }
 
   async function verifierReferences(db, companyId, { classId, yearId }) {
@@ -598,6 +722,9 @@ module.exports = function registerParcoursRoutes(router, ctx) {
           notes: paiement.notes, userId: req.user.id, eleveNom: `${eleve.first_name} ${eleve.last_name}`,
         });
       }
+      // Badge automatique : la carte scolaire (et son QR de vérification)
+      // naît avec le dossier.
+      const carte = await emettreCarte(client, { companyId: cid, studentId: eleve.id, userId: req.user.id });
       await client.query("COMMIT");
 
       // Répartition et état de l'inscription, hors transaction (lectures simples).
@@ -611,6 +738,7 @@ module.exports = function registerParcoursRoutes(router, ctx) {
         paiement: paiementCree,
         recu_url: paiementCree ? `/education/fee-payments/${paiementCree.id}/receipt` : null,
         fiche_url: `/education/enrollments/${inscription.id}/pdf`,
+        carte: { reference: carte.reference, statut: carte.status, verification_url: `${publicBaseUrl(req)}/verifier/${carte.token}` },
       });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
@@ -763,6 +891,8 @@ module.exports = function registerParcoursRoutes(router, ctx) {
           await pool.query(`UPDATE edu_feeplans SET class_id=$2, updated_at=NOW() WHERE company_id=$1 AND enrollment_id = ANY($3::int[])`,
             [cid, classId, insc.map((r) => r.id)]);
         }
+        // La carte valide affiche la nouvelle classe (vérification à jour).
+        if (!eleve.archived_at) await emettreCarte(pool, { companyId: cid, studentId: eleve.id, userId: req.user.id }).catch(() => null);
       }
       const { photo_key, ...donnees } = rows[0];
       res.json({ success: true, eleve: { ...donnees, photo_url: urlFichier("eleve", photo_key) } });
@@ -781,6 +911,8 @@ module.exports = function registerParcoursRoutes(router, ctx) {
       [Number(req.params.id), schoolId(req)]
     );
     if (!rows[0]) return res.status(404).json({ error: "Élève introuvable ou déjà archivé." });
+    // Un élève parti n'a plus de carte valide.
+    await revoquerCartes(pool, schoolId(req), rows[0].id);
     res.json({ success: true });
   });
 
@@ -792,6 +924,77 @@ module.exports = function registerParcoursRoutes(router, ctx) {
     );
     if (!rows[0]) return res.status(404).json({ error: "Élève introuvable." });
     res.json({ success: true });
+  });
+
+  /* ---------- Carte scolaire d'un élève (données + QR de vérification) ---------- */
+  async function carteValide(companyId, studentId) {
+    return (await pool.query(
+      `SELECT * FROM edu_document_verifications
+        WHERE company_id=$1 AND student_id=$2 AND doc_type='carte' AND status='valide'
+        ORDER BY issued_at DESC LIMIT 1`, [companyId, studentId])).rows[0] || null;
+  }
+
+  async function vueCarte(req, eleve, carte) {
+    const cid = schoolId(req);
+    const classe = eleve.class_id
+      ? (await pool.query(`SELECT name, level FROM edu_classes WHERE id=$1 AND company_id=$2`, [eleve.class_id, cid])).rows[0]
+      : null;
+    const url = carte ? urlVerification(req, carte.token) : null;
+    return {
+      carte: carte ? {
+        reference: carte.reference, statut: carte.status, annee: carte.school_year_label, classe: carte.class_label,
+        valid_until: carte.valid_until instanceof Date ? jourLocal(carte.valid_until) : carte.valid_until,
+        issued_at: carte.issued_at, verification_url: url,
+        qr: await QRCode.toDataURL(url, { width: 360, margin: 1, errorCorrectionLevel: "M" }),
+      } : null,
+      eleve: {
+        id: eleve.id, first_name: eleve.first_name, last_name: eleve.last_name, matricule: eleve.matricule,
+        gender: eleve.gender, photo_url: urlFichier("eleve", eleve.photo_key),
+        class_name: classe?.name || null, class_level: classe?.level || null, archived_at: eleve.archived_at,
+      },
+      etablissement: vueEtablissement(await etablissement(pool, cid)),
+    };
+  }
+
+  router.get("/students/:id/carte", async (req, res) => {
+    try {
+      const cid = schoolId(req);
+      const eleve = await assertStudentAccess(req, req.params.id);
+      if (!eleve) return res.status(404).json({ error: "Élève introuvable." });
+      let carte = await carteValide(cid, eleve.id);
+      // Élèves inscrits avant la carte automatique : émise à la première consultation.
+      if (!carte && STAFF_ROLES.includes(req.eduRole) && !eleve.archived_at) {
+        carte = await emettreCarte(pool, { companyId: cid, studentId: eleve.id, userId: req.user.id })
+          .catch(async (e) => { if (e.code === "23505") return carteValide(cid, eleve.id); throw e; });
+      }
+      res.json(await vueCarte(req, eleve, carte));
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error("ERREUR EDU CARTE :", e.message);
+      res.status(500).json({ error: "Erreur chargement de la carte." });
+    }
+  });
+
+  // Nouvelle carte (perte, vol, erreur) : l'ancienne devient « remplacée ».
+  router.post("/students/:id/carte/regenerer", requireRoles(STAFF_ROLES), async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const cid = schoolId(req);
+      const eleve = (await client.query(`SELECT * FROM edu_students WHERE id=$1 AND company_id=$2`, [Number(req.params.id) || 0, cid])).rows[0];
+      if (!eleve) return res.status(404).json({ error: "Élève introuvable." });
+      if (eleve.archived_at) return res.status(409).json({ error: "Restaurez le dossier avant d'émettre une carte." });
+      await client.query("BEGIN");
+      const carte = await emettreCarte(client, { companyId: cid, studentId: eleve.id, userId: req.user.id, remplacer: true });
+      await client.query("COMMIT");
+      res.status(201).json(await vueCarte(req, eleve, carte));
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error("ERREUR EDU CARTE REGEN :", e.message);
+      res.status(500).json({ error: "Erreur émission de la carte." });
+    } finally {
+      client.release();
+    }
   });
 
   /* Photo de l'élève : téléphone, webcam ou fichier ; réutilisée par la
@@ -902,6 +1105,8 @@ module.exports = function registerParcoursRoutes(router, ctx) {
 };
 
 module.exports.serveFichier = serveFichier;
+module.exports.verificationPublique = verificationPublique;
+module.exports.JETON_DOCUMENT = JETON_DOCUMENT;
 module.exports.urlFichier = urlFichier;
 module.exports.cheminFichier = cheminFichier;
 module.exports.publicBaseUrl = publicBaseUrl;
