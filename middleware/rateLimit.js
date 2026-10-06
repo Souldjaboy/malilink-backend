@@ -98,11 +98,16 @@ function getClientIp(req) {
  * @param {number} options.max - nombre max de requêtes par fenêtre
  * @param {string} [options.message] - message renvoyé en cas de dépassement
  * @param {Object} [options.store] - store personnalisé (tests / injection)
+ * @param {Function} [options.keyGenerator] - clé de comptage (défaut : IP du client)
  */
-function createRateLimiter({ windowMs, max, message, store }) {
+function createRateLimiter({ windowMs, max, message, store, keyGenerator }) {
   const backing = store || getStore();
   return function rateLimiter(req, res, next) {
-    const key = `${getClientIp(req)}:${req.path}`;
+    /* Par défaut : IP + chemin. `keyGenerator` permet de compter par compte
+       authentifié : derrière la NAT d'un opérateur mobile, des milliers
+       d'abonnés partagent la même IP et ne doivent pas s'épuiser l'un l'autre. */
+    const base = keyGenerator ? keyGenerator(req) : getClientIp(req);
+    const key = `${base}:${req.path}`;
     backing
       .hit(key, windowMs)
       .then(({ count, resetAt }) => {

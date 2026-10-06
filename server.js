@@ -105,6 +105,10 @@ if (!fs.existsSync(laboratoryUploadDir)) {
   fs.mkdirSync(laboratoryUploadDir, { recursive: true });
 }
 
+/* Dossiers PRIVÉS rangés sous uploads/ (pour être conservés avec lui d'une
+   release à l'autre) mais jamais servis tels quels : médias Social (lus par
+   URL signée) et photos d'élèves (lues par la route Éducation). */
+app.use(["/uploads/social", "/uploads/eleves"], (req, res) => res.status(404).end());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const storage = multer.diskStorage({
@@ -19138,7 +19142,14 @@ const realtime = createRealtime({ httpServer, jwt, jwtSecret: JWT_SECRET, pool }
 app.set("realtime", realtime);
 
 const createSocialRouter = require("./routes/social");
-app.use("/social", requireCompanyModule("social"), createSocialRouter({ pool, authenticateToken, createNotification, realtime }));
+const { createSocialMedia } = require("./routes/social/media");
+const socialMedia = createSocialMedia({ pool });
+/* Lecture des photos et vidéos Social par URL signée et limitée dans le
+   temps (une balise <img>/<video> n'envoie pas de jeton). La signature n'est
+   délivrée qu'à qui peut voir la publication ; la vidéo se lit par plages. */
+app.get("/social-media/:publicId", (req, res) => socialMedia.serve(req, res));
+app.head("/social-media/:publicId", (req, res) => socialMedia.serve(req, res));
+app.use("/social", requireCompanyModule("social"), createSocialRouter({ pool, authenticateToken, createNotification, realtime, media: socialMedia }));
 
 const createBadgesRouter = require("./routes/badges");
 app.use("/badges", createBadgesRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser }));

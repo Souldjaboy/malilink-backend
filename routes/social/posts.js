@@ -6,91 +6,150 @@
  * Suppression logique uniquement (deleted_at).
  */
 
-module.exports = function registerPostRoutes(router, { pool, helpers, createNotification }) {
+module.exports = function registerPostRoutes(router, { pool, helpers, createNotification, media }) {
   const { isBlockedEitherWay, areFriends, getPrivacy, getProfile } = helpers;
 
   const LINKED_TYPES = ["", "product", "shop", "company", "service", "restaurant", "hotel", "vehicle", "property", "job", "event"];
 
-  /* Fil personnalisé : mes posts + amis + suivis + publics récents,
-     en respectant l'audience de chaque post et les blocages. */
+  /* Visibilité d'une publication pour $1 (moi), réutilisée par le fil, les
+     enregistrements et la fiche d'une publication : audience + blocage,
+     vérifiés en base, jamais seulement à l'écran. */
+  const VISIBLE_POUR_MOI = `
+    po.deleted_at IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM social_blocks b
+      WHERE (b.blocker_user_id=$1 AND b.blocked_user_id=po.user_id)
+         OR (b.blocker_user_id=po.user_id AND b.blocked_user_id=$1))
+    AND (
+      po.user_id=$1
+      OR po.audience='public'
+      OR (po.audience='friends' AND EXISTS (
+           SELECT 1 FROM social_friendships f
+           WHERE f.user_a=LEAST(po.user_id,$1) AND f.user_b=GREATEST(po.user_id,$1)))
+      OR (po.audience='followers' AND EXISTS (
+           SELECT 1 FROM social_follows fo
+           WHERE fo.follower_user_id=$1 AND fo.followed_user_id=po.user_id AND fo.status='active'))
+    )`;
+
+  const COLONNES_POST = `po.*, p.display_name, p.photo_url AS author_photo, p.verified_level,
+    EXISTS (SELECT 1 FROM social_post_likes l WHERE l.post_id=po.id AND l.user_id=$1) AS liked_by_me,
+    EXISTS (SELECT 1 FROM social_saved_posts s WHERE s.post_id=po.id AND s.user_id=$1) AS saved_by_me`;
+
+  /* Fil d'actualité, paginé par curseur (id décroissant).
+     - « pour_vous » (défaut) : mes publications, celles de mes amis et de
+       mes abonnements, puis les publications publiques de la communauté ;
+     - « reseau » : uniquement moi, mes amis et les profils que je suis. */
   router.get("/feed", async (req, res) => {
     try {
+      const limit = Math.min(Math.max(Number(req.query.limit) || 15, 1), 50);
+      const before = Number(req.query.before) || null;
+      const reseauSeul = req.query.scope === "reseau";
       const { rows } = await pool.query(
-        `SELECT po.*, p.display_name, p.photo_url AS author_photo, p.verified_level,
-                EXISTS (SELECT 1 FROM social_post_likes l WHERE l.post_id=po.id AND l.user_id=$1) AS liked_by_me,
-                EXISTS (SELECT 1 FROM social_saved_posts s WHERE s.post_id=po.id AND s.user_id=$1) AS saved_by_me
+        `SELECT ${COLONNES_POST}
          FROM social_posts po
          JOIN social_profiles p ON p.user_id=po.user_id AND p.deleted_at IS NULL AND p.is_active=true
-         WHERE po.deleted_at IS NULL
-           AND po.tenant_id=$2
-           AND NOT EXISTS (
-             SELECT 1 FROM social_blocks b
-             WHERE (b.blocker_user_id=$1 AND b.blocked_user_id=po.user_id)
-                OR (b.blocker_user_id=po.user_id AND b.blocked_user_id=$1)
-           )
-           AND (
-             po.user_id=$1
-             OR (po.audience='public')
-             OR (po.audience='friends' AND EXISTS (
-                  SELECT 1 FROM social_friendships f
-                  WHERE f.user_a=LEAST(po.user_id,$1) AND f.user_b=GREATEST(po.user_id,$1)))
-             OR (po.audience='followers' AND EXISTS (
-                  SELECT 1 FROM social_follows fo
-                  WHERE fo.follower_user_id=$1 AND fo.followed_user_id=po.user_id AND fo.status='active'))
-           )
-         ORDER BY po.created_at DESC
-         LIMIT 50`,
-        [req.user.id, req.tenant_id || "malilink"]
+         WHERE po.tenant_id=$2
+           AND ${VISIBLE_POUR_MOI}
+           AND ($3::bigint IS NULL OR po.id < $3)
+           AND (NOT $4::boolean OR po.user_id=$1
+                OR EXISTS (SELECT 1 FROM social_friendships f
+                           WHERE f.user_a=LEAST(po.user_id,$1) AND f.user_b=GREATEST(po.user_id,$1))
+                OR EXISTS (SELECT 1 FROM social_follows fo
+                           WHERE fo.follower_user_id=$1 AND fo.followed_user_id=po.user_id AND fo.status='active'))
+         ORDER BY po.id DESC
+         LIMIT $5`,
+        [req.user.id, req.tenant_id || "malilink", before, reseauSeul, limit + 1]
       );
-      res.json(rows);
+      const page = rows.slice(0, limit);
+      const posts = media ? await media.attachToPosts(page) : page;
+      // Ancien format (tableau) conservé si aucun curseur n'est demandé par
+      // un client qui ne connaît pas la pagination.
+      if (req.query.format === "page" || req.query.before || req.query.scope) {
+        return res.json({ posts, next_cursor: rows.length > limit ? page[page.length - 1].id : null });
+      }
+      res.json(posts);
     } catch (error) {
       console.error("ERREUR SOCIAL FEED :", error.message);
       res.status(500).json({ error: "Erreur chargement du fil." });
     }
   });
 
+  /* Une publication (après un j'aime, un commentaire, un lien partagé). */
+  router.get("/posts/:id", async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT ${COLONNES_POST}
+         FROM social_posts po
+         JOIN social_profiles p ON p.user_id=po.user_id AND p.deleted_at IS NULL
+         WHERE po.id=$2 AND ${VISIBLE_POUR_MOI}`,
+        [req.user.id, Number(req.params.id)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Publication introuvable." });
+      const [post] = media ? await media.attachToPosts(rows) : rows;
+      res.json(post);
+    } catch (error) {
+      res.status(500).json({ error: "Erreur chargement de la publication." });
+    }
+  });
+
   router.post("/posts", async (req, res) => {
+    const client = await pool.connect();
     try {
       const profile = await getProfile(req.user.id);
       if (!profile || profile.is_active === false) {
         return res.status(400).json({ error: "Activez d'abord votre profil social." });
       }
-      const { content = "", media, audience = "public", linked_type = "", linked_id } = req.body || {};
+      const { content = "", media_ids, audience = "public", linked_type = "", linked_id } = req.body || {};
       const cleanContent = String(content || "").trim().slice(0, 5000);
-      const cleanMedia = Array.isArray(media)
-        ? media
-            .filter((item) => item && typeof item.url === "string")
-            .slice(0, 6)
-            .map((item) => ({
-              type: ["image", "video", "audio"].includes(item.type) ? item.type : "image",
-              url: String(item.url).slice(0, 500)
-            }))
-        : [];
-      if (!cleanContent && cleanMedia.length === 0) {
+      const ids = Array.isArray(media_ids) ? media_ids.filter((id) => typeof id === "string" && id.length <= 40) : [];
+      /* Le champ historique `media` (URL libres) n'est plus accepté : une URL
+         saisie par un client pourrait viser n'importe quel site. Les médias
+         passent par POST /social/media et sont désignés par leur identifiant. */
+      if (!cleanContent && ids.length === 0) {
         return res.status(400).json({ error: "Publication vide." });
       }
       const cleanAudience = helpers.AUDIENCES.includes(audience) ? audience : "public";
       const cleanLinkedType = LINKED_TYPES.includes(linked_type) ? linked_type : "";
 
-      const { rows } = await pool.query(
+      await client.query("BEGIN");
+      const { rows } = await client.query(
         `INSERT INTO social_posts
            (tenant_id, user_id, content, media, audience, linked_type, linked_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         VALUES ($1,$2,$3,'[]'::jsonb,$4,$5,$6)
          RETURNING *`,
         [
           req.tenant_id || "malilink",
           req.user.id,
           cleanContent,
-          JSON.stringify(cleanMedia),
           cleanAudience,
           cleanLinkedType,
           Number(linked_id) || null
         ]
       );
-      res.status(201).json({ success: true, post: rows[0] });
+      if (ids.length > 0) {
+        if (!media) {
+          const e = new Error("Les médias ne sont pas disponibles.");
+          e.status = 503;
+          throw e;
+        }
+        await media.attachToPost(client, {
+          userId: req.user.id, tenantId: req.tenant_id || "malilink", postId: rows[0].id, mediaIds: ids,
+        });
+      }
+      await client.query("COMMIT");
+      const [post] = media ? await media.attachToPosts(rows) : rows;
+      res.status(201).json({
+        success: true,
+        post: { ...post, display_name: profile.display_name, author_photo: profile.photo_url,
+          verified_level: profile.verified_level, liked_by_me: false, saved_by_me: false },
+      });
     } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (error.status) return res.status(error.status).json({ error: error.message });
       console.error("ERREUR SOCIAL POST :", error.message);
       res.status(500).json({ error: "Erreur publication." });
+    } finally {
+      client.release();
     }
   });
 
@@ -291,15 +350,19 @@ module.exports = function registerPostRoutes(router, { pool, helpers, createNoti
   router.get("/saved", async (req, res) => {
     try {
       const { rows } = await pool.query(
-        `SELECT po.*, p.display_name, p.photo_url AS author_photo
-         FROM social_saved_posts s
-         JOIN social_posts po ON po.id=s.post_id AND po.deleted_at IS NULL
+        `SELECT ${COLONNES_POST}
+         FROM social_saved_posts sv
+         JOIN social_posts po ON po.id=sv.post_id
          JOIN social_profiles p ON p.user_id=po.user_id AND p.deleted_at IS NULL
-         WHERE s.user_id=$1
-         ORDER BY s.created_at DESC LIMIT 100`,
+         WHERE sv.user_id=$1 AND ${VISIBLE_POUR_MOI}
+         ORDER BY sv.created_at DESC LIMIT 100`,
         [req.user.id]
       );
-      res.json(rows);
+      // Une publication dont l'audience ne m'inclut plus n'est plus rendue,
+      // même si je l'avais enregistrée.
+      const posts = media ? await media.attachToPosts(rows) : rows;
+      if (req.query.format === "page") return res.json({ posts, next_cursor: null });
+      res.json(posts);
     } catch (error) {
       res.status(500).json({ error: "Erreur chargement des enregistrements." });
     }
