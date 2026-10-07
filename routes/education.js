@@ -68,6 +68,7 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   });
   // Parcours d'inscription (routes/education-parcours.js), branché en fin de fichier.
   let parcours = null;
+  let documents = null;
 
   /* Rôle effectif dans le module. Les comptes d'administration d'une société
      (« admin », « direction »…, créés à l'inscription MaliLink) valent
@@ -1698,23 +1699,33 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   // Génération des bulletins d'une classe pour une période (calcul + rang)
   router.post("/report-cards/generate", requireRoles(STAFF_ROLES), async (req, res) => {
     try {
-      const { term_id, class_id } = req.body || {};
-      if (!term_id || !class_id) return res.status(400).json({ error: "term_id et class_id requis" });
+      const cid = schoolId(req);
+      const termId = Number(req.body?.term_id) || 0;
+      const classId = Number(req.body?.class_id) || 0;
+      if (!termId || !classId) return res.status(400).json({ error: "term_id et class_id requis" });
+      const terme = (await pool.query(
+        `SELECT t.id, t.label, t.start_date::text AS debut, t.end_date::text AS fin, y.label AS annee
+           FROM edu_terms t LEFT JOIN edu_school_years y ON y.id=t.school_year_id
+          WHERE t.id=$1 AND t.company_id=$2`, [termId, cid])).rows[0];
+      const classe = (await pool.query(`SELECT id, name FROM edu_classes WHERE id=$1 AND company_id=$2`, [classId, cid])).rows[0];
+      if (!terme || !classe) return res.status(404).json({ error: "Période ou classe introuvable." });
 
       const { rows: students } = await pool.query(
-        "SELECT * FROM edu_students WHERE class_id=$1 AND company_id=$2 AND status='actif'",
-        [class_id, schoolId(req)]
+        `SELECT * FROM edu_students WHERE class_id=$1 AND company_id=$2 AND status='actif' AND archived_at IS NULL`,
+        [classId, cid]
       );
       if (students.length === 0) return res.status(404).json({ error: "Aucun élève dans cette classe" });
 
       const results = [];
       for (const s of students) {
-        const avg = await computeStudentAverages(schoolId(req), s.id, Number(term_id));
+        const avg = await computeStudentAverages(cid, s.id, termId);
+        // Assiduité de la période (toute l'année si la période n'a pas de dates).
         const att = await pool.query(
           `SELECT COUNT(*) FILTER (WHERE status IN ('absent','absence_justifiee')) AS absences,
                   COUNT(*) FILTER (WHERE status='retard') AS retards
-           FROM edu_attendance WHERE student_id=$1`,
-          [s.id]
+             FROM edu_attendance WHERE student_id=$1 AND company_id=$2
+              AND ($3::date IS NULL OR attendance_date >= $3::date) AND ($4::date IS NULL OR attendance_date <= $4::date)`,
+          [s.id, cid, terme.debut, terme.fin]
         );
         results.push({
           student: s,
@@ -1725,27 +1736,79 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
         });
       }
 
-      results.sort((a, b) => (b.general_average || 0) - (a.general_average || 0));
+      // Rang : ex aequo partagent le même rang ; sans moyenne, pas de rang.
+      const notes = results.filter((r) => r.general_average != null).sort((a, b) => b.general_average - a.general_average);
+      notes.forEach((r, i) => { r.rank = i > 0 && r.general_average === notes[i - 1].general_average ? notes[i - 1].rank : i + 1; });
+      const moyennes = notes.map((r) => Number(r.general_average));
+      const moyenneClasse = moyennes.length ? Math.round((moyennes.reduce((a, b) => a + b, 0) / moyennes.length) * 100) / 100 : null;
+      // Statistiques de la classe par matière (moyenne, minimum, maximum).
+      const parMatiere = {};
+      for (const r of results) {
+        for (const d of r.details) {
+          if (d.subject_average == null) continue;
+          (parMatiere[d.subject_id] ||= []).push(Number(d.subject_average));
+        }
+      }
+      const arrondi = (v) => Math.round(v * 100) / 100;
+      const stats = {
+        plus_forte: moyennes.length ? Math.max(...moyennes) : null,
+        plus_faible: moyennes.length ? Math.min(...moyennes) : null,
+        matieres: Object.fromEntries(Object.entries(parMatiere).map(([id, v]) => [id, {
+          moyenne: arrondi(v.reduce((a, b) => a + b, 0) / v.length), min: Math.min(...v), max: Math.max(...v),
+        }])),
+      };
 
       let generated = 0;
-      for (let i = 0; i < results.length; i++) {
-        const r = results[i];
-        await pool.query(
+      for (const r of results) {
+        const { rows } = await pool.query(
           `INSERT INTO edu_report_cards
              (company_id, student_id, term_id, general_average, rank_in_class, class_size,
-              absences_count, late_count, details, generated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+              absences_count, late_count, details, generated_at, class_id, class_label, class_average, class_stats)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13)
            ON CONFLICT (student_id, term_id) DO UPDATE SET
-             general_average=$4, rank_in_class=$5, class_size=$6,
-             absences_count=$7, late_count=$8, details=$9, generated_at=NOW()`,
-          [schoolId(req), r.student.id, term_id, r.general_average, i + 1, results.length,
-           r.absences, r.retards, JSON.stringify(r.details)]
+             general_average=$4, rank_in_class=$5, class_size=$6, absences_count=$7, late_count=$8, details=$9,
+             generated_at=NOW(), class_id=$10, class_label=$11, class_average=$12, class_stats=$13
+           RETURNING id, company_id`,
+          [cid, r.student.id, termId, r.general_average, r.rank || null, results.length,
+           r.absences, r.retards, JSON.stringify(r.details), classId, classe.name, moyenneClasse, JSON.stringify(stats)]
         );
+        if (rows[0].company_id !== cid) continue; // bulletin d'un autre établissement : jamais touché
+        await emettreJetonBulletin(cid, rows[0].id, r.student.id, terme, classe.name, req.user.id);
         generated++;
       }
-      res.json({ ok: true, generated });
+      res.json({ ok: true, generated, class_average: moyenneClasse });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération bulletins" }); }
   });
+
+  /* Jeton de vérification d'un bulletin : créé une fois, conservé quand le
+     bulletin est régénéré (le QR déjà imprimé reste valable). */
+  async function emettreJetonBulletin(cid, reportCardId, studentId, terme, classeNom, userId) {
+    const existant = (await pool.query(
+      `SELECT id, reference FROM edu_document_verifications
+        WHERE company_id=$1 AND report_card_id=$2 AND doc_type='bulletin' AND status='valide'`, [cid, reportCardId])).rows[0];
+    if (existant) {
+      await pool.query(`UPDATE edu_document_verifications SET class_label=$2, school_year_label=$3 WHERE id=$1`,
+        [existant.id, classeNom, terme.annee || ""]);
+      await pool.query(`UPDATE edu_report_cards SET reference=$2 WHERE id=$1`, [reportCardId, existant.reference]);
+      return;
+    }
+    const an = new Date().getFullYear();
+    const seq = (await pool.query(
+      `INSERT INTO edu_document_counters (company_id, doc_type, year, last_seq) VALUES ($1,'bulletin',$2,1)
+       ON CONFLICT (company_id, doc_type, year) DO UPDATE SET last_seq = edu_document_counters.last_seq + 1 RETURNING last_seq`,
+      [cid, an])).rows[0].last_seq;
+    const etab = await parcours.etablissement(pool, cid);
+    const prefixe = (etab.short_name || etab.matricule_prefix || "BUL").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8) || "BUL";
+    const reference = `${prefixe}-B${an}-${String(seq).padStart(5, "0")}`;
+    await pool.query(
+      `INSERT INTO edu_document_verifications
+         (company_id, token, doc_type, student_id, report_card_id, reference, school_year_label, class_label, status, issued_by)
+       VALUES ($1,$2,'bulletin',$3,$4,$5,$6,$7,'valide',$8)
+       ON CONFLICT DO NOTHING`,
+      [cid, crypto.randomBytes(18).toString("base64url"), studentId, reportCardId, reference, terme.annee || "", classeNom, userId]
+    );
+    await pool.query(`UPDATE edu_report_cards SET reference=$2 WHERE id=$1`, [reportCardId, reference]);
+  }
 
   router.get("/students/:id/report-cards", async (req, res) => {
     try {
@@ -1810,82 +1873,8 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   });
 
   // Bulletin PDF (§16) — tableau des matières, moyenne, rang, mention, QR signé.
-  router.get("/report-cards/:id/pdf", reserveAuDossier("bulletin"), async (req, res) => {
-    try {
-      const rc = (await pool.query(
-        `SELECT rc.*, s.first_name, s.last_name, s.matricule AS student_matricule, s.gender,
-                c.name AS class_name, t.label AS term_label, y.label AS year_label
-           FROM edu_report_cards rc
-           JOIN edu_students s ON s.id=rc.student_id
-           LEFT JOIN edu_classes c ON c.id=s.class_id
-           JOIN edu_terms t ON t.id=rc.term_id
-           LEFT JOIN edu_school_years y ON y.id=t.school_year_id
-          WHERE rc.id=$1 AND rc.company_id=$2`,
-        [req.params.id, schoolId(req)]
-      )).rows[0];
-      if (!rc) return res.status(404).json({ error: "Bulletin introuvable" });
-      const school = (await pool.query(
-        `SELECT co.name, es.address, es.phone, es.director_name, es.logo_url
-           FROM companies co LEFT JOIN edu_schools es ON es.company_id=co.id WHERE co.id=$1 LIMIT 1`,
-        [schoolId(req)]
-      )).rows[0] || {};
-      let details = [];
-      try { details = Array.isArray(rc.details) ? rc.details : JSON.parse(rc.details || "[]"); } catch { details = []; }
-      const ref = `BUL-${rc.id}`;
-      const subjectRows = details.map((d) => {
-        const coef = Number(d.coefficient) || 0;
-        const avg = d.subject_average == null ? null : Number(d.subject_average);
-        return [
-          d.subject_name,
-          coef.toString(),
-          avg == null ? "—" : avg.toFixed(2),
-          avg == null ? "—" : (avg * coef).toFixed(2),
-          avg == null ? "—" : mention(avg),
-        ];
-      });
-      const totalCoef = details.reduce((s, d) => s + (Number(d.coefficient) || 0), 0);
-      const totalPts = details.reduce((s, d) => s + (d.subject_average == null ? 0 : Number(d.subject_average) * (Number(d.coefficient) || 0)), 0);
-      await edupdf.renderDocument(res, {
-        filename: `bulletin-${rc.student_matricule || rc.id}`,
-        title: "Bulletin de notes",
-        subtitle: `${rc.term_label || ""}${rc.year_label ? " · " + rc.year_label : ""}`,
-        reference: ref,
-        qrText: edupdf.docToken("BULLETIN", ref),
-        school,
-        sections: [
-          { title: "Élève", rows: [
-            { label: "Nom complet", value: `${rc.first_name} ${rc.last_name}` },
-            { label: "Matricule", value: rc.student_matricule },
-            { label: "Classe", value: rc.class_name || "—" },
-          ] },
-          { title: "Résultats par matière", table: {
-            columns: [
-              { label: "Matière", width: 200 },
-              { label: "Coef", width: 45, align: "center" },
-              { label: "Moy./20", width: 70, align: "center" },
-              { label: "Moy×Coef", width: 80, align: "center" },
-              { label: "Mention", width: 110 },
-            ],
-            rows: [
-              ...subjectRows,
-              ["TOTAL", totalCoef.toString(), "", totalPts.toFixed(2), ""],
-            ],
-          } },
-          { title: "Synthèse", rows: [
-            { label: "Moyenne générale", value: rc.general_average == null ? "—" : `${Number(rc.general_average).toFixed(2)}/20` },
-            { label: "Mention", value: mention(rc.general_average) },
-            { label: "Rang", value: rc.rank_in_class ? `${rc.rank_in_class}ᵉ / ${rc.class_size}` : "—" },
-            { label: "Absences", value: String(rc.absences_count ?? 0) },
-            { label: "Retards", value: String(rc.late_count ?? 0) },
-            { label: "Conduite", value: rc.conduct || "—" },
-            { label: "Appréciation", value: rc.appreciation || "—" },
-            { label: "Décision du conseil", value: rc.council_decision || "—" },
-          ] },
-        ],
-        footerNote: `Bulletin généré par MaliLink Éducation le ${new Date().toLocaleDateString("fr-FR")}. Authenticité vérifiable par le QR code.`,
-      });
-    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur génération du bulletin PDF" }); }
-  });
+  // Bulletin PDF (modèle choisi dans les paramètres, QR de vérification).
+  router.get("/report-cards/:id/pdf", reserveAuDossier("bulletin"), (req, res) => documents.envoyerBulletin(req, res));
 
   // ---------- PAIEMENTS SCOLAIRES ----------
 
@@ -2422,6 +2411,10 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
   parcours = require("./education-parcours")(router, {
     pool, schoolId, requireRoles, STAFF_ROLES, MONEY_ROLES, edupdf,
     nextEnrollmentRef, nextReceiptRef, recomputeFeePlan, buildInstallments, assertStudentAccess,
+  });
+  // Cartes scolaires et bulletins (modèles, PDF, aperçus).
+  documents = require("./education-documents")(router, {
+    pool, schoolId, requireRoles, STAFF_ROLES, GRADE_ROLES, assertStudentAccess, teacherClassIds, parcours,
   });
 
   return router;

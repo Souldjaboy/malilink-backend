@@ -122,10 +122,12 @@ const televersementImage = multer({
 
 /* Range une image reçue (type lu dans le fichier) dans le dossier privé. */
 function rangerImage(fichierTemporaire, type, companyId) {
+  // JPEG ou PNG seulement : ces images sont imprimées sur la carte, le
+  // bulletin et les reçus (le format WebP ne passe pas dans un PDF).
   const ext = detecterImage(fichierTemporaire);
-  if (!ext) {
+  if (!ext || ext === "webp") {
     fs.promises.unlink(fichierTemporaire).catch(() => {});
-    const e = new Error("Image refusée : JPEG, PNG ou WebP uniquement.");
+    const e = new Error("Image refusée : JPEG ou PNG uniquement (PNG à fond transparent conseillé pour le logo, la signature et le cachet).");
     e.status = 415;
     throw e;
   }
@@ -190,7 +192,7 @@ function verificationPublique(pool) {
           WHERE v.token = $1`, [token]);
       const v = rows[0];
       if (!v) return res.status(404).json(inconnu);
-      pool.query(`UPDATE edu_document_verifications SET last_checked_at=NOW(), checks_count=checks_count+1 WHERE id=$1`, [v.id]).catch(() => {});
+      await pool.query(`UPDATE edu_document_verifications SET last_checked_at=NOW(), checks_count=checks_count+1 WHERE id=$1`, [v.id]).catch(() => {});
       const aujourdhui = new Date().toISOString().slice(0, 10);
       const statut = v.status !== "valide" ? v.status : v.valid_until && v.valid_until < aujourdhui ? "expire" : "valide";
       res.json({
@@ -321,12 +323,19 @@ module.exports = function registerParcoursRoutes(router, ctx) {
       const modeleCarte = MODELES_CARTE.includes(b.card_template) ? b.card_template : "academique";
       const modeleBulletin = MODELES_BULLETIN.includes(b.report_template) ? b.report_template : "institutionnel";
       const options = (o, cles) => Object.fromEntries(cles.filter((c) => o && typeof o[c] === "boolean").map((c) => [c, o[c]]));
+      // Couleurs propres à un modèle (sinon celles de l'établissement).
+      const couleurs = (o) => Object.fromEntries(["couleur_principale", "couleur_secondaire"]
+        .filter((c) => /^#[0-9A-Fa-f]{6}$/.test(String(o?.[c] || ""))).map((c) => [c, o[c]]));
       const carteOptions = {
-        ...options(b.card_options, ["afficher_photo", "afficher_niveau", "afficher_naissance", "afficher_signature", "afficher_slogan", "afficher_tuteur"]),
+        ...options(b.card_options, ["afficher_logo", "afficher_photo", "afficher_niveau", "afficher_naissance", "afficher_signature", "afficher_slogan"]),
+        ...couleurs(b.card_options),
         orientation: b.card_options?.orientation === "portrait" ? "portrait" : "paysage",
       };
-      const bulletinOptions = options(b.report_options,
-        ["afficher_logo", "afficher_photo", "afficher_rang", "afficher_moyenne_classe", "afficher_appreciations", "afficher_signature", "afficher_cachet"]);
+      const bulletinOptions = {
+        ...options(b.report_options,
+          ["afficher_logo", "afficher_photo", "afficher_rang", "afficher_moyenne_classe", "afficher_appreciations", "afficher_signature", "afficher_cachet"]),
+        ...couleurs(b.report_options),
+      };
       const { rows } = await pool.query(
         `INSERT INTO edu_schools (company_id, school_type, grading_system, grade_max, director_name, address, phone,
             official_name, short_name, slogan, whatsapp, email, website, color_primary, color_secondary,
@@ -1101,11 +1110,15 @@ module.exports = function registerParcoursRoutes(router, ctx) {
     }
   });
 
-  return { etablissement, urlFichier, synchroniserInscription, ecrireCompta, genererMatricule, verifierReferences, MODES_PAIEMENT, publicBaseUrl };
+  return {
+    etablissement, urlFichier, synchroniserInscription, ecrireCompta, genererMatricule, verifierReferences, MODES_PAIEMENT,
+    publicBaseUrl, emettreCarte, carteValide, urlVerification,
+  };
 };
 
 module.exports.serveFichier = serveFichier;
 module.exports.verificationPublique = verificationPublique;
+module.exports.urlVerification = urlVerification;
 module.exports.JETON_DOCUMENT = JETON_DOCUMENT;
 module.exports.urlFichier = urlFichier;
 module.exports.cheminFichier = cheminFichier;
