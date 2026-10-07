@@ -1,0 +1,17 @@
+# /etc/systemd/system/livekit.service
+[Unit]
+Description=LiveKit (appels MaliLink Social)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/livekit-server --config /etc/livekit/livekit.yaml
+Restart=on-failure
+RestartSec=5
+User=livekit
+Group=livekit
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

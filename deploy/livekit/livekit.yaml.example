@@ -1,0 +1,18 @@
+# LiveKit — serveur média des appels MaliLink Social (un seul nœud).
+# Copier vers /etc/livekit/livekit.yaml (droits 600) APRÈS que
+# rtc.malilinkglobal.com résout vers 72.62.232.24.
+port: 7880                 # signalisation (WebSocket), derrière Nginx en TLS
+bind_addresses:
+  - 127.0.0.1
+rtc:
+  tcp_port: 7881           # média en TCP (réseaux qui bloquent l'UDP)
+  udp_port: 7882           # média en UDP, un seul port multiplexé
+  use_external_ip: true    # annonce l'IP publique du serveur
+keys:
+  # Générer : livekit-server generate-keys  (ne jamais commiter la vraie clé)
+  CLE_API_A_REMPLACER: SECRET_API_A_REMPLACER_32_CARACTERES_MINIMUM
+room:
+  empty_timeout: 60        # salle fermée 60 s après le départ du dernier participant
+  max_participants: 2      # appels à deux
+logging:
+  level: info
