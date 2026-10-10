@@ -86,6 +86,7 @@ app.use((req, res, next) => {
 });
 
 const { sensitiveRoutesRateLimit } = require("./middleware/rateLimit");
+const courriel = require("./services/courriel");
 app.use(sensitiveRoutesRateLimit);
 
 app.use(requireTenant);
@@ -966,6 +967,29 @@ function getUserCompanyId(req) {
   return req.user?.company_id || null;
 }
 
+/* Révocation des sessions : un jeton émis avant users.tokens_valid_after
+   est refusé. Lecture mise en cache 30 s par utilisateur. */
+const cacheRevocation = new Map();
+async function sessionRevoquee(user) {
+  if (!user?.id || !user.iat) return false;
+  const now = Date.now();
+  let entree = cacheRevocation.get(user.id);
+  if (!entree || now - entree.at > 30000) {
+    try {
+      const { rows } = await pool.query("SELECT tokens_valid_after FROM users WHERE id=$1", [user.id]);
+      entree = { at: now, apres: rows[0]?.tokens_valid_after ? new Date(rows[0].tokens_valid_after).getTime() : 0 };
+    } catch {
+      entree = { at: now, apres: 0 };
+    }
+    cacheRevocation.set(user.id, entree);
+    if (cacheRevocation.size > 5000) cacheRevocation.delete(cacheRevocation.keys().next().value);
+  }
+  return entree.apres > 0 && user.iat < Math.floor(entree.apres / 1000);
+}
+function revoquerSessions(userId) {
+  cacheRevocation.delete(Number(userId));
+}
+
 async function authenticateToken(req, res, next) {
   const token = getAuthTokenFromRequest(req);
   if (!token) {
@@ -978,6 +1002,11 @@ async function authenticateToken(req, res, next) {
     const user = jwt.verify(token, JWT_SECRET);
     const requestTenant = getTenantFromRequest(req);
     const tokenTenant = normalizeTenantId(user.tenant_id);
+
+    // Sessions révoquées (réinitialisation du mot de passe, changement d'email).
+    if (await sessionRevoquee(user)) {
+      return res.status(401).json({ error: "Session expirée : reconnectez-vous.", code: "session_revoquee" });
+    }
 
     if (tokenTenant && tokenTenant !== requestTenant) {
       return res.status(403).json({
@@ -1065,6 +1094,48 @@ async function logAudit(req, action, entityType = "", entityId = null, details =
   }
 }
 
+/* Mot de passe temporaire : généré par le serveur, haché comme tous les
+   mots de passe, changement obligatoire à la connexion, sessions en cours
+   révoquées. L'ancien mot de passe n'est jamais lu ni affiché.
+   companyId (facultatif) limite la cible à une entreprise. */
+async function reinitialiserMotDePasseTemporaire(req, { userId, companyId = null, envoyerEmail = false }) {
+  const tenant = getTenantFromRequest(req);
+  const prefixe = tenant === "malilink" ? "MaliLink" : tenant === "hafiya" ? "Hafiya" : "Triangle";
+  const temporaire = `${prefixe}-${crypto.randomBytes(3).toString("hex")}-${crypto.randomBytes(3).toString("hex").toUpperCase()}9`;
+  const result = await pool.query(
+    `UPDATE users
+        SET password=$1, force_password_change=true, tokens_valid_after=NOW(), updated_at=CURRENT_TIMESTAMP
+      WHERE id=$2 ${companyId ? "AND company_id=$3" : ""}
+      RETURNING id, fullname, email, role, company_id`,
+    companyId ? [await hashPassword(temporaire), Number(userId), Number(companyId)] : [await hashPassword(temporaire), Number(userId)]
+  );
+  const cible = result.rows[0];
+  if (!cible) return null;
+  revoquerSessions(cible.id);
+  // Journal rattaché à l'entreprise du compte (le Super Admin n'en a pas).
+  await logAudit({ ...req, headers: req.headers, user: { ...req.user, company_id: cible.company_id } }, "reset_password", "user", cible.id,
+    { target_email: courriel.masquer(cible.email), sessions_revoquees: true });
+
+  let email_sent = false;
+  let email_message = "Mot de passe temporaire créé : communiquez-le à la personne par un canal sûr.";
+  if (envoyerEmail && cible.email && !String(cible.email).includes("@pending.")) {
+    const id = courriel.identite(tenant);
+    const texte = `Bonjour ${cible.fullname || ""},\n\nVotre mot de passe ${id.nom} a été réinitialisé par un administrateur.\nMot de passe temporaire : ${temporaire}\n\nConnectez-vous sur ${id.url}/login : un nouveau mot de passe vous sera demandé.`;
+    const html = `<p>Bonjour ${escapeHtml(cible.fullname || "")},</p><p>Votre mot de passe ${escapeHtml(id.nom)} a été réinitialisé par un administrateur.</p>
+      <p>Mot de passe temporaire : <strong style="font-size:18px">${escapeHtml(temporaire)}</strong></p>
+      <p>Connectez-vous sur <a href="${escapeHtml(id.url)}/login">${escapeHtml(id.url)}</a> : un nouveau mot de passe vous sera demandé.</p>`;
+    const r = await courriel.envoyerCourriel(pool, {
+      to: cible.email, sujet: `${id.nom} — réinitialisation de votre mot de passe`, texte, html, tenant,
+      but: "mot_de_passe_temporaire", userId: cible.id, companyId: cible.company_id,
+    });
+    email_sent = r.accepte;
+    email_message = r.accepte
+      ? `Email envoyé à ${courriel.masquer(cible.email)} (accepté par le serveur d'envoi).`
+      : `Email non envoyé (${r.raison}) : communiquez le mot de passe temporaire par un canal sûr.`;
+  }
+  return { user: cible, temporary_password: temporaire, email_sent, email_message };
+}
+
 function generateOtpCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
@@ -1083,11 +1154,13 @@ function supportWhatsAppUrl() {
   return `https://wa.me/${number}?text=${text}`;
 }
 
-function publicAppUrl() {
+function publicAppUrl(tenant) {
+  // URL publique du produit de la requête (MaliLink : PUBLIC_BASE_URL).
+  if (tenant) return courriel.identite(tenant).url;
   return String(process.env.APP_URL || process.env.PUBLIC_BASE_URL || process.env.FRONTEND_URL || "https://trianglewmspro.com").replace(/\/$/, "");
 }
 
-async function createVerificationCode({ companyId, userId, targetType, targetValue, db = pool }) {
+async function createVerificationCode({ companyId, userId, targetType, targetValue, db = pool, tenant }) {
   const code = generateOtpCode();
   const token = crypto.randomBytes(24).toString("hex");
   const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
@@ -1113,102 +1186,64 @@ async function createVerificationCode({ companyId, userId, targetType, targetVal
   return {
     code,
     token,
-    verify_url: `${publicAppUrl()}/verify-${targetType}?token=${token}`
+    verify_url: `${publicAppUrl(tenant)}/verify-${targetType}?token=${token}`
   };
 }
 
-async function sendVerificationMessage({ targetType, targetValue, code, verifyUrl }) {
+/* Envoi d'un code de vérification. `sent` n'est vrai que si le serveur SMTP
+   a ACCEPTÉ le message ; la réception n'est prouvée que par la saisie du code. */
+async function sendVerificationMessage({ targetType, targetValue, code, verifyUrl, tenant, userId, companyId }) {
   if (targetType === "email") {
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return {
-        sent: false,
-        provider: "smtp",
-        message: "SMTP non configuré. Configurez SMTP pour envoyer le code OTP réel."
-      };
-    }
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
+    const id = courriel.identite(tenant);
+    const { texte, html } = courriel.modeleCode({
+      tenant, titre: "Vérification de votre adresse email",
+      intro: `Saisissez ce code sur ${id.nom} pour confirmer que cette adresse vous appartient.`,
+      code, minutes: 10, lien: verifyUrl, libelleLien: "Confirmer mon adresse",
     });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: targetValue,
-      subject: "Code de vérification Triangle WMS Pro",
-      text: `Votre code de vérification Triangle WMS Pro est : ${code}. Il expire dans 10 minutes.\n\nLien sécurisé : ${verifyUrl}`,
-      html: `
-        <div style="font-family:Arial,sans-serif;color:#111">
-          <h2>Vérification Triangle WMS Pro</h2>
-          <p>Votre code de vérification est :</p>
-          <p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p>
-          <p>Ce code expire dans 10 minutes.</p>
-          <p><a href="${escapeHtml(verifyUrl)}">Valider directement mon compte</a></p>
-        </div>
-      `
+    const r = await courriel.envoyerCourriel(pool, {
+      to: targetValue, sujet: `${id.nom} — votre code de vérification`, texte, html, tenant, but: "verification_email", userId, companyId,
     });
-
-    return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code OTP envoyé par email." };
+    return {
+      sent: r.accepte, statut: r.statut, provider: process.env.EMAIL_PROVIDER || "smtp", raison: r.raison || "",
+      message: r.accepte
+        ? `Code envoyé à ${courriel.masquer(targetValue)} (accepté par le serveur d'envoi).`
+        : `Le code n'a pas pu être envoyé : ${r.raison}.`
+    };
   }
 
   if ((process.env.SMS_PROVIDER || "sandbox") === "sandbox" || !process.env.SMS_API_KEY) {
     return {
       sent: false,
+      statut: "non_configure",
       provider: process.env.SMS_PROVIDER || "sms",
-      message: "Provider SMS non configuré. Configurez Twilio, Africa's Talking, Orange API ou MTN API."
+      message: "Envoi par SMS non configuré : utilisez l'adresse email ou contactez le support."
     };
   }
 
-  console.log("SMS OTP prêt à envoyer :", { targetValue });
-  return { sent: false, provider: process.env.SMS_PROVIDER, message: "Provider SMS préparé." };
+  console.log("SMS OTP prêt à envoyer :", { targetValue: courriel.masquer(targetValue) });
+  return { sent: false, statut: "non_configure", provider: process.env.SMS_PROVIDER, message: "Envoi par SMS non disponible." };
 }
 
-async function sendPasswordResetMessage({ targetType, targetValue, code, resetUrl }) {
+async function sendPasswordResetMessage({ targetType, targetValue, code, resetUrl, tenant, userId, companyId }) {
   if (targetType === "email") {
-    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      return {
-        sent: false,
-        provider: "smtp",
-        message: "SMTP non configuré. Configurez SMTP pour envoyer le code de réinitialisation."
-      };
-    }
-
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
+    const id = courriel.identite(tenant);
+    const { texte, html } = courriel.modeleCode({
+      tenant, titre: "Réinitialisation de votre mot de passe",
+      intro: `Une réinitialisation du mot de passe de votre compte ${id.nom} a été demandée.`,
+      code, minutes: 15, lien: resetUrl, libelleLien: "Choisir un nouveau mot de passe",
     });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: targetValue,
-      subject: "Réinitialisation mot de passe Triangle WMS Pro",
-      text: `Votre code de réinitialisation Triangle WMS Pro est : ${code}. Il expire dans 15 minutes.\n\nLien sécurisé : ${resetUrl}`,
-      html: `
-        <div style="font-family:Arial,sans-serif;color:#111">
-          <h2>Réinitialisation mot de passe</h2>
-          <p>Votre code de réinitialisation est :</p>
-          <p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p>
-          <p>Ce code expire dans 15 minutes.</p>
-          <p><a href="${escapeHtml(resetUrl)}">Créer un nouveau mot de passe</a></p>
-        </div>
-      `
+    const r = await courriel.envoyerCourriel(pool, {
+      to: targetValue, sujet: `${id.nom} — réinitialisation du mot de passe`, texte, html, tenant, but: "reinitialisation_mot_de_passe", userId, companyId,
     });
-
-    return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code envoyé par email." };
+    return {
+      sent: r.accepte, statut: r.statut, provider: process.env.EMAIL_PROVIDER || "smtp", raison: r.raison || "",
+      message: r.accepte ? "Code envoyé par email (accepté par le serveur d'envoi)." : `L'email n'a pas pu être envoyé : ${r.raison}.`
+    };
   }
 
   return {
     sent: false,
+    statut: "non_configure",
     provider: process.env.SMS_PROVIDER || "sms",
     message: "SMS/WhatsApp non configuré. Utilisez un email ou configurez un provider SMS."
   };
@@ -2494,7 +2529,8 @@ app.post("/register-saas", async (req, res) => {
         userId: user.id,
         targetType,
         targetValue,
-        db: registrationClient
+        db: registrationClient,
+        tenant: registrationTenant
       });
     }
 
@@ -2540,7 +2576,10 @@ app.post("/register-saas", async (req, res) => {
         targetType,
         targetValue,
         code: verification.code,
-        verifyUrl: verification.verify_url
+        verifyUrl: verification.verify_url,
+        tenant: registrationTenant,
+        userId: user.id,
+        companyId: company.id
       });
     }
 
@@ -2558,8 +2597,8 @@ app.post("/register-saas", async (req, res) => {
             required: true,
             target_type: targetType,
             target_value: targetValue,
-            delivery,
-            verify_url: verification.verify_url
+            // Jamais le lien ni le code : seule la boîte email les reçoit.
+            delivery: { sent: delivery?.sent === true, statut: delivery?.statut || "", message: delivery?.message || "" }
           }
     });
   } catch (error) {
@@ -2644,17 +2683,23 @@ app.post("/password-reset/request", async (req, res) => {
       [user.id, user.company_id || null, targetType, targetValue, codeHash, tokenHash]
     );
 
-    const resetUrl = `${publicAppUrl()}/mot-de-passe-oublie?token=${token}`;
+    const resetUrl = `${publicAppUrl(getTenantFromRequest(req))}/mot-de-passe-oublie?token=${token}`;
     const delivery = await sendPasswordResetMessage({
       targetType,
       targetValue,
       code,
-      resetUrl
+      resetUrl,
+      tenant: getTenantFromRequest(req),
+      userId: user.id,
+      companyId: user.company_id
     });
 
     if (!delivery.sent) {
+      // Code inutilisable s'il n'a pas pu partir : on l'annule.
+      await pool.query("UPDATE password_reset_codes SET used_at=NOW() WHERE id=$1", [created.rows[0].id]).catch(() => {});
       return res.status(503).json({
-        error: delivery.message,
+        error: `${delivery.message} Contactez le support pour récupérer votre compte.`,
+        envoi: delivery.statut,
         provider: delivery.provider
       });
     }
@@ -2669,10 +2714,9 @@ app.post("/password-reset/request", async (req, res) => {
 
     res.json({
       success: true,
-      message: delivery.message || genericMessage,
-      target_type: targetType,
-      target_value: targetValue,
-      token_hint: token ? "" : undefined
+      envoi: delivery.statut,
+      message: `${genericMessage} Le serveur d'envoi a accepté le message ; vérifiez aussi vos courriers indésirables.`,
+      target_type: targetType
     });
   } catch (error) {
     console.error("ERREUR PASSWORD RESET REQUEST :", error);
@@ -2828,6 +2872,7 @@ app.post("/login", async (req, res) => {
         c.account_status AS company_account_status,
         c.email_verified AS company_email_verified,
         c.phone_verified AS company_phone_verified,
+        c.admin_validated_at AS company_admin_validated_at,
         c.business_type AS business_type,
         c.trial_end_date AS company_trial_end_date,
         c.subscription_expires_at AS company_subscription_expires_at,
@@ -2891,6 +2936,7 @@ const SELECT_UTILISATEUR_CONNEXION = `SELECT
         c.account_status AS company_account_status,
         c.email_verified AS company_email_verified,
         c.phone_verified AS company_phone_verified,
+        c.admin_validated_at AS company_admin_validated_at,
         c.business_type AS business_type,
         c.trial_end_date AS company_trial_end_date,
         c.subscription_expires_at AS company_subscription_expires_at,
@@ -2931,12 +2977,16 @@ async function finaliserConnexion(req, res, user, methode) {
     // Comptes sans entreprise (client, livreur) : pas de vérification
     // entreprise à exiger.
     const hasNoCompany = !user.company_id;
-    const userVerified = user.email_verified === true || user.phone_verified === true;
+    /* Validation administrative (Super Admin, journalisée) : elle ouvre la
+       connexion SANS prétendre que l'email a été prouvé — email_verified
+       reste tel quel et seule la saisie d'un code le passe à vrai. */
+    const userVerified = user.email_verified === true || user.phone_verified === true || Boolean(user.admin_validated_at);
     const companyVerified =
       isCustomerAccount ||
       hasNoCompany ||
       user.company_email_verified === true ||
-      user.company_phone_verified === true;
+      user.company_phone_verified === true ||
+      Boolean(user.company_admin_validated_at);
     const accountPending =
       String(user.account_status || "").toLowerCase() === "pending_verification" ||
       (!isCustomerAccount && !hasNoCompany && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
@@ -3381,8 +3431,8 @@ app.post("/verification/verify", async (req, res) => {
         filter += ` AND target_type=$${values.length}`;
       }
       if (target_value) {
-        values.push(target_value);
-        filter += ` AND target_value=$${values.length}`;
+        values.push(String(target_value).trim());
+        filter += ` AND LOWER(target_value)=LOWER($${values.length})`;
       }
       if (user_id) {
         values.push(Number(user_id));
@@ -3457,22 +3507,35 @@ app.post("/verification/verify", async (req, res) => {
   }
 });
 
+/* Renvoi d'un code de vérification.
+   - le contact doit correspondre au compte (pas d'envoi vers un compte
+     désigné seulement par son identifiant) ;
+   - 60 s minimum entre deux codes, 5 codes par heure et par compte ;
+   - réponse exacte : code envoyé (accepté par le serveur SMTP) ou non
+     envoyé, avec la raison ; un code non envoyé est aussitôt annulé ;
+   - compte inconnu : réponse neutre (pas d'énumération des adresses). */
 app.post("/verification/resend", async (req, res) => {
   try {
-    const { target_type, target_value, user_id } = req.body;
+    const { target_type, target_value, user_id } = req.body || {};
     const targetType = target_type === "phone" ? "phone" : "email";
     const targetValue = String(target_value || "").trim();
+    const neutre = {
+      success: true,
+      envoi: "indetermine",
+      message: "Si un compte non vérifié correspond à ce contact, un nouveau code vient de lui être envoyé."
+    };
 
-    if (!targetValue && !user_id) {
-      return res.status(400).json({ error: "Contact ou utilisateur obligatoire." });
+    if (!targetValue) {
+      return res.status(400).json({ error: targetType === "email" ? "Indiquez votre adresse email." : "Indiquez votre numéro de téléphone." });
     }
 
     const userResult = await pool.query(
-      `SELECT id, company_id, email, phone
+      `SELECT id, company_id, email, phone, email_verified, phone_verified, account_status, verification_required
        FROM users
-       WHERE ($1::int IS NOT NULL AND id=$1)
-          OR ($2 <> '' AND LOWER(email)=LOWER($2))
-          OR ($3 <> '' AND regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g') = regexp_replace($3, '[^0-9+]', '', 'g'))
+       WHERE (($2 <> '' AND LOWER(email)=LOWER($2))
+          OR ($3 <> '' AND regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g') = regexp_replace($3, '[^0-9+]', '', 'g')))
+         AND ($1::int IS NULL OR id=$1)
+       ORDER BY id DESC
        LIMIT 1`,
       [
         optionalNumber(user_id),
@@ -3482,31 +3545,77 @@ app.post("/verification/resend", async (req, res) => {
     );
 
     const user = userResult.rows[0];
-    if (!user) return res.status(404).json({ error: "Utilisateur introuvable." });
+    if (!user) return res.json(neutre);
 
+    const dejaVerifie = (targetType === "email" ? user.email_verified === true : user.phone_verified === true)
+      && user.verification_required !== true
+      && String(user.account_status || "").toLowerCase() !== "pending_verification";
+    if (dejaVerifie) {
+      return res.json({ success: true, envoi: "inutile", deja_verifie: true, message: "Ce contact est déjà vérifié : vous pouvez vous connecter." });
+    }
+
+    const recents = (await pool.query(
+      `SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')::int AS heure,
+              EXTRACT(EPOCH FROM (NOW() - MAX(created_at)))::int AS depuis
+         FROM verification_codes WHERE user_id=$1 AND target_type=$2`,
+      [user.id, targetType]
+    )).rows[0];
+    if (recents.depuis !== null && recents.depuis < 60) {
+      const attente = 60 - recents.depuis;
+      res.set("Retry-After", String(attente));
+      return res.status(429).json({ error: `Un code vient d'être envoyé. Patientez ${attente} s avant d'en demander un autre.`, retry_after: attente });
+    }
+    if (recents.heure >= 5) {
+      return res.status(429).json({ error: "Trop de codes demandés en une heure. Réessayez plus tard ou contactez le support MaliLink." });
+    }
+
+    const tenant = getTenantFromRequest(req);
     const finalTargetValue = targetType === "phone" ? user.phone : user.email;
     const verification = await createVerificationCode({
       companyId: user.company_id,
       userId: user.id,
       targetType,
-      targetValue: finalTargetValue
+      targetValue: finalTargetValue,
+      tenant
     });
     const delivery = await sendVerificationMessage({
       targetType,
       targetValue: finalTargetValue,
       code: verification.code,
-      verifyUrl: verification.verify_url
+      verifyUrl: verification.verify_url,
+      tenant,
+      userId: user.id,
+      companyId: user.company_id
     });
+
+    await logAudit(
+      { ...req, user: { id: user.id, company_id: user.company_id, role: "verification" } },
+      "verification_code_resent",
+      "user",
+      user.id,
+      { target_type: targetType, envoi: delivery.statut }
+    );
+
+    if (!delivery.sent) {
+      // Un code que personne n'a reçu ne doit pas rester valable.
+      await pool.query(
+        "UPDATE verification_codes SET used_at=NOW() WHERE user_id=$1 AND target_type=$2 AND used_at IS NULL",
+        [user.id, targetType]
+      );
+      return res.status(503).json({
+        success: false,
+        envoi: delivery.statut,
+        error: `Le code n'a pas pu être envoyé (${delivery.raison || delivery.message}). Réessayez plus tard ou contactez le support MaliLink.`
+      });
+    }
 
     res.json({
       success: true,
-      message: "Nouveau code généré.",
-      target_type: targetType,
-      target_value: finalTargetValue,
-      delivery
+      envoi: "accepte",
+      message: `Nouveau code envoyé à ${courriel.masquer(finalTargetValue)}. Le serveur d'envoi l'a accepté ; s'il n'arrive pas, vérifiez vos courriers indésirables. Il expire dans 10 minutes.`
     });
   } catch (error) {
-    console.error("ERREUR RESEND VERIFICATION :", error);
+    console.error("ERREUR RESEND VERIFICATION :", error.message);
     res.status(500).json({ error: "Erreur renvoi code" });
   }
 });
@@ -3950,77 +4059,22 @@ app.post(
       if (!canAccessAdminSettings(req.user)) {
         return res.status(403).json({ error: "Accès administrateur requis." });
       }
-
-      const tempPassword = `Triangle-${crypto.randomBytes(4).toString("hex")}-2026`;
-      const hashedPassword = await hashPassword(tempPassword);
       const companyId = getEffectiveCompanyId(req, req.user.company_id);
       const isSuperAdmin = isSuperAdminUser(req.user);
-
-      const result = await pool.query(
-        `UPDATE users
-         SET password=$1,
-             force_password_change=true,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2
-         ${isSuperAdmin ? "" : "AND company_id=$3"}
-         RETURNING id, fullname, email, role, company_id`,
-        isSuperAdmin ? [hashedPassword, req.params.id] : [hashedPassword, req.params.id, companyId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Utilisateur introuvable" });
-      }
-
-      await logAudit(
-        req,
-        "reset_password",
-        "user",
-        req.params.id,
-        { target_email: result.rows[0].email }
-      );
-
-      let email_sent = false;
-      let email_message = "SMTP non configuré : communiquez le mot de passe temporaire manuellement.";
-
-      if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && result.rows[0].email) {
-        try {
-          const transporter = nodemailer.createTransport({
-            host: process.env.SMTP_HOST,
-            port: Number(process.env.SMTP_PORT || 587),
-            secure: Number(process.env.SMTP_PORT || 587) === 465,
-            auth: {
-              user: process.env.SMTP_USER,
-              pass: process.env.SMTP_PASS
-            }
-          });
-
-          await transporter.sendMail({
-            from: process.env.SMTP_FROM || process.env.SMTP_USER,
-            to: result.rows[0].email,
-            subject: "Réinitialisation mot de passe Triangle WMS Pro",
-            html: `
-              <p>Bonjour ${result.rows[0].fullname || ""},</p>
-              <p>Votre mot de passe temporaire Triangle WMS Pro est :</p>
-              <p style="font-size:18px;font-weight:bold">${tempPassword}</p>
-              <p>Connectez-vous puis modifiez votre mot de passe.</p>
-            `
-          });
-          email_sent = true;
-          email_message = "Email de réinitialisation envoyé.";
-        } catch (mailError) {
-          console.error("ERREUR EMAIL RESET PASSWORD :", mailError);
-          email_message = "SMTP configuré mais l’envoi email a échoué.";
-        }
-      }
-
+      const r = await reinitialiserMotDePasseTemporaire(req, {
+        userId: req.params.id,
+        companyId: isSuperAdmin ? null : companyId,
+        envoyerEmail: true
+      });
+      if (!r) return res.status(404).json({ error: "Utilisateur introuvable" });
       res.json({
-        message: email_message,
-        user: result.rows[0],
-        temporary_password: tempPassword,
-        email_sent
+        message: r.email_message,
+        user: r.user,
+        temporary_password: r.temporary_password,
+        email_sent: r.email_sent
       });
     } catch (error) {
-      console.error("ERREUR RESET PASSWORD :", error);
+      console.error("ERREUR RESET PASSWORD :", error.message);
       res.status(500).json({ error: "Erreur réinitialisation mot de passe" });
     }
   }
@@ -10527,13 +10581,16 @@ app.post("/marketplace/customers/register", async (req, res) => {
       companyId: null,
       userId: user.id,
       targetType,
-      targetValue
+      targetValue,
+      tenant: getTenantFromRequest(req)
     });
     const delivery = await sendVerificationMessage({
       targetType,
       targetValue,
       code: verification.code,
-      verifyUrl: verification.verify_url
+      verifyUrl: verification.verify_url,
+      tenant: getTenantFromRequest(req),
+      userId: user.id
     });
 
     res.status(201).json({
@@ -19123,6 +19180,12 @@ app.use(
   })
 );
 
+// Super Admin › Entreprises › Modifier (+ confirmation publique d'un changement d'email).
+const superAdminEntreprises = require("./routes/super-admin-entreprises")({
+  pool, authenticateToken, logAudit, reinitialiserMotDePasseTemporaire, getTenantFromRequest, revoquerSessions
+});
+app.use("/super-admin/entreprises", superAdminEntreprises.router);
+app.use("/comptes", superAdminEntreprises.publique);
 app.use("/education/learning", requireCompanyModule("education"), require("./routes/education-learning")({
   pool,
   authenticateToken,

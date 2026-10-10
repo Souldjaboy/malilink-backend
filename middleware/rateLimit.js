@@ -132,6 +132,7 @@ const SENSITIVE_PREFIXES = [
   "/client/register",
   "/password-reset",
   "/verification",
+  "/comptes",
   "/auth/social",
   "/support/contact"
 ];
