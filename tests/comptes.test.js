@@ -17,6 +17,8 @@ const { q, appel, jeton, verifier, section, creerSociete, terminer, BASE } = req
 const SMTP = Boolean(process.env.SMTP_HOST);
 const MAILPIT = "http://127.0.0.1:8025/api/v1";
 const JOURNAL_SERVEUR = `/tmp/malilink_comptes-serveur.log`;
+// Sauvegardes « état avant » du script VPS dans un dossier temporaire, pas dans le dépôt.
+const ENV_SCRIPT = { ...process.env, MALILINK_SAUVEGARDES: fs.mkdtempSync(path.join(require("os").tmpdir(), "malilink-sauvegardes-")) };
 
 async function boite(adresse) {
   const r = await fetch(`${MAILPIT}/search?query=${encodeURIComponent(`to:${adresse}`)}`).then((x) => x.json());
@@ -61,19 +63,19 @@ async function main() {
     const court = await appel("POST", `/super-admin/entreprises/${ecole.id}/administrateurs/${ecole.admin.id}/validation`, tSA, { motif: "ok" });
     verifier("motif obligatoire", court.status === 400);
 
-    const sortie = execFileSync("node", ["scripts/comptes/valider-compte-ecole.js", "--identifier", "--societe", String(ecole.id)], { env: process.env, encoding: "utf8" });
+    const sortie = execFileSync("node", ["scripts/comptes/valider-compte-ecole.js", "--identifier", "--societe", String(ecole.id)], { env: ENV_SCRIPT, encoding: "utf8" });
     verifier("script VPS --identifier : société, admin, email masqué, rien modifié", sortie.includes(`Société ${ecole.id}`) && sortie.includes("correspond au nom attendu")
       && sortie.includes("d***@e***.test") && !sortie.includes("directeur-ecole@essai.test"), sortie.slice(0, 400));
     let refusNom = 0;
     try {
       execFileSync("node", ["scripts/comptes/valider-compte-ecole.js", "--valider", "--societe", String(ecole.id), "--utilisateur", String(ecole.admin.id),
-        "--nom", "MALILINK SCHOOL", "--par", "auto", "--motif", "Validation demandée", "--oui"], { env: process.env, encoding: "utf8", stdio: "pipe" });
+        "--nom", "MALILINK SCHOOL", "--par", "auto", "--motif", "Validation demandée", "--oui"], { env: ENV_SCRIPT, encoding: "utf8", stdio: "pipe" });
     } catch (e) { refusNom = e.status; }
     const toujours = (await q(`SELECT admin_validated_at FROM users WHERE id=$1`, [ecole.admin.id]))[0];
     verifier("script VPS : nom approximatif → arrêt sans modification", refusNom === 1 && !toujours.admin_validated_at);
 
     const sortieV = execFileSync("node", ["scripts/comptes/valider-compte-ecole.js", "--valider", "--societe", String(ecole.id), "--utilisateur", String(ecole.admin.id),
-      "--nom", "MALILINK SCOOL", "--par", "sa-comptes@essai.test", "--motif", "Validation administrative demandée par le propriétaire", "--oui"], { env: process.env, encoding: "utf8" });
+      "--nom", "MALILINK SCOOL", "--par", "sa-comptes@essai.test", "--motif", "Validation administrative demandée par le propriétaire", "--oui"], { env: ENV_SCRIPT, encoding: "utf8" });
     verifier("script VPS --valider : validation journalisée", /VALIDATION_ADMINISTRATIVE_EFFECTUEE · journal n°\d+/.test(sortieV), sortieV.slice(-400));
     const apres = (await q(`SELECT email_verified, admin_validated_at, admin_validated_by, account_status, verification_required FROM users WHERE id=$1`, [ecole.admin.id]))[0];
     verifier("email TOUJOURS non vérifié (validation ≠ preuve de l'email)", apres.email_verified === false && Boolean(apres.admin_validated_at) && apres.admin_validated_by === superAdmin.id

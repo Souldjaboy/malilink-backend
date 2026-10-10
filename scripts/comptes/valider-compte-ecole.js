@@ -85,7 +85,7 @@ async function valider() {
     if (!superAdmin) { console.error("Super Admin introuvable ou inactif : arrêt."); process.exit(1); }
   }
   afficher(fiche, true);
-  const dossier = "/root/backups";
+  const dossier = process.env.MALILINK_SAUVEGARDES || "/root/backups";
   const fichier = path.join(fs.existsSync(dossier) ? dossier : process.cwd(), `malilink-validation-compte-${societe}-${utilisateur}-${Date.now()}.json`);
   fs.writeFileSync(fichier, JSON.stringify({ date: new Date().toISOString(), avant: fiche }, null, 2), { mode: 0o600 });
   console.log(`\nÉtat avant sauvegardé : ${fichier}`);
