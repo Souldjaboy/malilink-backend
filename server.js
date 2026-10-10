@@ -984,7 +984,9 @@ async function sessionRevoquee(user) {
     cacheRevocation.set(user.id, entree);
     if (cacheRevocation.size > 5000) cacheRevocation.delete(cacheRevocation.keys().next().value);
   }
-  return entree.apres > 0 && user.iat < Math.floor(entree.apres / 1000);
+  // iat est à la seconde : un jeton de la même seconde que la révocation est
+  // révoqué aussi (au pire, une connexion faite dans cette seconde est à refaire).
+  return entree.apres > 0 && user.iat <= Math.floor(entree.apres / 1000);
 }
 function revoquerSessions(userId) {
   cacheRevocation.delete(Number(userId));
