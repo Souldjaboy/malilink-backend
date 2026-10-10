@@ -23,6 +23,7 @@ const registerPostRoutes = require("./posts");
 const registerMessageRoutes = require("./messages");
 const registerNetworkRoutes = require("./network");
 const registerCallRoutes = require("./calls");
+const registerLiveRoutes = require("./lives");
 const { createSocialMedia } = require("./media");
 
 module.exports = function createSocialRouter({ pool, authenticateToken, createNotification, realtime, media }) {
@@ -80,6 +81,8 @@ module.exports = function createSocialRouter({ pool, authenticateToken, createNo
   registerMessageRoutes(router, context);
   // Appels audio/vidéo : inactifs (sans erreur) tant que LiveKit et les drapeaux ne sont pas configurés.
   registerCallRoutes(router, context);
+  // Directs : « indisponibles » tant que le serveur média n'est pas configuré, joignable et activé.
+  registerLiveRoutes(router, context);
 
   // Publications derrière leur propre flag (routes /feed, /posts, /saved,
   // /comments — montées en dernier : le middleware ne gêne aucune route
