@@ -19123,6 +19123,13 @@ app.use(
   })
 );
 
+app.use("/education/learning", requireCompanyModule("education"), require("./routes/education-learning")({
+  pool,
+  authenticateToken,
+  hashPassword,
+  validatePasswordStrength,
+  createNotification
+}));
 const createEducationRouter = require("./routes/education");
 /* Photos d'élèves, logo, sceau, signature et cachet d'établissement : lus
    par URL signée et limitée dans le temps, jamais par le dossier public. */

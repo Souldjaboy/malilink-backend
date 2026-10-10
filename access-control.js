@@ -87,6 +87,7 @@ const MODULE_CATALOG = [
   // Verticales métier
   { key: "restaurant", label: "Restaurant", group: "verticales", vertical: true, permission: ["restaurant"] },
   { key: "education", label: "Éducation", group: "verticales", vertical: true, permission: ["education"] },
+  { key: "education.learning", label: "MaliLink Academy", group: "verticales", permission: ["education.learning"] },
   { key: "immobilier", label: "Immobilier", group: "verticales", vertical: true, permission: ["immobilier"] },
   { key: "hotel", label: "Hôtel", group: "verticales", vertical: true, permission: ["immobilier.hotel", "immobilier"] },
   { key: "automobile", label: "Automobile / Garage", group: "verticales", vertical: true, permission: ["automobile"] },
@@ -270,6 +271,11 @@ function companyModuleState(ctx, rawKey) {
       : { enabled: true, reason: "hors_catalogue" };
     if (!parentState.enabled) return parentState;
     const row = ctx.companyRows.get(key);
+    // Academy is opt-in, including schools created after its migration.
+    if (key === "education.learning") {
+      if (!row || row.enabled !== true) return { enabled: false, reason: "academy_non_active" };
+      if (row.source !== "super_admin" && !planAllows(ctx.plan, key)) return { enabled: false, reason: "hors_plan" };
+    }
     if (row && row.enabled === false) return { enabled: false, reason: "sous_module_desactive" };
     return { enabled: true, reason: parentState.reason };
   }
@@ -460,6 +466,7 @@ const API_ROUTE_RULES = [
   { prefix: "/automobile", module: "automobile" },
   { prefix: "/laboratory", module: "laboratoire" },
   { prefix: "/laboratories", module: "laboratoire" },
+  { prefix: "/education/learning", module: "education.learning" },
   { prefix: "/education", module: "education" },
   // Voyage côté VOYAGEUR (recherche, réservation) = service de plateforme ouvert
   // à tous ; le module de la société ne gouverne que l'espace partenaire.
@@ -532,6 +539,8 @@ const SEGMENT_ACTIONS = [
 ];
 
 function actionForRequest(method, path) {
+  // A learner submits their own work; ownership is enforced by the Academy service.
+  if (String(method).toUpperCase() === "POST" && /^\/education\/learning\/(programs\/\d+\/start|attempts\/\d+\/submit)$/.test(String(path))) return "view";
   const base = METHOD_ACTION[String(method || "GET").toUpperCase()] || "view";
   const segments = String(path || "").split("?")[0].split("/").filter(Boolean).map((s) => s.toLowerCase());
   const dernier = segments[segments.length - 1] || "";
@@ -549,6 +558,7 @@ function actionForRequest(method, path) {
 // ════════════════════════════════════════════════════════════════════
 
 const PAGE_ROUTE_RULES = [
+  ["/education/academy", "education.learning"],
   ["/produits", "produits"], ["/stocks", "stock"], ["/inventaires", "inventaire"],
   ["/scanner", "scanner"], ["/entrepots", "entrepots"], ["/emplacements", "emplacements"],
   ["/pos", "pos"], ["/partenaires", "partenaires"], ["/marketplace/business", "marketplace"],

@@ -42,7 +42,7 @@ const SUBMODULES = {
   restaurant: ["commandes", "cuisine", "menu", "tables", "serveurs", "qr", "paiements"],
   immobilier: ["biens", "ventes", "locations", "contrats", "paiements", "hotel", "reservations"],
   automobile: ["vehicules", "ventes", "locations", "contrats", "paiements", "documents"],
-  education: ["eleves", "professeurs", "classes", "cours", "emploi_du_temps", "presences", "notes", "paiements", "mensualites", "inscriptions", "parents", "parametres"],
+  education: ["eleves", "professeurs", "classes", "cours", "learning", "emploi_du_temps", "presences", "notes", "paiements", "mensualites", "inscriptions", "parents", "parametres"],
   laboratoire: ["patients", "rendez_vous", "analyses", "resultats", "paiements", "documents", "parametres"],
   finance: ["wallet", "finance", "comptabilite", "rapports", "documents", "activites"],
   administration: ["utilisateurs", "parametres", "entrepots", "emplacements", "pointage", "badges", "alertes", "support", "import", "super_admin"],
@@ -152,6 +152,7 @@ const WRITE_ACTIONS = new Set(["view", "create", "update", "export", "print"]);
 function defaultPermissionsForRole(role, moduleKey) {
   const r = String(role || "").toLowerCase().trim();
   const grant = (all) => ACTIONS.reduce((acc, a) => { acc[a] = all === true ? true : (all === "write" ? WRITE_ACTIONS.has(a) : a === "view"); return acc; }, {});
+  if (moduleKey === "education.learning" && ["school_admin", "director"].includes(r)) return grant("write");
 
   if (FULL_ACCESS_ROLES.has(r)) return grant(true);
 
