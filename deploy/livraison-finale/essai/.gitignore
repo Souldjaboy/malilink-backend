@@ -1,2 +1,6 @@
 *.tar
 resultats/
+navigateur/e2e-donnees.json
+navigateur/*.png
+navigateur/node_modules/
+backend-e2e.log
