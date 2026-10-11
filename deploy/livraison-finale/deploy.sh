@@ -482,7 +482,7 @@ titre "8. BACKEND : MIGRATIONS ET MISE À JOUR"
 for f in $(cd "$HERE/payload" && find backend -type f -name '*.js'); do node --check "$HERE/payload/$f"; done
 BACK_TOUCHE=1
 while read -r f; do rel="${f#backend/}"; mkdir -p "$BACK/$(dirname "$rel")"; cp "$HERE/payload/$f" "$BACK/$rel.nouveau"; mv "$BACK/$rel.nouveau" "$BACK/$rel"; done < <(cd "$HERE/payload" && find backend -type f)
-(cd "$BACK" && node -e 'for (const m of ["./services/courriel","./services/comptes","./routes/super-admin-entreprises","./routes/social/index","./routes/social/lives"]) require(m)')
+(cd "$BACK" && node -e 'for (const m of ["./services/courriel","./services/comptes","./services/espaces","./routes/super-admin-entreprises","./routes/social/index","./routes/social/lives","./socket/index"]) require(m)')
 (cd "$BACK" && DATABASE_URL="$DATABASE_URL" node scripts/migrate.js)
 ok "migrations appliquées (additives, répétées avec succès sur la copie)"
 pm2c restart "$APP_BACK" >/dev/null
