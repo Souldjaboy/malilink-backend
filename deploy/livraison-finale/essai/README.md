@@ -14,8 +14,9 @@ retour arrière prouve que l'environnement complet a été restitué.
 
 ## Préparer (une fois par variante)
 
-    git -C .. archive 8f56fff > backend-prod.tar            # backend de production (Academy)
-    git -C ../../frontend archive dee116b > frontend-prod.tar
+    B="$(git rev-parse --show-toplevel)"                   # dossier backend
+    git -C "$B" archive 8f56fff > backend-prod.tar          # backend de production (Academy)
+    git -C "$B/../frontend" archive dee116b > frontend-prod.tar
     docker build -t vps-essai:pg16 --build-arg PGV=16 .     # PGV=14, PM2V=5.4.3 : variantes
     docker run -d --name prep -e POSTGRES_PASSWORD=essai -v "$PWD:/essai:ro" vps-essai:pg16
     docker exec prep bash /essai/preparer.sh
@@ -23,7 +24,7 @@ retour arrière prouve que l'environnement complet a été restitué.
 
 ## Lancer
 
-    PAQUET=<dossier du paquet malilink-comptes-lives> ./lancer.sh vps-essai:prod16 \
+    PAQUET=<dossier extrait malilink-livraison-finale> ./lancer.sh vps-essai:prod16 \
       audit succes pm2-start-echoue demarrage-plante http-echoue interruption-int \
       interruption-term interruption-hup retour-impossible backend-echoue migration-echoue
 
