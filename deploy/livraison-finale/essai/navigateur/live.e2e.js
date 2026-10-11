@@ -50,8 +50,9 @@ const api = (chemin, jeton, opts = {}) => fetch(`${API}${chemin}`, { ...opts, he
     await intrus.waitForTimeout(5000);
     const imagesIntrus = await intrus.evaluate(() => { const v = document.querySelector("video"); return v ? v.videoWidth : 0; }).catch(() => 0);
     const direct = await api(`/social/lives/${live.id}`, jetonAutreEspace, { headers: { "x-tenant-id": "hafiya" } });
+    // L'espace vient du serveur : l'en-tête « hafiya » contraire est refusé dès l'entrée (400).
     ok(`autre espace (hafiya) avec l'adresse du direct : aucune image, aucun jeton (${intrus.url().replace(BASE, "")})`,
-      imagesIntrus === 0 && !jetonsVus.some((t) => t.includes('"token"')) && direct.code === "SOCIAL_HORS_ESPACE", JSON.stringify(direct));
+      imagesIntrus === 0 && !jetonsVus.some((t) => t.includes('"token"')) && !direct.token && direct.error === "Tenant invalide.", JSON.stringify(direct));
 
     await new Promise((r) => setTimeout(r, 6000));
     const detail = await api(`/social/lives/${live.id}`, jetonHote);

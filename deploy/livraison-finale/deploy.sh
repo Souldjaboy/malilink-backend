@@ -378,7 +378,8 @@ if [ "$MODE" = "audit" ]; then
   SANS_DEFAUT="non défini : seuls les domaines reconnus fixent l'espace"
   info "espace fixé par le déploiement (DEFAULT_TENANT_ID) : ${DEFAUT_DEPLOIEMENT:-$SANS_DEFAUT}"
   COL_ESPACE="$(psql "$DATABASE_URL" -Atqc "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='account_tenant_id'" || true)"
-  COND_NON_RATTACHE="u.company_id IS NULL$([ "$COL_ESPACE" = 1 ] && echo " AND u.account_tenant_id IS NULL")"
+  # Avant la migration 091, aucun compte sans société n'a d'espace établi.
+  if [ "$COL_ESPACE" = 1 ]; then COND_NON_RATTACHE="u.company_id IS NULL AND u.account_tenant_id IS NULL"; else COND_NON_RATTACHE="u.company_id IS NULL"; fi
   psql "$DATABASE_URL" -Atqc "SELECT '   comptes sans société SANS espace établi : '||COUNT(*)||' ('||COALESCE(string_agg(DISTINCT LOWER(COALESCE(role,'?')), ', '),'—')||')' FROM users u WHERE $COND_NON_RATTACHE" || true
   SA_SANS="$(psql "$DATABASE_URL" -Atqc "SELECT '      Super Admin '||id||' · '||regexp_replace(COALESCE(email,''), '^(.)[^@]*@(.)[^.]*(\..*)?$', '\1***@\2***\3') FROM users u WHERE $COND_NON_RATTACHE AND (is_super_admin IS TRUE OR LOWER(role)='super_admin') ORDER BY id" || true)"
   [ -n "$SA_SANS" ] && { alerte "Super Admins sans société ni espace : ils ne pourront PLUS se connecter avant attribution :"; printf '%s\n' "$SA_SANS"; }

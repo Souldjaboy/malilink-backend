@@ -20,12 +20,20 @@ const JOURNAL_SERVEUR = `/tmp/malilink_comptes-serveur.log`;
 // Sauvegardes « état avant » du script VPS dans un dossier temporaire, pas dans le dépôt.
 const ENV_SCRIPT = { ...process.env, MALILINK_SAUVEGARDES: fs.mkdtempSync(path.join(require("os").tmpdir(), "malilink-sauvegardes-")) };
 
-async function boite(adresse) {
-  const r = await fetch(`${MAILPIT}/search?query=${encodeURIComponent(`to:${adresse}`)}`).then((x) => x.json());
-  const msgs = r.messages || [];
-  if (!msgs.length) return null;
-  const m = await fetch(`${MAILPIT}/message/${msgs[0].ID}`).then((x) => x.json());
-  return { total: msgs.length, sujet: m.Subject, de: m.From, texte: m.Text, html: m.HTML };
+/* Boîte Mailpit : attend (6 s au plus) qu'au moins « minimum » emails soient
+   arrivés pour cette adresse — l'envoi SMTP est asynchrone. */
+async function boite(adresse, minimum = 1) {
+  const limite = Date.now() + 6000;
+  for (;;) {
+    const r = await fetch(`${MAILPIT}/search?query=${encodeURIComponent(`to:${adresse}`)}`).then((x) => x.json());
+    const msgs = r.messages || [];
+    if (msgs.length >= minimum) {
+      const m = await fetch(`${MAILPIT}/message/${msgs[0].ID}`).then((x) => x.json());
+      return { total: msgs.length, sujet: m.Subject, de: m.From, texte: m.Text, html: m.HTML };
+    }
+    if (Date.now() > limite) return msgs.length ? { total: msgs.length } : null;
+    await new Promise((ok) => setTimeout(ok, 200));
+  }
 }
 const codeDe = (texte) => (String(texte).match(/Code : (\d{6})/) || [])[1];
 const attendre = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -117,7 +125,7 @@ async function main() {
       const renvoi = await appel("POST", "/verification/resend", null, { target_type: "email", target_value: email, user_id: userId });
       verifier("renvoi : « accepté par le serveur d'envoi », adresse masquée", renvoi.status === 200 && renvoi.data.envoi === "accepte" && renvoi.data.message.includes("n***@e***.test"), JSON.stringify(renvoi.data));
       await attendre(500);
-      const m2 = await boite(email);
+      const m2 = await boite(email, 2);
       const nouveauCode = codeDe(m2.texte);
       verifier("deuxième email reçu, nouveau code", m2.total === 2 && nouveauCode && nouveauCode !== premierCode);
       const ancien = await appel("POST", "/verification/verify", null, { code: premierCode, target_type: "email", target_value: email, user_id: userId });
