@@ -182,7 +182,13 @@ restaurer_backend() {
   local h f rel
   info "backend : remise des fichiers d'origine"
   while read -r h f; do [[ "$f" == backend/* ]] || continue; rel="${f#backend/}"; cp -a "$SAVE/backend/$rel" "$BACK/$rel"; done < "$SAVE/avant.sha256"
-  while read -r f; do [[ "$f" == backend/* ]] && rm -f "$BACK/${f#backend/}"; done < "$SAVE/nouveaux.txt"
+  # Fichiers « nouveaux » : ceux qui existaient AVANT ce déploiement sont
+  # restaurés ; seuls ceux qu'il a réellement créés sont supprimés.
+  while read -r f; do
+    [[ "$f" == backend/* ]] || continue; rel="${f#backend/}"
+    if grep -qxF "$f" "$SAVE/nouveaux-preexistants.txt" 2>/dev/null; then cp -a "$SAVE/nouveaux-preexistants/$rel" "$BACK/$rel"
+    else rm -f "$BACK/$rel"; fi
+  done < "$SAVE/nouveaux.txt"
   pm2c restart "$APP_BACK" >/dev/null 2>&1 || { info "pm2 restart $APP_BACK en échec"; return 1; }
 }
 verifier_backend() {
@@ -191,7 +197,12 @@ verifier_backend() {
     [[ "$f" == backend/* ]] || continue; rel="${f#backend/}"
     [ "$(sha256sum "$BACK/$rel" 2>/dev/null | cut -d' ' -f1)" = "$h" ] || { info "backend : $rel différent de l'original"; bon=1; }
   done < "$SAVE/avant.sha256"
-  while read -r f; do [[ "$f" == backend/* ]] && [ -e "$BACK/${f#backend/}" ] && { info "backend : ${f#backend/} encore présent"; bon=1; }; done < "$SAVE/nouveaux.txt"
+  while read -r f; do
+    [[ "$f" == backend/* ]] || continue; rel="${f#backend/}"
+    if grep -qxF "$f" "$SAVE/nouveaux-preexistants.txt" 2>/dev/null; then
+      cmp -s "$BACK/$rel" "$SAVE/nouveaux-preexistants/$rel" || { info "backend : $rel préexistant mais pas restauré à l'identique"; bon=1; }
+    elif [ -e "$BACK/$rel" ]; then info "backend : $rel encore présent"; bon=1; fi
+  done < "$SAVE/nouveaux.txt"
   attendre_stable "$APP_BACK" || bon=1
   pm2js comparer "$APP_BACK" "$SAVE/pm2-backend-avant.json" || bon=1
   [ "$(cwd_de "$APP_BACK" || true)" = "$BACK" ] || { info "backend : mauvais répertoire"; bon=1; }
@@ -362,11 +373,17 @@ if [ "$MODE" = "audit" ]; then
     alerte "sociétés hors de l'espace malilink : leurs comptes ne se connectent déjà pas sur MaliLink et ne figureront plus dans les listes du Super Admin :"
     printf '%s\n' "$AUTRES"
   else ok "toutes les sociétés sont dans l'espace malilink"; fi
-  if [ "$(psql "$DATABASE_URL" -Atqc "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='account_tenant_id'")" = 1 ]; then
-    psql "$DATABASE_URL" -Atqc "SELECT '   comptes sans société : '||COUNT(*) FILTER (WHERE account_tenant_id IS NOT NULL)||' rattaché(s), '||COUNT(*) FILTER (WHERE account_tenant_id IS NULL)||' à rattacher' FROM users WHERE company_id IS NULL" || true
-  else
-    info "comptes sans société : $(psql "$DATABASE_URL" -Atqc "SELECT COUNT(*) FROM users WHERE company_id IS NULL") — chacun sera rattaché à son espace à sa prochaine connexion sur le site (journalisé)"
-  fi
+  DEFAUT_DEPLOIEMENT="$(pm2c jlist | node -e 'const p=JSON.parse(require("fs").readFileSync(0,"utf8")).find(x=>x.name==="malilink-backend");process.stdout.write((p&&p.pm2_env&&p.pm2_env.env&&p.pm2_env.env.DEFAULT_TENANT_ID)||"")')"
+  [ -n "$DEFAUT_DEPLOIEMENT" ] || DEFAUT_DEPLOIEMENT="$(grep -E '^DEFAULT_TENANT_ID=' "$BACK/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true)"
+  SANS_DEFAUT="non défini : seuls les domaines reconnus fixent l'espace"
+  info "espace fixé par le déploiement (DEFAULT_TENANT_ID) : ${DEFAUT_DEPLOIEMENT:-$SANS_DEFAUT}"
+  COL_ESPACE="$(psql "$DATABASE_URL" -Atqc "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='account_tenant_id'" || true)"
+  COND_NON_RATTACHE="u.company_id IS NULL$([ "$COL_ESPACE" = 1 ] && echo " AND u.account_tenant_id IS NULL")"
+  psql "$DATABASE_URL" -Atqc "SELECT '   comptes sans société SANS espace établi : '||COUNT(*)||' ('||COALESCE(string_agg(DISTINCT LOWER(COALESCE(role,'?')), ', '),'—')||')' FROM users u WHERE $COND_NON_RATTACHE" || true
+  SA_SANS="$(psql "$DATABASE_URL" -Atqc "SELECT '      Super Admin '||id||' · '||regexp_replace(COALESCE(email,''), '^(.)[^@]*@(.)[^.]*(\..*)?$', '\1***@\2***\3') FROM users u WHERE $COND_NON_RATTACHE AND (is_super_admin IS TRUE OR LOWER(role)='super_admin') ORDER BY id" || true)"
+  [ -n "$SA_SANS" ] && { alerte "Super Admins sans société ni espace : ils ne pourront PLUS se connecter avant attribution :"; printf '%s\n' "$SA_SANS"; }
+  alerte "Après le déploiement, aucun compte sans espace établi ne peut se connecter (aucun rattachement automatique)."
+  info "   → juste après : node scripts/comptes/attribuer-espace.js --rapport, puis --attribuer (décision explicite, journalisée)."
   info "Après le déploiement, un jeton sans espace (OAuth, connexion après code, inscription téléphone) demande une reconnexion."
 
   titre "B. ÉCOLE « MALILINK SCOOL » (société ${SOCIETE_ECOLE:-8}) — identification, lecture seule"
@@ -405,6 +422,17 @@ install -d -m 700 "$SAVE" "$SAVE/backend"
 exec > >(trap '' INT TERM HUP; exec tee -a "$SAVE/deploiement.log") 2>&1
 armer_pieges
 cp "$HERE/avant.sha256" "$HERE/nouveaux.txt" "$SAVE/"
+# Présence initiale des fichiers « nouveaux » (backend modifié sur place ; le
+# frontend nouveau est construit dans une autre release, l'ancienne n'est pas touchée).
+: > "$SAVE/nouveaux-preexistants.txt"
+while read -r f; do
+  [[ "$f" == backend/* ]] || continue; rel="${f#backend/}"
+  if [ -e "$BACK/$rel" ]; then
+    echo "$f" >> "$SAVE/nouveaux-preexistants.txt"
+    mkdir -p "$SAVE/nouveaux-preexistants/$(dirname "$rel")"; cp -a "$BACK/$rel" "$SAVE/nouveaux-preexistants/$rel"
+  fi
+done < "$HERE/nouveaux.txt"
+[ -s "$SAVE/nouveaux-preexistants.txt" ] && info "fichiers « nouveaux » déjà présents (identiques) : $(wc -l < "$SAVE/nouveaux-preexistants.txt") — sauvegardés, restaurés en cas de retour"
 cp "$HERE/deploy.sh" "$SAVE/deploy.sh"
 { printf 'BACK=%q\n' "$BACK"; printf 'FRONT=%q\n' "$FRONT"; printf 'NEW_FRONT=%q\n' "$NEW_FRONT"; printf 'SITE_DEPLOIEMENT=%q\n' "$SITE"; printf 'PORTS_BACK=%q\n' "$PORTS_BACK"; printf 'PORTS_FRONT=%q\n' "$PORTS_FRONT"; } > "$SAVE/etat.env"
 pm2c jlist > "$SAVE/pm2-private.json"
@@ -495,6 +523,9 @@ c1="$(curl -s -m 15 -o "$SAVE/controle-resend.json" -w '%{http_code}' -X POST -H
 grep -q "Indiquez votre adresse email" "$SAVE/controle-resend.json" 2>/dev/null || echec "renvoi d'OTP : réponse inattendue ($c1)"
 attendre_http "/api/social/lives/config" "401" 30 || echec "directs : $DERNIER_CODE au lieu de 401"
 attendre_http "/api/super-admin/entreprises/1" "401" 30 || echec "super admin : $DERNIER_CODE au lieu de 401"
+ESPACE_SITE="$(curl -s -m 15 "$SITE/api/espace" || true)"
+echo "$ESPACE_SITE" | grep -q '"tenant_id":"malilink"' || echec "espace résolu pour $SITE : ${ESPACE_SITE:-aucune réponse} (attendu malilink)"
+ok "espace résolu pour $SITE : $ESPACE_SITE"
 attendre_http "/api/education/learning/programs" "401|403" 30 || echec "Academy : $DERNIER_CODE au lieu de 401/403"
 ok "nouveau backend en ligne, stable, définition PM2 inchangée (Academy toujours protégée)"
 
@@ -535,5 +566,7 @@ titre "DÉPLOIEMENT TERMINÉ"
 info "Journal : $SAVE/deploiement.log"
 info "Retour arrière manuel : bash $SAVE/rollback.sh (code et définition PM2 ; la base n'est jamais restaurée)"
 info "Sessions : un jeton émis sans espace (OAuth, après code, inscription téléphone) demande une reconnexion."
+info "Comptes sans société sans espace établi : connexion refusée jusqu'à attribution explicite :"
+info "  cd $BACK && node scripts/comptes/attribuer-espace.js --rapport"
 info "Étape suivante — identifier le compte école (lecture seule) :"
 info "  cd $BACK && node scripts/comptes/valider-compte-ecole.js --identifier --societe 8"

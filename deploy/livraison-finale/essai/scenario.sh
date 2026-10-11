@@ -46,6 +46,9 @@ repetitions() { runuser -u postgres -- psql -Atqc "SELECT string_agg(datname, ',
 essai() { curl -s -m 5 "$SITE/__essai"; }
 dump_front() { node -e 'const d=JSON.parse(require("fs").readFileSync("/root/.pm2/dump.pm2","utf8")).find(x=>x.name==="malilink-frontend");console.log(d?d.pm_cwd:"absent")'; }
 
+# Scénario « nouveau-preexistant » : un fichier « nouveau » du paquet est déjà
+# présent (identique) avant le déploiement ; il doit survivre au retour arrière.
+[ "$S" = nouveau-preexistant ] && cp "$PAQ/payload/backend/services/espaces.js" "$R/backend/services/espaces.js"
 # Fichiers téléversés par les utilisateurs : ne doivent jamais bouger.
 mkdir -p "$R/backend/uploads/essai" && for i in 1 2 3; do echo "photo $i" > "$R/backend/uploads/essai/photo-$i.jpg"; done
 AV_DEF_FRONT="$(pm2q def malilink-frontend)"; AV_DEF_FRONT_SC="$(pm2q def-sans-cwd malilink-frontend)"
@@ -90,6 +93,7 @@ case "$S" in
     verifier "ports réellement écoutés détectés (backend 5050, frontend 3020)" 'grep -q "(ports écoutés : 5050)" "$LOG" && grep -q "(ports écoutés : 3020)" "$LOG"'
     verifier "école 8 identifiée en lecture seule, email masqué" 'grep -q "société 8 « MALILINK SCOOL » · espace malilink" "$LOG" && grep -q "d\*\*\*@e\*\*\*.test" "$LOG" && ! grep -q "directeur@ecole.test" "$LOG"'
     verifier "SMTP absent : signalé sans rien envoyer" 'grep -q "SMTP_EN_ECHEC" "$LOG"'
+    verifier "espaces : déploiement fixé et comptes sans espace établi signalés (aucune attribution)" 'grep -q "DEFAULT_TENANT_ID) : malilink" "$LOG" && grep -q "comptes sans société SANS espace établi : 1 (customer)" "$LOG" && grep -q "attribuer-espace.js --rapport" "$LOG"'
     verifier "rien d'écrit : ni sauvegarde, ni fichier, ni processus touché" '[ -z "$(ls /root/backups)" ] && [ "$(empreintes_back)" = "$AV_FICHIERS" ] && [ "$(pm2q pid malilink-frontend)" = "$AV_PID_FRONT" ] && [ "$(pm2q autres)" = "$AV_AUTRES" ]'
     ;;
   succes)
@@ -104,6 +108,7 @@ case "$S" in
     verifier "témoins jamais redémarrés, dump PM2 sur la nouvelle release" '[ "$(pm2q autres)" = "$AV_AUTRES" ] && [ "$(dump_front)" = "$NOUVEAU" ] && [[ "$NOUVEAU" == */malilink-livraison-finale-*/frontend ]]'
     verifier "mêmes ports qu'avant (3020) et uploads intacts, annoncés et réels" 'grep -q "mêmes ports : 3020" "$LOG" && grep -q "uploads intacts : 3 avant" "$LOG" && [ "$(ls $R/backend/uploads/essai | wc -l)" = 3 ]'
     verifier "migration 091 en production (espaces des comptes)" '[ "$(mig091)" = 1 ]'
+    verifier "espace résolu par le domaine après déploiement (malilink)" 'grep -q "espace résolu pour http://127.0.0.1:8080 : {\"tenant_id\":\"malilink\",\"source\":\"domaine\"}" "$LOG"'
     SAVE="$(ls -d /root/backups/malilink-livraison-finale-*)"
     echo "   → retour arrière manuel : bash $SAVE/rollback.sh"
     bash "$SAVE/rollback.sh" > "$LOG.retour" 2>&1; CODE=$?
@@ -143,6 +148,12 @@ case "$S" in
     echo resend-502 > /etc/essai/proxy; lancer; rm -f /etc/essai/proxy
     verifier "contrôle du backend en échec détecté" 'grep -q "renvoi d.OTP : réponse inattendue" "$LOG"'
     verifier "frontend jamais touché (même pid, aucun redémarrage)" '[ "$(pm2q pid malilink-frontend)" = "$AV_PID_FRONT" ]'
+    retour_verifie ;;
+  nouveau-preexistant)
+    echo http500 > /etc/essai/nouveau; lancer
+    verifier "présence initiale enregistrée : 1 fichier « nouveau » déjà là" 'grep -q "déjà présents (identiques) : 1" "$LOG"'
+    verifier "fichier préexistant RESTAURÉ au retour arrière (pas supprimé)" 'cmp -s "$R/backend/services/espaces.js" "$PAQ/payload/backend/services/espaces.js"'
+    verifier "fichiers réellement créés par le déploiement supprimés" '[ ! -e "$R/backend/services/comptes.js" ] && [ ! -e "$R/backend/routes/social/lives.js" ] && [ ! -e "$R/backend/scripts/comptes/attribuer-espace.js" ]'
     retour_verifie ;;
   migration-echoue)
     psql "$DB" -qc "CREATE TABLE social_live_comments (id int)"

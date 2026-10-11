@@ -15,7 +15,7 @@
 
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
-const { q, appel, jeton, verifier, section, terminer } = require("./_outils");
+const { q, appel, appelHote, jeton, verifier, section, terminer } = require("./_outils");
 
 const MODE = process.env.MODE || "absent";
 const TENANT_A = "malilink";
@@ -42,12 +42,14 @@ async function membre(nom, tenant, extra = {}) {
     [nom, `${nom.toLowerCase().replace(/\W/g, "")}-${crypto.randomBytes(3).toString("hex")}@essai.test`, extra.superAdmin ? "super_admin" : "customer", tenant, Boolean(extra.superAdmin)]))[0];
   const token = jwt.sign({ id: u.id, role: extra.superAdmin ? "super_admin" : "customer", company_id: null, tenant_id: tenant, is_super_admin: Boolean(extra.superAdmin) },
     process.env.JWT_SECRET, { expiresIn: "2h" });
-  const entetes = { "x-tenant-id": tenant };
+  // Espace par le DOMAINE (un en-tête client ne peut plus changer d'espace) :
+  // A = espace du déploiement de test (malilink), B = domaine hafiyalab.com.
+  const appelle = (m, chemin, corps) => (tenant === TENANT_A ? appel(m, chemin, token, corps) : appelHote("hafiyalab.com", m, chemin, token, corps));
   if (socialActif(tenant)) {
-    const r = await appel("POST", "/social/profile", token, { display_name: nom, birth_date: "1994-05-02", photo_url: "/uploads/photo-essai.jpg", city: "Bamako", is_public: true }, entetes);
+    const r = await appelle("POST", "/social/profile", { display_name: nom, birth_date: "1994-05-02", photo_url: "/uploads/photo-essai.jpg", city: "Bamako", is_public: true });
     if (r.status >= 300) throw new Error(`profil ${nom} (${tenant}) : ${JSON.stringify(r.data)}`);
   }
-  return { id: u.id, nom, token, tenant, entetes };
+  return { id: u.id, nom, token, tenant, appelle };
 }
 async function directEnBase(hote, { vu = "NOW()" } = {}) {
   return (await q(
@@ -76,11 +78,11 @@ async function isolationTenants() {
   if (MODE === "reel" && B_ACTIF) {
     // Social actif dans B : le direct B est créé par l'API (espace de la requête).
     await q(`DELETE FROM social_lives WHERE id=$1`, [liveB.id]);
-    const cree = await appel("POST", "/social/lives", hoteB.token, { title: "Direct du tenant B", audience: "public" }, hoteB.entetes);
+    const cree = await hoteB.appelle("POST", "/social/lives", { title: "Direct du tenant B", audience: "public" });
     verifier("espace B : direct créé par l'API, rattaché à l'espace B", cree.status === 201
       && (await q(`SELECT tenant_id FROM social_lives WHERE public_id=$1`, [cree.data.live?.id]))[0]?.tenant_id === TENANT_B, JSON.stringify(cree.data));
     liveB = (await q(`SELECT id, public_id FROM social_lives WHERE public_id=$1`, [cree.data.live.id]))[0];
-    const rej = await appel("POST", `/social/lives/${liveB.public_id}/rejoindre`, spectB.token, null, spectB.entetes);
+    const rej = await spectB.appelle("POST", `/social/lives/${liveB.public_id}/rejoindre`, null);
     verifier("espace B : un membre B rejoint le direct B (contrôle positif)", rej.status === 200 && Boolean(rej.data.token));
   } else {
     await q(`INSERT INTO social_live_viewers (live_id, user_id) VALUES ($1,$2)`, [liveB.id, spectB.id]);
@@ -89,8 +91,8 @@ async function isolationTenants() {
   const comA = (await q(`INSERT INTO social_live_comments (live_id, user_id, content) VALUES ($1,$2,'Bonjour A') RETURNING id`, [liveA.id, hoteA.id]))[0];
 
   verifier("contrôle positif : l'hôte A voit son direct dans l'espace A",
-    (await appel("GET", `/social/lives/${liveA.public_id}`, hoteA.token, null, hoteA.entetes)).status === 200);
-  const propreB = await appel("GET", `/social/lives/${liveB.public_id}`, hoteB.token, null, hoteB.entetes);
+    (await hoteA.appelle("GET", `/social/lives/${liveA.public_id}`, null)).status === 200);
+  const propreB = await hoteB.appelle("GET", `/social/lives/${liveB.public_id}`, null);
   verifier(B_ACTIF ? "contrôle positif : l'hôte B voit son direct dans l'espace B" : "espace B : réseau social indisponible, même pour l'hôte du direct B (404)",
     B_ACTIF ? propreB.status === 200 : propreB.status === 404 && propreB.data?.code === "SOCIAL_HORS_ESPACE", JSON.stringify(propreB.data));
 
@@ -114,7 +116,7 @@ async function isolationTenants() {
   const essayer = async (qui, pid, cid, cible) => {
     const ecarts = [];
     for (const [m, chemin, corps] of routes(pid, cid, cible)) {
-      const r = await appel(m, chemin, qui.token, corps, qui.entetes);
+      const r = await qui.appelle(m, chemin, corps);
       const fuite = r.data && (r.data.token || r.data.title || Array.isArray(r.data));
       if (!attendu(qui, chemin).includes(r.status) || fuite) ecarts.push(`${m} ${chemin.replace(pid, ":id")} → ${r.status}`);
     }
@@ -129,7 +131,9 @@ async function isolationTenants() {
   const ba = await essayer(intrusB, liveA.public_id, comA.id, hoteA.id);
   verifier("membre B sur le direct A : introuvable sur les 11 routes", ba.length === 0, ba.join(" ; "));
   const entete = await appel("GET", `/social/lives/${liveB.public_id}`, intrusA.token, null, { "x-tenant-id": TENANT_B });
-  verifier("jeton A + en-tête « espace B » : refusé à l'authentification", entete.status === 403 && entete.data?.code === "AUTRE_ESPACE");
+  verifier("en-tête « espace B » contraire à l'espace du serveur : requête refusée (400)", entete.status === 400);
+  const domaineB = await appelHote("hafiyalab.com", "GET", `/social/lives/${liveB.public_id}`, intrusA.token);
+  verifier("jeton A présenté sur le domaine de l'espace B : refusé (AUTRE_ESPACE)", domaineB.status === 403 && domaineB.data?.code === "AUTRE_ESPACE");
 
   const etatB = (await q(`SELECT status FROM social_lives WHERE id=$1`, [liveB.id]))[0];
   const traces = (await q(
@@ -141,10 +145,10 @@ async function isolationTenants() {
     etatB.status === "live" && traces.spectateurs === 0 && traces.commentaires === 0 && traces.signalements === 0, JSON.stringify({ etatB, traces }));
 
   if (MODE === "reel") {
-    const listeA = await appel("GET", "/social/lives", intrusA.token, null, intrusA.entetes);
+    const listeA = await intrusA.appelle("GET", "/social/lives", null);
     verifier("liste de l'espace A : son direct, jamais celui de B", listeA.data.lives.some((l) => l.id === liveA.public_id) && !listeA.data.lives.some((l) => l.id === liveB.public_id));
     if (B_ACTIF) {
-      const listeB = await appel("GET", "/social/lives", intrusB.token, null, intrusB.entetes);
+      const listeB = await intrusB.appelle("GET", "/social/lives", null);
       verifier("liste de l'espace B : son direct, jamais celui de A", listeB.data.lives.some((l) => l.id === liveB.public_id) && !listeB.data.lives.some((l) => l.id === liveA.public_id));
     }
   }
@@ -152,15 +156,15 @@ async function isolationTenants() {
   // Nettoyage automatique : un appel de l'espace A ne clôt que les directs de A.
   const muetA = await directEnBase(await membre("Hôte muet A", TENANT_A), { vu: "NOW() - INTERVAL '2 minutes'" });
   const muetB = await directEnBase(await membre("Hôte muet B", TENANT_B), { vu: "NOW() - INTERVAL '2 minutes'" });
-  await appel("GET", `/social/lives/${liveA.public_id}`, hoteA.token, null, hoteA.entetes);
+  await hoteA.appelle("GET", `/social/lives/${liveA.public_id}`, null);
   const apresA = await q(`SELECT public_id, status, end_reason FROM social_lives WHERE id = ANY($1::bigint[]) ORDER BY id`, [[muetA.id, muetB.id]]);
   verifier("nettoyage déclenché par A : direct muet A clos, direct muet B intact",
     apresA[0].status === "ended" && apresA[0].end_reason === "hote_deconnecte" && apresA[1].status === "live", JSON.stringify(apresA));
-  await appel("GET", `/social/lives/${liveB.public_id}`, hoteB.token, null, hoteB.entetes);
+  await hoteB.appelle("GET", `/social/lives/${liveB.public_id}`, null);
   const apresB = (await q(`SELECT status, end_reason FROM social_lives WHERE id=$1`, [muetB.id]))[0];
   verifier(B_ACTIF ? "nettoyage déclenché par B : direct muet B clos à son tour" : "espace B sans Social : rien n'y est déclenché, direct muet B intact",
     B_ACTIF ? apresB.status === "ended" && apresB.end_reason === "hote_deconnecte" : apresB.status === "live");
-  if (MODE === "reel" && B_ACTIF) await appel("POST", `/social/lives/${liveB.public_id}/terminer`, hoteB.token, null, hoteB.entetes);
+  if (MODE === "reel" && B_ACTIF) await hoteB.appelle("POST", `/social/lives/${liveB.public_id}/terminer`, null);
 }
 
 async function amis(a, b) {
@@ -260,7 +264,7 @@ async function main() {
     await appel("GET", "/social/lives", inconnu.token);
     const etat = (await q(`SELECT status, end_reason FROM social_lives WHERE public_id=$1`, [d2.data.live.id]))[0];
     verifier("hôte déconnecté depuis 60 s : direct clos automatiquement", etat.status === "ended" && etat.end_reason === "hote_deconnecte");
-    const sa = (await q(`INSERT INTO users (fullname, email, password, role, is_super_admin) VALUES ('SA','sa-live@essai.test','x','super_admin',true) RETURNING id, role, company_id, is_super_admin`))[0];
+    const sa = (await q(`INSERT INTO users (fullname, email, password, role, is_super_admin, account_tenant_id, account_tenant_source) VALUES ('SA','sa-live@essai.test','x','super_admin',true,'malilink','inscription') RETURNING id, role, company_id, is_super_admin`))[0];
     const d3 = await appel("POST", "/social/lives", ami.token, { title: "Direct à modérer", audience: "public" });
     const mod = await appel("POST", `/social/lives/${d3.data.live.id}/terminer`, jeton(sa));
     verifier("le Super Admin peut couper un direct (modération)", mod.data.termine === true

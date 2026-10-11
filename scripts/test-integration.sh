@@ -17,6 +17,7 @@ export TZ="${TZ:-Europe/Paris}"
 docker exec malilink-postgres-test psql -U postgres -qc "DROP DATABASE IF EXISTS ${BASE_NOM};" >/dev/null 2>&1
 docker exec malilink-postgres-test psql -U postgres -qc "CREATE DATABASE ${BASE_NOM};" >/dev/null
 node scripts/migrate.js >"/tmp/${BASE_NOM}-migrations.log" 2>&1 || { echo "migrations en échec"; tail -20 "/tmp/${BASE_NOM}-migrations.log"; exit 1; }
+docker exec -i malilink-postgres-test psql -U postgres -q -d "${BASE_NOM}" < tests/fixtures-essai.sql >/dev/null || { echo "données d'essai en échec"; exit 1; }
 node server.js >"/tmp/${BASE_NOM}-serveur.log" 2>&1 &
 SERVEUR=$!
 trap 'kill $SERVEUR 2>/dev/null' EXIT

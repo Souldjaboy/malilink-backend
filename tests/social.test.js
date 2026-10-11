@@ -16,8 +16,8 @@ const { q, appel, jeton, verifier, section, terminer, BASE } = require("./_outil
 
 async function personne(nom, { publique = true } = {}) {
   const u = (await q(
-    `INSERT INTO users (fullname, email, password, role, company_id)
-     VALUES ($1,$2,'x','customer',NULL) RETURNING id, role, company_id`,
+    `INSERT INTO users (fullname, email, password, role, company_id, account_tenant_id, account_tenant_source)
+     VALUES ($1,$2,'x','customer',NULL,'malilink','inscription') RETURNING id, role, company_id`,
     [nom, `${nom.toLowerCase().replace(/\W/g, "")}-${crypto.randomBytes(3).toString("hex")}@essai.test`]))[0];
   const token = jeton(u);
   const r = await appel("POST", "/social/profile", token, {

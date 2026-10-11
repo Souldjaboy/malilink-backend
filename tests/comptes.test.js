@@ -36,8 +36,8 @@ async function connexion(email, password) {
 
 async function main() {
   if (SMTP) await fetch(`${MAILPIT}/messages`, { method: "DELETE" });
-  const superAdmin = (await q(`INSERT INTO users (fullname, email, password, role, company_id, is_super_admin, is_active)
-    VALUES ('Super Admin', 'sa-comptes@essai.test', 'x', 'super_admin', NULL, true, true) RETURNING id, role, company_id, is_super_admin`))[0];
+  const superAdmin = (await q(`INSERT INTO users (fullname, email, password, role, company_id, is_super_admin, is_active, account_tenant_id, account_tenant_source)
+    VALUES ('Super Admin', 'sa-comptes@essai.test', 'x', 'super_admin', NULL, true, true, 'malilink', 'inscription') RETURNING id, role, company_id, is_super_admin`))[0];
   const tSA = jeton(superAdmin);
 
   section("1. VALIDATION ADMINISTRATIVE D'UN COMPTE ÉCOLE");

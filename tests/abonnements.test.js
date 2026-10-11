@@ -46,8 +46,8 @@ const jour = (decalage) => new Date(Date.now() + decalage * 86400000).toISOStrin
 
 async function main() {
   // Le super-admin des tests est un vrai compte (les actions le référencent).
-  await q(`INSERT INTO users (id, fullname, email, password, role, is_super_admin)
-           VALUES (999001, 'Super Admin Test', 'superadmin-test@essai.test', 'x', 'super_admin', TRUE) ON CONFLICT (id) DO NOTHING`);
+  await q(`INSERT INTO users (id, fullname, email, password, role, is_super_admin, account_tenant_id, account_tenant_source)
+           VALUES (999001, 'Super Admin Test', 'superadmin-test@essai.test', 'x', 'super_admin', TRUE, 'malilink', 'inscription') ON CONFLICT (id) DO NOTHING`);
   const plans = Object.fromEntries((await q(
     `SELECT commercial_code, price_monthly::float AS mensuel, installation_fee::float AS installation FROM subscription_plans
       WHERE commercial_code IN ('starter','business','pro')`)).map((p) => [p.commercial_code, p]));

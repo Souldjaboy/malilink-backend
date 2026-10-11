@@ -16,6 +16,7 @@ export TZ="${TZ:-Europe/Paris}"   # hors UTC : un décalage de fuseau ne passe p
 docker exec malilink-postgres-test psql -U postgres -qc "DROP DATABASE IF EXISTS ${BASE_NOM};" >/dev/null
 docker exec malilink-postgres-test psql -U postgres -qc "CREATE DATABASE ${BASE_NOM};" >/dev/null
 node scripts/migrate.js >/tmp/p0-migrations.log 2>&1 || { echo "migrations en échec"; tail -20 /tmp/p0-migrations.log; exit 1; }
+docker exec -i malilink-postgres-test psql -U postgres -q -d "${BASE_NOM}" < tests/fixtures-essai.sql >/dev/null || { echo "données d'essai en échec"; exit 1; }
 echo "migrations : $(grep -c '^  OK' /tmp/p0-migrations.log) appliquées"
 
 demarrer() {

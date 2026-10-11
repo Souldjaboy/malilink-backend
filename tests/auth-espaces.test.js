@@ -24,7 +24,8 @@ const crypto = require("crypto");
 const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { q, appel, jeton, verifier, section, creerSociete, terminer, BASE } = require("./_outils");
+const { execFileSync } = require("child_process");
+const { q, appel, appelHote, jeton, verifier, section, creerSociete, terminer, BASE } = require("./_outils");
 
 const MDP = "Essai-2026-ok";
 const HACHE = bcrypt.hashSync(MDP, 4);
@@ -34,8 +35,13 @@ const MAILPIT = "http://127.0.0.1:8025/api/v1";
 const decoder = (t) => jwt.decode(t) || {};
 const alea = () => crypto.randomBytes(3).toString("hex");
 
-/* Requête brute : sans en-tête d'espace (l'espace vient alors du serveur). */
-async function brut(methode, chemin, { token, corps, entetes = {}, suivre = true } = {}) {
+// Domaines reconnus des deux espaces éprouvés ; sans domaine, la requête prend
+// l'espace du déploiement de test (DEFAULT_TENANT_ID=malilink).
+const DOMAINE = { [A]: "malilinkglobal.com", [B]: "hafiyalab.com" };
+
+/* Requête brute ; hote : en-tête Host imposé (espace établi par le domaine). */
+async function brut(methode, chemin, { token, corps, entetes = {}, suivre = true, hote } = {}) {
+  if (hote) return appelHote(hote, methode, chemin, token, corps, entetes);
   const r = await fetch(`${BASE}${chemin}`, {
     method: methode, redirect: suivre ? "follow" : "manual",
     headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...entetes },
@@ -46,7 +52,7 @@ async function brut(methode, chemin, { token, corps, entetes = {}, suivre = true
   return { status: r.status, data, location: r.headers.get("location") || "" };
 }
 const connexion = (identifiant, espace, mdp = MDP) =>
-  brut("POST", "/login", { corps: { email: identifiant, password: mdp }, entetes: espace ? { "x-tenant-id": espace } : {} });
+  brut("POST", "/login", { corps: { email: identifiant, password: mdp }, hote: espace ? DOMAINE[espace] : undefined });
 
 async function compte({ nom, companyId = null, role = "customer", espace = null, superAdmin = false, phone = null }) {
   return (await q(
@@ -81,7 +87,7 @@ const fournisseur = http.createServer((req, res) => {
 });
 async function parcoursOAuth(profil, espaceDepart) {
   profilOAuth = profil;
-  const depart = await brut("GET", "/auth/social/instagram/start?mode=login", { suivre: false, entetes: espaceDepart ? { "x-tenant-id": espaceDepart } : {} });
+  const depart = await brut("GET", "/auth/social/instagram/start?mode=login", { suivre: false, hote: espaceDepart ? DOMAINE[espaceDepart] : undefined });
   const state = new URL(depart.location).searchParams.get("state");
   const retour = await brut("GET", `/auth/social/instagram/callback?code=essai&state=${encodeURIComponent(state)}`, { suivre: false });
   const url = new URL(retour.location);
@@ -89,6 +95,7 @@ async function parcoursOAuth(profil, espaceDepart) {
   return { etat: decoder(state), url, connexion: payload ? JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) : null, erreur: url.searchParams.get("social_error") };
 }
 
+const ctx = {};
 async function main() {
   await new Promise((r) => fournisseur.listen(5098, r));
   if (process.env.SMTP_HOST) await fetch(`${MAILPIT}/messages`, { method: "DELETE" }).catch(() => {});
@@ -100,6 +107,26 @@ async function main() {
   const societeB = await societe("Laboratoire de l'espace B", B);
   const adminB = await compte({ nom: "Admin B", companyId: societeB, role: "admin" });
 
+  section("0. ESPACE DE LA REQUÊTE : DOMAINE EXACT, EN-TÊTES CLIENT ET PROXY");
+  {
+    const e = async (hote, entetes = {}, chemin = "/espace") => (await appelHote(hote, "GET", chemin, null, null, entetes));
+    verifier("malilinkglobal.com et www. : espace malilink établi par le domaine",
+      (await e("malilinkglobal.com")).data?.source === "domaine" && (await e("www.malilinkglobal.com")).data?.tenant_id === A);
+    verifier("hafiyalab.com : espace hafiya établi par le domaine", (await e("hafiyalab.com")).data?.tenant_id === B);
+    const pieges = [];
+    for (const h of ["evil-malilinkglobal.com", "malilinkglobal.com.evil.net", "hafiyalab.com.attaquant.io", "xhafiyalab.com"]) {
+      const r = await e(h);
+      if (r.data?.source === "domaine") pieges.push(`${h} → ${JSON.stringify(r.data)}`);
+    }
+    verifier("domaines piégés (inclusion, suffixe) : jamais reconnus, espace du déploiement seulement", pieges.length === 0, pieges.join(" ; "));
+    const xfh = await e("127.0.0.1", { "x-forwarded-host": "hafiyalab.com" });
+    verifier("X-Forwarded-Host fourni par le client : ignoré", xfh.data?.tenant_id === A && xfh.data?.source === "deploiement", JSON.stringify(xfh.data));
+    verifier("en-tête x-tenant-id contraire au domaine : requête refusée (400)", (await e("malilinkglobal.com", { "x-tenant-id": B })).status === 400);
+    verifier("en-tête x-tenant-id contraire au déploiement : requête refusée (400)", (await e("127.0.0.1", { "x-tenant-id": B })).status === 400);
+    verifier("paramètre ?tenant_id contraire : refusé (400)", (await e("malilinkglobal.com", {}, "/espace?tenant_id=hafiya")).status === 400);
+    verifier("en-tête identique à l'espace établi : accepté", (await e("malilinkglobal.com", { "x-tenant-id": A })).data?.tenant_id === A);
+  }
+
   section("1. CONNEXION EMAIL (compte d'une société)");
   {
     const c = await connexion(adminA.email, A);
@@ -107,9 +134,11 @@ async function main() {
     verifier("connexion dans l'espace de la société : jeton avec tenant_id ET company_id distincts", c.status === 200 && t.tenant_id === A && t.company_id === ecoleA.id && c.data.user.tenant_id === A, JSON.stringify(c.data).slice(0, 200));
     verifier("sans en-tête : espace du déploiement (comme sur malilinkglobal.com)", (await connexion(adminA.email, null)).status === 200);
     const autre = await connexion(adminA.email, B);
-    verifier("même compte via l'espace B (en-tête) : refusé", autre.status === 403 && !autre.data?.token);
-    const croise = await brut("GET", "/rbac/me", { token: c.data.token, entetes: { "x-tenant-id": B } });
-    verifier("jeton A présenté avec l'en-tête « espace B » : refusé (AUTRE_ESPACE)", croise.status === 403 && croise.data?.code === "AUTRE_ESPACE");
+    verifier("même compte sur le domaine de l'espace B : refusé", autre.status === 403 && !autre.data?.token);
+    const croise = await brut("GET", "/rbac/me", { token: c.data.token, hote: DOMAINE[B] });
+    verifier("jeton A présenté sur le domaine de l'espace B : refusé (AUTRE_ESPACE)", croise.status === 403 && croise.data?.code === "AUTRE_ESPACE");
+    const entete = await brut("GET", "/rbac/me", { token: c.data.token, entetes: { "x-tenant-id": B } });
+    verifier("jeton A + en-tête « espace B » : requête refusée (400), l'en-tête ne change pas d'espace", entete.status === 400);
     verifier("réponse de connexion sans mot de passe ni empreinte", sansMotDePasse(c.data));
     const b = await connexion(adminB.email, B);
     verifier("compte d'une société de l'espace B : connexion dans B, jeton tenant_id=hafiya", b.status === 200 && decoder(b.data?.token).tenant_id === B);
@@ -142,11 +171,11 @@ async function main() {
     verifier("connexion OAuth : jeton avec tenant_id", t.tenant_id === A && Boolean(t.company_id), nouveau.url.toString().slice(0, 160));
 
     const ancien = await compte({ nom: "Ancien client OAuth" });
-    const lie = await parcoursOAuth({ id: `ig-${alea()}`, email: ancien.email, name: "Ancien client" }, null);
-    const apres = (await q(`SELECT account_tenant_id, account_tenant_source FROM users WHERE id=$1`, [ancien.id]))[0];
-    verifier("ancien compte sans société relié par OAuth : rattaché à l'espace du site, journalisé",
-      decoder(lie.connexion?.token).tenant_id === A && apres.account_tenant_id === A && apres.account_tenant_source === "premiere_connexion"
-      && (await q(`SELECT 1 FROM audit_logs WHERE action='compte_rattache_espace' AND entity_id=$1`, [String(ancien.id)])).length === 1, JSON.stringify({ apres, e: lie.erreur }));
+    const lie = await parcoursOAuth({ id: `ig-${alea()}`, email: ancien.email, name: "Ancien client" }, A);
+    const apres = (await q(`SELECT account_tenant_id FROM users WHERE id=$1`, [ancien.id]))[0];
+    verifier("ancien compte sans société relié par OAuth : refusé (espace non établi), procédure expliquée, PAS rattaché",
+      !lie.connexion && /administration MaliLink doit confirmer/.test(lie.erreur || "") && apres.account_tenant_id === null, JSON.stringify({ apres, e: lie.erreur }));
+    ctx.ancienOAuth = { ...ancien, profil: lie };
 
     const deB = await parcoursOAuth({ id: `ig-${alea()}`, email: adminB.email, name: "Admin B" }, A);
     verifier("OAuth depuis l'espace A avec l'email d'un compte de l'espace B : refusé, aucun jeton", !deB.connexion && /autre espace/i.test(deB.erreur || ""), deB.url.toString().slice(0, 200));
@@ -154,7 +183,7 @@ async function main() {
     const flottant = await compte({ nom: "Ancien OAuth B" });
     const tente = await parcoursOAuth({ id: `ig-${alea()}`, email: flottant.email, name: "Ancien OAuth B" }, B);
     const reste = (await q(`SELECT account_tenant_id FROM users WHERE id=$1`, [flottant.id]))[0];
-    verifier("ancien compte, OAuth démarré avec l'en-tête « espace B » sur le site A : refusé, PAS rattaché", !tente.connexion && reste.account_tenant_id === null, tente.erreur || "");
+    verifier("ancien compte, OAuth démarré sur le domaine de l'espace B : refusé, PAS rattaché", !tente.connexion && reste.account_tenant_id === null, tente.erreur || "");
   }
 
   section("4. ANCIENS JETONS ET ANCIENS COMPTES SANS SOCIÉTÉ");
@@ -174,15 +203,43 @@ async function main() {
     }
 
     const ancien = await compte({ nom: "Ancien client" });
-    const viaEntete = await connexion(ancien.email, B);
-    verifier("ancien compte, en-tête « espace B » contraire au site : refusé (ESPACE_A_CONFIRMER), pas rattaché",
-      viaEntete.status === 403 && viaEntete.data?.code === "ESPACE_A_CONFIRMER" && (await q(`SELECT account_tenant_id FROM users WHERE id=$1`, [ancien.id]))[0].account_tenant_id === null);
-    const premier = await connexion(ancien.email, null);
-    const enBase = (await q(`SELECT account_tenant_id, account_tenant_source, account_tenant_set_at FROM users WHERE id=$1`, [ancien.id]))[0];
-    verifier("premier login sur le site : rattaché à son espace (source premiere_connexion), journalisé",
-      premier.status === 200 && decoder(premier.data?.token).tenant_id === A && enBase.account_tenant_id === A && enBase.account_tenant_source === "premiere_connexion" && enBase.account_tenant_set_at
-      && (await q(`SELECT 1 FROM audit_logs WHERE action='compte_rattache_espace' AND entity_id=$1`, [String(ancien.id)])).length === 1);
-    verifier("ensuite, via l'espace B : refusé (AUTRE_ESPACE)", (await connexion(ancien.email, B)).data?.code === "AUTRE_ESPACE");
+    ctx.ancien = ancien;
+    for (const espace of [null, A, B]) {
+      const r = await connexion(ancien.email, espace);
+      verifier(`ancien compte sans espace établi, connexion ${espace ? `sur ${DOMAINE[espace]}` : "sur le site"} : refusée, procédure expliquée`,
+        r.status === 403 && r.data?.code === "ESPACE_NON_ETABLI" && /contactez le support/.test(r.data?.error || "") && !r.data?.token, JSON.stringify(r.data));
+    }
+    verifier("…et toujours pas rattaché (aucune attribution silencieuse)", (await q(`SELECT account_tenant_id FROM users WHERE id=$1`, [ancien.id]))[0].account_tenant_id === null);
+    const jetonAncien = jeton({ id: ancien.id, role: "customer", company_id: null, tenant_id: A }); // émis par l'ancienne version
+    const opSensible = await brut("PUT", "/me/password", { token: jetonAncien, corps: { current_password: MDP, new_password: "Sensible-2026-ok" } });
+    verifier("jeton existant d'un compte sans espace établi : opérations refusées (ESPACE_NON_ETABLI)", opSensible.status === 403 && opSensible.data?.code === "ESPACE_NON_ETABLI"
+      && (await brut("GET", "/rbac/me", { token: jetonAncien })).data?.code === "ESPACE_NON_ETABLI");
+    const avantReset = (await q(`SELECT COUNT(*)::int AS n FROM password_reset_codes WHERE user_id=$1`, [ancien.id]))[0].n;
+    const reset = await brut("POST", "/password-reset/request", { corps: { identifier: ancien.email } });
+    verifier("récupération de mot de passe : réponse neutre, AUCUN code créé", reset.status === 200 && /Si ce compte existe/.test(reset.data?.message || "")
+      && (await q(`SELECT COUNT(*)::int AS n FROM password_reset_codes WHERE user_id=$1`, [ancien.id]))[0].n === avantReset);
+
+    // Attribution administrative explicite (script VPS), journalisée.
+    const sa = await compte({ nom: "Super Admin Attribution", role: "super_admin", superAdmin: true, espace: A });
+    ctx.sa = sa;
+    const script = (...a) => { try { return execFileSync("node", ["scripts/comptes/attribuer-espace.js", ...a], { env: process.env, encoding: "utf8", stdio: "pipe" }); } catch (e) { return `ÉCHEC ${e.stdout || ""}${e.stderr || ""}`; } };
+    const rapport = script("--rapport");
+    verifier("rapport (lecture seule) : comptes non rattachés listés, emails masqués", rapport.includes(`- ${ancien.id} `) && !rapport.includes(ancien.email) && /NON rattachés/.test(rapport), rapport.slice(0, 300));
+    const sansOui = script("--attribuer", "--espace", A, "--ids", String(ancien.id), "--par", sa.email, "--motif", "Client historique de MaliLink Global");
+    verifier("attribution sans --oui : refusée, rien modifié", /ÉCHEC/.test(sansOui) && (await q(`SELECT account_tenant_id FROM users WHERE id=$1`, [ancien.id]))[0].account_tenant_id === null);
+    const fait = script("--attribuer", "--espace", A, "--ids", `${ancien.id},${ctx.ancienOAuth.id}`, "--par", sa.email, "--motif", "Clients historiques de MaliLink Global (vérifiés)", "--preuve", "ticket support 42", "--oui");
+    const attribue = (await q(`SELECT account_tenant_id, account_tenant_source, account_tenant_set_by FROM users WHERE id=$1`, [ancien.id]))[0];
+    const journal = await q(`SELECT tenant_id, assigned_by, reason, evidence FROM account_tenant_assignments WHERE user_id=$1`, [ancien.id]);
+    verifier("attribution explicite : espace, source « attribution_admin », auteur, motif et preuve journalisés",
+      /ATTRIBUTION_ESPACE_EFFECTUEE · 2 compte/.test(fait) && attribue.account_tenant_id === A && attribue.account_tenant_source === "attribution_admin" && attribue.account_tenant_set_by === sa.id
+      && journal.length === 1 && journal[0].evidence === "ticket support 42"
+      && (await q(`SELECT 1 FROM audit_logs WHERE action='attribution_espace_compte' AND entity_id=$1`, [String(ancien.id)])).length === 1, fait.slice(-300));
+    verifier("une seconde attribution ne change pas un compte déjà rattaché", /déjà rattaché/.test(script("--attribuer", "--espace", B, "--ids", String(ancien.id), "--par", sa.email, "--motif", "Tentative de changement d'espace", "--oui")));
+    verifier("après attribution : connexion acceptée dans son espace, jeton existant de nouveau valable",
+      (await connexion(ancien.email, null)).status === 200 && (await brut("GET", "/rbac/me", { token: jetonAncien })).status === 200);
+    verifier("après attribution : refusé sur le domaine de l'autre espace (AUTRE_ESPACE)", (await connexion(ancien.email, B)).data?.code === "AUTRE_ESPACE");
+    const oauthApres = await parcoursOAuth({ id: `ig-${alea()}`, email: ctx.ancienOAuth.email, name: "Ancien client" }, A);
+    verifier("après attribution : la connexion OAuth de l'ancien compte aboutit", decoder(oauthApres.connexion?.token).tenant_id === A, oauthApres.erreur || "");
     const livreur = await brut("POST", "/delivery/drivers/public-register", { corps: { fullname: "Livreur Essai", phone: `6${String(Date.now()).slice(-7)}`, password: MDP, driver_type: "livreur", vehicle_type: "moto" } });
     if (livreur.status === 201) {
       const l = (await q(`SELECT account_tenant_id, account_tenant_source FROM users WHERE id=$1`, [livreur.data.user.id]))[0];
@@ -194,7 +251,7 @@ async function main() {
 
   section("5. ACCÈS ENTRE ESPACES — SUPER ADMIN COMPRIS");
   {
-    const sa = await compte({ nom: "Super Admin A", role: "super_admin", superAdmin: true, espace: A });
+    const sa = ctx.sa;
     const c = await connexion(sa.email, null);
     const tSA = c.data?.token;
     verifier("Super Admin : jeton de son espace", c.status === 200 && decoder(tSA).tenant_id === A);
@@ -211,8 +268,34 @@ async function main() {
     const societes = await brut("GET", "/super-admin/companies", { token: tSA });
     verifier("liste des sociétés : seulement l'espace A", societes.status === 200 && societes.data.some((x) => x.id === ecoleA.id) && !societes.data.some((x) => x.id === societeB));
     const utilisateurs = await brut("GET", "/super-admin/users", { token: tSA });
-    verifier("liste des utilisateurs : espace A (anciens comptes non rattachés visibles), jamais l'espace B",
-      utilisateurs.status === 200 && utilisateurs.data.some((x) => x.id === adminA.id) && !utilisateurs.data.some((x) => x.id === adminB.id) && sansMotDePasse(utilisateurs.data));
+    const nonEtabli = await compte({ nom: "Compte non etabli" });
+    const listeApres = await brut("GET", "/super-admin/users", { token: tSA });
+    verifier("liste des utilisateurs : appartenance PROUVÉE seulement (ni espace B, ni compte sans espace établi)",
+      utilisateurs.status === 200 && utilisateurs.data.some((x) => x.id === adminA.id) && utilisateurs.data.some((x) => x.id === ctx.ancien.id)
+      && !utilisateurs.data.some((x) => x.id === adminB.id) && !listeApres.data.some((x) => x.id === nonEtabli.id) && sansMotDePasse(utilisateurs.data));
+    const empreinte = (await q(`SELECT password, fullname FROM users WHERE id=$1`, [nonEtabli.id]))[0];
+    const actions = [
+      ["PUT", `/super-admin/users/${nonEtabli.id}`, { fullname: "Modifié par le Super Admin" }],
+      ["PUT", `/super-admin/users/${nonEtabli.id}/password`, { password: "Autre-2026-ok" }],
+      ["DELETE", `/super-admin/users/${nonEtabli.id}`],
+      ["POST", `/users/${nonEtabli.id}/reset-password`],
+      ["PUT", `/users/${nonEtabli.id}`, { fullname: "Modifié (route générique)" }],
+      ["DELETE", `/users/${nonEtabli.id}`],
+      ["GET", `/users/${nonEtabli.id}/permissions`],
+      ["PUT", `/users/${adminB.id}/permissions`, { permissions: [] }],
+      ["DELETE", `/users/${adminB.id}`],
+    ];
+    const accepte = [];
+    for (const [m, chemin, corps] of actions) {
+      const r = await brut(m, chemin, { token: tSA, corps });
+      if (r.status !== 404) accepte.push(`${m} ${chemin} → ${r.status}`);
+    }
+    const apresActions = (await q(`SELECT password, fullname FROM users WHERE id=$1`, [nonEtabli.id]))[0];
+    verifier("Super Admin sur un compte sans appartenance prouvée (ou de l'espace B) : modification, mot de passe, réinitialisation, permissions et suppression refusées (404)",
+      accepte.length === 0 && apresActions && apresActions.password === empreinte.password && apresActions.fullname === empreinte.fullname
+      && (await q(`SELECT 1 FROM users WHERE id=$1`, [adminB.id])).length === 1, accepte.join(" ; "));
+    const prouve = await brut("PUT", `/super-admin/users/${ctx.ancien.id}`, { token: tSA, corps: { fullname: "Ancien client (vérifié)", email: ctx.ancien.email, phone: "", role: "customer", is_active: true } });
+    verifier("…mais autorisé sur un compte dont l'appartenance a été prouvée", prouve.status === 200, JSON.stringify(prouve.data).slice(0, 120));
     const modules = await brut("GET", "/super-admin/modules", { token: tSA });
     verifier("modules par société : seulement l'espace A", modules.status === 200 && !modules.data.companies.some((x) => x.id === societeB));
     const vue = await brut("GET", "/super-admin/overview", { token: tSA });
@@ -292,6 +375,57 @@ async function main() {
     verifier("mot de passe fixé par le Super Admin : changement imposé, sessions fermées, rien d'affiché",
       fixe.status === 200 && apres.force_password_change === true && (await brut("GET", "/rbac/me", { token: tU })).status === 401 && sansMotDePasse(fixe.data));
     verifier("journal : mot de passe fixé par le Super Admin", (await q(`SELECT 1 FROM audit_logs WHERE action='super_admin_password_set' AND entity_id=$1`, [String(u.id)])).length === 1);
+  }
+
+  section("7. TEMPS RÉEL (socket) : ESPACE, STATUT DU COMPTE, RÉVOCATION, PRÉSENCE");
+  {
+    const ioClient = require(require.resolve("socket.io-client", { paths: [path.join(__dirname, "../../frontend")] }));
+    const ouvrir = (token, hote) => new Promise((ok) => {
+      const evenements = [];
+      const s = ioClient.io(BASE, { auth: { token }, transports: ["websocket"], reconnection: false, timeout: 8000, ...(hote ? { extraHeaders: { host: hote } } : {}) });
+      s.onAny((nom, donnees) => evenements.push({ nom, donnees }));
+      s.on("connect", () => ok({ s, connecte: true, evenements }));
+      s.on("connect_error", (e) => { s.close(); ok({ s, connecte: false, erreur: e.message, evenements }); });
+    });
+    const membre = async (nom, companyId, espace) => {
+      const u = await compte({ nom, companyId, role: companyId ? "magasinier" : "customer", espace: companyId ? null : espace });
+      const r = await connexion(u.email, espace);
+      return { ...u, token: r.data?.token };
+    };
+    const a1 = await membre("Socket A1", ecoleA.id, A);
+    const a2 = await membre("Socket A2", ecoleA.id, A);
+    const b1 = await membre("Socket B1", societeB, B);
+    const sa1 = await ouvrir(a1.token);
+    const sb1 = await ouvrir(b1.token, DOMAINE[B]);
+    verifier("connexion temps réel valide dans chaque espace (A par le site, B par son domaine)", sa1.connecte && sb1.connecte, `${sa1.erreur || ""} ${sb1.erreur || ""}`);
+    const sa2 = await ouvrir(a2.token);
+    await attendre(800);
+    const presence = (ev, id) => ev.some((e) => e.nom === "presence:online" && e.donnees?.user_id === id);
+    verifier("présence : A1 voit l'arrivée de A2 (même espace)", presence(sa1.evenements, a2.id));
+    verifier("présence : B1 ne voit RIEN de l'espace A, A1 ne voit rien de B", !presence(sb1.evenements, a2.id) && !presence(sb1.evenements, a1.id) && !presence(sa1.evenements, b1.id));
+    const mauvaisDomaine = await ouvrir(a1.token, DOMAINE[B]);
+    verifier("jeton A sur le domaine de l'espace B : connexion refusée (AUTRE_ESPACE)", !mauvaisDomaine.connecte && mauvaisDomaine.erreur === "AUTRE_ESPACE", mauvaisDomaine.erreur);
+    const nonEtabli = await compte({ nom: "Socket non etabli" });
+    const sansEspace = await ouvrir(jeton({ id: nonEtabli.id, role: "customer", company_id: null, tenant_id: A }));
+    verifier("compte sans espace établi : connexion refusée (ESPACE_NON_ETABLI)", !sansEspace.connecte && sansEspace.erreur === "ESPACE_NON_ETABLI", sansEspace.erreur);
+
+    // Révocation : changement de mot de passe → la connexion ouverte est fermée aussitôt.
+    const ferme = new Promise((ok) => { sa1.s.on("disconnect", (raison) => ok(raison)); setTimeout(() => ok("toujours connecté"), 8000); });
+    await brut("PUT", "/me/password", { token: a1.token, corps: { current_password: MDP, new_password: "Socket-2026-ok" } });
+    const raison = await ferme;
+    verifier("session révoquée (mot de passe changé) : connexion temps réel fermée par le serveur, motif annoncé",
+      raison === "io server disconnect" && sa1.evenements.some((e) => e.nom === "session:fermee" && e.donnees?.code === "session_revoquee"), `${raison} ${JSON.stringify(sa1.evenements.slice(-2))}`);
+    const revoque = await ouvrir(a1.token);
+    verifier("ancien jeton révoqué : nouvelle connexion refusée", !revoque.connecte && revoque.erreur === "session_revoquee", revoque.erreur);
+
+    // Désactivation par le Super Admin : connexion fermée, API et temps réel refusés.
+    const tSA = (await connexion(ctx.sa.email, null)).data.token;
+    const fermeA2 = new Promise((ok) => { sa2.s.on("disconnect", (r) => ok(r)); setTimeout(() => ok("toujours connecté"), 8000); });
+    await brut("PUT", `/super-admin/users/${a2.id}`, { token: tSA, corps: { fullname: "Socket A2", email: a2.email, phone: "", role: "magasinier", is_active: false } });
+    verifier("compte désactivé : connexion temps réel fermée aussitôt", (await fermeA2) === "io server disconnect");
+    verifier("compte désactivé : API refusée (COMPTE_DESACTIVE) et reconnexion temps réel refusée",
+      (await brut("GET", "/rbac/me", { token: a2.token })).data?.code === "COMPTE_DESACTIVE" && (await ouvrir(a2.token)).erreur === "COMPTE_DESACTIVE");
+    for (const x of [sa2, sb1]) x.s.close();
   }
 
   fournisseur.close();

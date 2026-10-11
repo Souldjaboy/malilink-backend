@@ -41,6 +41,35 @@ async function appel(methode, chemin, token, corps, entetes = {}) {
 }
 const q = async (sql, p = []) => (await pool.query(sql, p)).rows;
 
+/* Requête avec un en-tête Host choisi (fetch l'ignore) : pour éprouver
+   l'espace établi par le DOMAINE (ex. « hafiyalab.com »). → { status, data, location } */
+function appelHote(hote, methode, chemin, token, corps, entetes = {}) {
+  const u = new URL(BASE);
+  const donnees = corps ? JSON.stringify(corps) : null;
+  return new Promise((ok, ko) => {
+    const r = require("http").request({
+      host: u.hostname, port: u.port, path: chemin, method: methode,
+      headers: {
+        host: hote, "Content-Type": "application/json",
+        ...(donnees ? { "Content-Length": Buffer.byteLength(donnees) } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}), ...entetes,
+      },
+    }, (res) => {
+      let texte = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { texte += c; });
+      res.on("end", () => {
+        let data = null;
+        try { data = JSON.parse(texte); } catch { /* corps vide ou redirection */ }
+        ok({ status: res.statusCode, data, location: res.headers.location || "" });
+      });
+    });
+    r.on("error", ko);
+    if (donnees) r.write(donnees);
+    r.end();
+  });
+}
+
 /* Société + administrateur, sur le tenant malilink, avec des modules posés. */
 async function creerSociete({ nom, type = "commerce", planCode = "business", modules = {} }) {
   const plan = (await q(`SELECT id FROM subscription_plans WHERE commercial_code = $1`, [planCode]))[0];
@@ -67,4 +96,4 @@ async function terminer() {
   process.exit(bilan.echoues === 0 ? 0 : 1);
 }
 
-module.exports = { BASE, pool, q, appel, jeton, jetonSuperAdmin, verifier, section, creerSociete, terminer, bilan };
+module.exports = { BASE, pool, q, appel, appelHote, jeton, jetonSuperAdmin, verifier, section, creerSociete, terminer, bilan };
