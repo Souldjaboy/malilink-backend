@@ -1,4 +1,10 @@
-# MaliLink — livraison finale : comptes, OTP, espaces, Super Admin, directs
+# MaliLink — livraison finale (révision 2) : comptes, OTP, espaces, Super Admin, directs
+
+Révision 2 : corrige les défauts relevés par la revue de la première archive
+(domaines, en-têtes client, rattachement automatique, comptes non prouvés côté
+Super Admin, fichiers « nouveaux » au retour arrière, temps réel). Elle
+remplace `malilink-livraison-finale-20261011.tar.gz`, qui ne doit pas être
+déployée.
 
 Une seule archive à déployer. Elle ne touche que `malilink-backend` et
 `malilink-frontend` : ni Triangle, ni HAFIYA, ni Nginx, ni la facturation ADA.
@@ -12,17 +18,30 @@ conservés à l'identique (fichiers contrôlés par empreinte).
 
 ## Ce qui change pour les utilisateurs
 
-- **Espaces** : chaque jeton porte l'espace vérifié du compte. Ni le domaine
-  ni un en-tête ne permettent de changer d'espace.
+- **Espaces** : chaque jeton porte l'espace vérifié du compte.
+  - Espace d'une requête : celui du **domaine** reconnu (`malilinkglobal.com`
+    et ses sous-domaines, liste exacte), sinon celui du déploiement
+    (`DEFAULT_TENANT_ID`).
+  - Un en-tête ou un paramètre client contraire est refusé (400).
+  - `X-Forwarded-Host` n'est jamais pris en compte.
 - **Reconnexion** : un jeton sans espace demande une reconnexion. C'est le cas
   des jetons OAuth, de ceux obtenus après saisie d'un code, et de ceux de
   l'inscription par téléphone. Les jetons de la connexion par mot de passe
   restent valables.
-- **Anciens comptes sans société** (clients, livreurs) : rattachés à leur
-  espace à la prochaine connexion sur le site. Le rattachement est journalisé
-  (`compte_rattache_espace`). Aucun espace n'est attribué par défaut.
+- **Anciens comptes sans société** (clients, livreurs, éventuellement un
+  Super Admin sans société) : **aucun rattachement automatique**. Tant que
+  leur espace n'est pas attribué explicitement, ils ne peuvent ni se
+  connecter, ni utiliser un jeton existant, ni récupérer leur mot de passe.
+  Le message leur indique de contacter le support. L'attribution se fait
+  juste après le déploiement, par le script `attribuer-espace.js`
+  (section 3), et elle est journalisée.
 - **Super Admin** : écoles, utilisateurs et chiffres limités à son espace.
-  L'école choisie doit appartenir à cet espace.
+  L'école choisie doit appartenir à cet espace. Un compte dont
+  l'appartenance à l'espace n'est pas **prouvée** est invisible et intouchable
+  (modification, mot de passe, suppression).
+- **Temps réel** : mêmes contrôles que l'API. Une session révoquée ou un
+  compte désactivé est déconnecté aussitôt, et la présence n'est diffusée que
+  dans l'espace.
 - **Sessions** : après une récupération ou un changement de mot de passe, et
   après un mot de passe fixé par le Super Admin, les autres sessions sont
   fermées.
@@ -30,7 +49,7 @@ conservés à l'identique (fichiers contrôlés par empreinte).
 ## 1. Sur le Mac
 
 ```bash
-scp ~/Development/livraisons/malilink-livraison-finale-20261011.tar.gz root@72.62.232.24:/root/
+scp ~/Development/livraisons/malilink-livraison-finale-r2-20261011.tar.gz root@72.62.232.24:/root/
 ```
 
 ## 2. Sur le VPS
@@ -40,13 +59,13 @@ aussi : en cas de coupure, il fait un retour arrière vérifié.
 
 ```bash
 tmux new -s livraison
-cd /root && sha256sum malilink-livraison-finale-20261011.tar.gz
+cd /root && sha256sum malilink-livraison-finale-r2-20261011.tar.gz
 ```
 
 Comparer avec le SHA-256 communiqué, puis :
 
 ```bash
-cd /root && tar xzf malilink-livraison-finale-20261011.tar.gz && cd malilink-livraison-finale
+cd /root && tar xzf malilink-livraison-finale-r2-20261011.tar.gz && cd malilink-livraison-finale-r2
 sha256sum -c --quiet EMPREINTES.sha256 && echo "paquet intègre"
 bash precontrole.sh
 ```
@@ -60,9 +79,15 @@ bash precontrole.sh
   - **moteur PostgreSQL** et migrations en attente (089, 090, 091) ;
   - méthode de répétition des migrations ;
   - infrastructure des directs.
-- **A. Espaces** : sociétés par espace. Les sociétés hors de l'espace
-  `malilink` ne se connectent déjà pas sur MaliLink et disparaîtront des
-  listes du Super Admin : à examiner si la liste n'est pas vide.
+- **A. Espaces** :
+  - sociétés par espace ;
+  - valeur de `DEFAULT_TENANT_ID` ;
+  - **comptes sans société sans espace établi**, par rôle, et Super Admins
+    sans société ni espace. Ces comptes ne pourront plus se connecter avant
+    leur attribution (section 3).
+  - Les sociétés hors de l'espace `malilink` ne se connectent déjà pas sur
+    MaliLink et disparaîtront des listes du Super Admin : à examiner si la
+    liste n'est pas vide.
 - **B. École (société 8)** : nom, espace, statuts, administrateurs (emails
   masqués).
 - **C. SMTP** : connexion et authentification réelles, **sans envoi**.
@@ -105,7 +130,39 @@ Codes de sortie :
 ```bash
 pm2 status
 cd "$(readlink -f /proc/$(pm2 pid malilink-backend)/cwd)"
+curl -s https://malilinkglobal.com/api/espace
 ```
+
+La dernière commande doit afficher `{"tenant_id":"malilink","source":"domaine"}`
+(ou `"deploiement"`). Le déploiement le contrôle aussi.
+
+**Anciens comptes sans société : attribution explicite de l'espace.** À faire
+juste après le déploiement : sans elle, ces comptes ne peuvent pas se
+connecter.
+
+```bash
+node scripts/comptes/attribuer-espace.js --rapport
+```
+
+Le rapport est en lecture seule : comptes par rôle, liste des non rattachés,
+emails et téléphones masqués. Ensuite, deux possibilités.
+
+- Si **tous** ces comptes appartiennent à MaliLink (base dédiée à MaliLink),
+  c'est votre décision explicite, journalisée :
+
+```bash
+node scripts/comptes/attribuer-espace.js --attribuer --espace malilink --tous-non-rattaches --par auto --motif "Comptes historiques de la base MaliLink Global" --oui
+```
+
+- Sinon, compte par compte (`--ids 12,15`), après vérification :
+
+```bash
+node scripts/comptes/attribuer-espace.js --attribuer --espace malilink --ids <IDS> --par auto --motif "<raison>" --preuve "<ticket, échange…>" --oui
+```
+
+Chaque attribution est inscrite dans `account_tenant_assignments` et
+`audit_logs`. Un compte déjà rattaché n'est jamais modifié. `--par auto`
+exige un seul Super Admin actif ; sinon, utilisez `--par <email>`.
 
 **École (société 8)**. Identification, en lecture seule :
 
@@ -155,8 +212,8 @@ less /root/backups/malilink-livraison-finale-*/deploiement.log
 ```sql
 -- derniers envois
 SELECT created_at, purpose, recipient_masked, status, error FROM email_delivery_log ORDER BY id DESC LIMIT 10;
--- rattachements
-SELECT created_at, action, entity_id, details FROM audit_logs WHERE action IN ('compte_rattache_espace','admin_account_validation') ORDER BY id DESC LIMIT 20;
+-- attributions d'espace et validations
+SELECT created_at, action, entity_id, details FROM audit_logs WHERE action IN ('attribution_espace_compte','admin_account_validation') ORDER BY id DESC LIMIT 20;
 ```
 
 **Directs** : ils restent « indisponibles » tant que LiveKit n'est pas installé.
