@@ -6,6 +6,7 @@ joignable ET que les drapeaux ne sont pas activés, l'application affiche
 vérifie réellement LiveKit avant d'ouvrir quoi que ce soit.
 
 Ce document ne fournit ni DNS, ni certificat, ni clé : tout se crée chez vous.
+Toutes les commandes se lancent depuis ce dossier (celui des fichiers `*.example`).
 
 Modèles vérifiés localement le 11/10/2026 : `livekit.yaml.example` démarre
 LiveKit 1.13.8 avec son TURN (UDP 3478, TLS 5349, relais 30000-40000) ; les
