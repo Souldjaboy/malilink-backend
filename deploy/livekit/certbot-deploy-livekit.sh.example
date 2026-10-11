@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# /etc/letsencrypt/renewal-hooks/deploy/livekit.sh  (chmod 700)
+# Copie le certificat de rtc.malilinkglobal.com pour le TURN/TLS de LiveKit
+# (le service tourne sous l'utilisateur livekit, sans accès à /etc/letsencrypt).
+set -euo pipefail
+case " ${RENEWED_DOMAINS:-rtc.malilinkglobal.com} " in *" rtc.malilinkglobal.com "*) ;; *) exit 0 ;; esac
+install -d -m 750 -o livekit -g livekit /etc/livekit/tls
+install -m 640 -o livekit -g livekit /etc/letsencrypt/live/rtc.malilinkglobal.com/fullchain.pem /etc/livekit/tls/fullchain.pem
+install -m 600 -o livekit -g livekit /etc/letsencrypt/live/rtc.malilinkglobal.com/privkey.pem /etc/livekit/tls/privkey.pem
+systemctl restart livekit 2>/dev/null || true

@@ -1,0 +1,10 @@
+# ÉTAPE 1 (HTTP seul, pour obtenir le certificat) :
+#   /etc/nginx/sites-available/rtc.malilinkglobal.com
+# Site DÉDIÉ : n'altère aucun autre site Nginx. À activer seulement quand
+# « dig +short rtc.malilinkglobal.com » renvoie l'IP du VPS.
+server {
+    listen 80;
+    server_name rtc.malilinkglobal.com;
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 404; }
+}

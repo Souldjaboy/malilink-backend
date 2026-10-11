@@ -1,7 +1,7 @@
-# /etc/nginx/sites-available/rtc.malilinkglobal.com
-# Site DÉDIÉ : n'altère aucun autre site Nginx. À activer seulement quand
-# « dig +short rtc.malilinkglobal.com » renvoie 72.62.232.24, puis :
-#   certbot --nginx -d rtc.malilinkglobal.com
+# ÉTAPE 2 (après « certbot certonly --webroot ») : remplace le fichier de l'étape 1.
+#   /etc/nginx/sites-available/rtc.malilinkglobal.com
+# « listen 443 ssl http2 » : compatible avec le Nginx d'Ubuntu 22.04/24.04
+# (« http2 on; » exige Nginx ≥ 1.25.1).
 server {
     listen 80;
     server_name rtc.malilinkglobal.com;
@@ -10,8 +10,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    http2 on;
+    listen 443 ssl http2;
     server_name rtc.malilinkglobal.com;
 
     ssl_certificate     /etc/letsencrypt/live/rtc.malilinkglobal.com/fullchain.pem;
