@@ -31,9 +31,11 @@ function verifier(titre, condition, detail = "") {
 }
 const section = (t) => console.log(`\n${G}${t}${Z}`);
 
+// Jeton comme à la connexion : il porte l'espace du compte.
 const jeton = (u) => jwt.sign({
   id: u.id, fullname: u.fullname || "Essai", email: u.email || `u${u.id}@essai.test`,
   role: u.role, company_id: u.company_id ?? null, is_super_admin: Boolean(u.is_super_admin),
+  tenant_id: u.tenant_id || "malilink",
 }, SECRET, { expiresIn: "2h" });
 
 async function appel(methode, chemin, token, corps, entetes = {}) {

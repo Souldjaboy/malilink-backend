@@ -15,9 +15,12 @@ function verifier(titre, condition, detail = "") {
 }
 const section = (t) => console.log(`\n${G}${t}${Z}`);
 
+// Comme à la connexion, le jeton porte l'espace du compte (malilink par
+// défaut ici) ; tenant_id: null fabrique un ancien jeton sans espace.
 const jeton = (u) => jwt.sign({
   id: u.id, fullname: u.fullname || "Essai", email: u.email || `u${u.id}@essai.test`,
   role: u.role, company_id: u.company_id ?? null, is_super_admin: Boolean(u.is_super_admin),
+  ...(u.tenant_id === null ? {} : { tenant_id: u.tenant_id || "malilink" }),
 }, SECRET, { expiresIn: "2h" });
 const jetonSuperAdmin = () => jeton({ id: 999001, role: "super_admin", is_super_admin: true });
 

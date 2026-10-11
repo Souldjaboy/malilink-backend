@@ -23,23 +23,30 @@ const TENANT_B = "hafiya";
 
 async function personne(nom) {
   const u = (await q(
-    `INSERT INTO users (fullname, email, password, role, company_id) VALUES ($1,$2,'x','customer',NULL) RETURNING id, role, company_id`,
+    `INSERT INTO users (fullname, email, password, role, company_id, account_tenant_id, account_tenant_source)
+     VALUES ($1,$2,'x','customer',NULL,'malilink','inscription') RETURNING id, role, company_id`,
     [nom, `${nom.toLowerCase().replace(/\W/g, "")}-${crypto.randomBytes(3).toString("hex")}@essai.test`]))[0];
   const token = jeton(u);
   const r = await appel("POST", "/social/profile", token, { display_name: nom, birth_date: "1995-03-10", photo_url: "/uploads/photo-essai.jpg", city: "Bamako", is_public: true });
   if (r.status >= 300) throw new Error(`profil ${nom} : ${JSON.stringify(r.data)}`);
   return { ...u, nom, token };
 }
-/* Membre rattaché à un tenant : jeton portant tenant_id, comme à la connexion. */
+/* Membre d'un espace : compte sans société rattaché à son espace (comme à
+   l'inscription), jeton portant tenant_id comme à la connexion. */
+const SOCIAL_ESPACES = String(process.env.SOCIAL_ESPACES || "malilink").split(",").map((t) => t.trim());
+const socialActif = (tenant) => SOCIAL_ESPACES.includes(tenant);
 async function membre(nom, tenant, extra = {}) {
   const u = (await q(
-    `INSERT INTO users (fullname, email, password, role, company_id, tenant_id, is_super_admin) VALUES ($1,$2,'x',$3,NULL,$4,$5) RETURNING id`,
+    `INSERT INTO users (fullname, email, password, role, company_id, account_tenant_id, account_tenant_source, is_super_admin)
+     VALUES ($1,$2,'x',$3,NULL,$4,'inscription',$5) RETURNING id`,
     [nom, `${nom.toLowerCase().replace(/\W/g, "")}-${crypto.randomBytes(3).toString("hex")}@essai.test`, extra.superAdmin ? "super_admin" : "customer", tenant, Boolean(extra.superAdmin)]))[0];
   const token = jwt.sign({ id: u.id, role: extra.superAdmin ? "super_admin" : "customer", company_id: null, tenant_id: tenant, is_super_admin: Boolean(extra.superAdmin) },
     process.env.JWT_SECRET, { expiresIn: "2h" });
   const entetes = { "x-tenant-id": tenant };
-  const r = await appel("POST", "/social/profile", token, { display_name: nom, birth_date: "1994-05-02", photo_url: "/uploads/photo-essai.jpg", city: "Bamako", is_public: true }, entetes);
-  if (r.status >= 300) throw new Error(`profil ${nom} (${tenant}) : ${JSON.stringify(r.data)}`);
+  if (socialActif(tenant)) {
+    const r = await appel("POST", "/social/profile", token, { display_name: nom, birth_date: "1994-05-02", photo_url: "/uploads/photo-essai.jpg", city: "Bamako", is_public: true }, entetes);
+    if (r.status >= 300) throw new Error(`profil ${nom} (${tenant}) : ${JSON.stringify(r.data)}`);
+  }
   return { id: u.id, nom, token, tenant, entetes };
 }
 async function directEnBase(hote, { vu = "NOW()" } = {}) {
@@ -49,11 +56,15 @@ async function directEnBase(hote, { vu = "NOW()" } = {}) {
     [crypto.randomBytes(12).toString("base64url"), hote.tenant, hote.id, `Direct ${hote.tenant} de ${hote.nom}`, `live-${crypto.randomBytes(12).toString("hex")}`]))[0];
 }
 
-/* Isolation A/B : un membre (ou un Super Admin) du tenant A ne trouve aucun
-   direct du tenant B, même avec son identifiant, sur aucune route ; et
-   réciproquement. Le nettoyage automatique reste limité au tenant. */
+/* Isolation A/B : un membre (ou un Super Admin) de l'espace A ne trouve aucun
+   direct de l'espace B, même avec son identifiant, sur aucune route ; et
+   réciproquement. Le nettoyage automatique reste limité à l'espace.
+   Par défaut Social n'existe que dans l'espace malilink : l'espace B est alors
+   arrêté dès l'entrée du module ; avec SOCIAL_ESPACES=malilink,hafiya, ce sont
+   les filtres des directs eux-mêmes qui sont éprouvés de B vers A. */
 async function isolationTenants() {
-  section(`ISOLATION ENTRE TENANTS (A=${TENANT_A}, B=${TENANT_B})`);
+  const B_ACTIF = socialActif(TENANT_B);
+  section(`ISOLATION ENTRE ESPACES (A=${TENANT_A}, B=${TENANT_B}, Social dans B : ${B_ACTIF ? "oui" : "non"})`);
   const hoteA = await membre("Awa Tenant A", TENANT_A);
   const intrusA = await membre("Moussa Tenant A", TENANT_A);
   const saA = await membre("SA Tenant A", TENANT_A, { superAdmin: true });
@@ -62,27 +73,28 @@ async function isolationTenants() {
   const intrusB = await membre("Sira Tenant B", TENANT_B);
   const liveA = await directEnBase(hoteA);
   let liveB = await directEnBase(hoteB);
-  if (MODE === "reel") {
-    // En mode réel, le direct B est créé par l'API (tenant de la requête).
+  if (MODE === "reel" && B_ACTIF) {
+    // Social actif dans B : le direct B est créé par l'API (espace de la requête).
     await q(`DELETE FROM social_lives WHERE id=$1`, [liveB.id]);
     const cree = await appel("POST", "/social/lives", hoteB.token, { title: "Direct du tenant B", audience: "public" }, hoteB.entetes);
-    verifier("tenant B : direct créé par l'API, rattaché au tenant B", cree.status === 201
+    verifier("espace B : direct créé par l'API, rattaché à l'espace B", cree.status === 201
       && (await q(`SELECT tenant_id FROM social_lives WHERE public_id=$1`, [cree.data.live?.id]))[0]?.tenant_id === TENANT_B, JSON.stringify(cree.data));
     liveB = (await q(`SELECT id, public_id FROM social_lives WHERE public_id=$1`, [cree.data.live.id]))[0];
     const rej = await appel("POST", `/social/lives/${liveB.public_id}/rejoindre`, spectB.token, null, spectB.entetes);
-    verifier("tenant B : un membre B rejoint le direct B (contrôle positif)", rej.status === 200 && Boolean(rej.data.token));
+    verifier("espace B : un membre B rejoint le direct B (contrôle positif)", rej.status === 200 && Boolean(rej.data.token));
   } else {
     await q(`INSERT INTO social_live_viewers (live_id, user_id) VALUES ($1,$2)`, [liveB.id, spectB.id]);
   }
   const comB = (await q(`INSERT INTO social_live_comments (live_id, user_id, content) VALUES ($1,$2,'Bonjour B') RETURNING id`, [liveB.id, spectB.id]))[0];
   const comA = (await q(`INSERT INTO social_live_comments (live_id, user_id, content) VALUES ($1,$2,'Bonjour A') RETURNING id`, [liveA.id, hoteA.id]))[0];
 
-  verifier("contrôle positif : l'hôte B voit son direct dans le tenant B",
-    (await appel("GET", `/social/lives/${liveB.public_id}`, hoteB.token, null, hoteB.entetes)).status === 200);
-  verifier("contrôle positif : l'hôte A voit son direct dans le tenant A",
+  verifier("contrôle positif : l'hôte A voit son direct dans l'espace A",
     (await appel("GET", `/social/lives/${liveA.public_id}`, hoteA.token, null, hoteA.entetes)).status === 200);
+  const propreB = await appel("GET", `/social/lives/${liveB.public_id}`, hoteB.token, null, hoteB.entetes);
+  verifier(B_ACTIF ? "contrôle positif : l'hôte B voit son direct dans l'espace B" : "espace B : réseau social indisponible, même pour l'hôte du direct B (404)",
+    B_ACTIF ? propreB.status === 200 : propreB.status === 404 && propreB.data?.code === "SOCIAL_HORS_ESPACE", JSON.stringify(propreB.data));
 
-  // Toutes les routes d'un direct, avec l'identifiant de l'autre tenant.
+  // Toutes les routes d'un direct, avec l'identifiant de l'autre espace.
   const routes = (pid, cid, cible) => [
     ["GET", `/social/lives/${pid}`],
     ["POST", `/social/lives/${pid}/rejoindre`],
@@ -96,27 +108,28 @@ async function isolationTenants() {
     ["POST", `/social/lives/${pid}/signaler`, { raison: "autre" }],
     ["POST", `/social/lives/${pid}/terminer`],
   ];
-  // Sans serveur média, rejoindre/jeton répondent 503 avant toute recherche : aucun accès non plus.
-  const attendu = (chemin) => (MODE !== "reel" && /\/(rejoindre|jeton)$/.test(chemin) ? [503] : [404]);
+  // Espace sans Social : 404 dès l'entrée. Sinon, sans serveur média,
+  // rejoindre/jeton répondent 503 avant toute recherche : aucun accès non plus.
+  const attendu = (qui, chemin) => (!socialActif(qui.tenant) ? [404] : MODE !== "reel" && /\/(rejoindre|jeton)$/.test(chemin) ? [503] : [404]);
   const essayer = async (qui, pid, cid, cible) => {
     const ecarts = [];
     for (const [m, chemin, corps] of routes(pid, cid, cible)) {
       const r = await appel(m, chemin, qui.token, corps, qui.entetes);
       const fuite = r.data && (r.data.token || r.data.title || Array.isArray(r.data));
-      if (!attendu(chemin).includes(r.status) || fuite) ecarts.push(`${m} ${chemin.replace(pid, ":id")} → ${r.status}`);
+      if (!attendu(qui, chemin).includes(r.status) || fuite) ecarts.push(`${m} ${chemin.replace(pid, ":id")} → ${r.status}`);
     }
     return ecarts;
   };
   const ab = await essayer(intrusA, liveB.public_id, comB.id, spectB.id);
   verifier("membre A sur le direct B : introuvable sur les 11 routes", ab.length === 0, ab.join(" ; "));
   const sa = await essayer(saA, liveB.public_id, comB.id, spectB.id);
-  verifier("Super Admin du tenant A sur le direct B : introuvable aussi", sa.length === 0, sa.join(" ; "));
+  verifier("Super Admin de l'espace A sur le direct B : introuvable aussi", sa.length === 0, sa.join(" ; "));
   const hoteSurB = await essayer(hoteA, liveB.public_id, comB.id, spectB.id);
   verifier("hôte A (qui a un direct) sur le direct B : introuvable", hoteSurB.length === 0, hoteSurB.join(" ; "));
   const ba = await essayer(intrusB, liveA.public_id, comA.id, hoteA.id);
   verifier("membre B sur le direct A : introuvable sur les 11 routes", ba.length === 0, ba.join(" ; "));
   const entete = await appel("GET", `/social/lives/${liveB.public_id}`, intrusA.token, null, { "x-tenant-id": TENANT_B });
-  verifier("jeton A + en-tête « tenant B » : refusé à l'authentification", entete.status === 403);
+  verifier("jeton A + en-tête « espace B » : refusé à l'authentification", entete.status === 403 && entete.data?.code === "AUTRE_ESPACE");
 
   const etatB = (await q(`SELECT status FROM social_lives WHERE id=$1`, [liveB.id]))[0];
   const traces = (await q(
@@ -129,12 +142,14 @@ async function isolationTenants() {
 
   if (MODE === "reel") {
     const listeA = await appel("GET", "/social/lives", intrusA.token, null, intrusA.entetes);
-    const listeB = await appel("GET", "/social/lives", intrusB.token, null, intrusB.entetes);
-    verifier("listes : chaque tenant ne voit que ses directs publics", listeA.data.lives.some((l) => l.id === liveA.public_id) && !listeA.data.lives.some((l) => l.id === liveB.public_id)
-      && listeB.data.lives.some((l) => l.id === liveB.public_id) && !listeB.data.lives.some((l) => l.id === liveA.public_id));
+    verifier("liste de l'espace A : son direct, jamais celui de B", listeA.data.lives.some((l) => l.id === liveA.public_id) && !listeA.data.lives.some((l) => l.id === liveB.public_id));
+    if (B_ACTIF) {
+      const listeB = await appel("GET", "/social/lives", intrusB.token, null, intrusB.entetes);
+      verifier("liste de l'espace B : son direct, jamais celui de A", listeB.data.lives.some((l) => l.id === liveB.public_id) && !listeB.data.lives.some((l) => l.id === liveA.public_id));
+    }
   }
 
-  // Nettoyage automatique : un appel du tenant A ne clôt que les directs du tenant A.
+  // Nettoyage automatique : un appel de l'espace A ne clôt que les directs de A.
   const muetA = await directEnBase(await membre("Hôte muet A", TENANT_A), { vu: "NOW() - INTERVAL '2 minutes'" });
   const muetB = await directEnBase(await membre("Hôte muet B", TENANT_B), { vu: "NOW() - INTERVAL '2 minutes'" });
   await appel("GET", `/social/lives/${liveA.public_id}`, hoteA.token, null, hoteA.entetes);
@@ -143,8 +158,9 @@ async function isolationTenants() {
     apresA[0].status === "ended" && apresA[0].end_reason === "hote_deconnecte" && apresA[1].status === "live", JSON.stringify(apresA));
   await appel("GET", `/social/lives/${liveB.public_id}`, hoteB.token, null, hoteB.entetes);
   const apresB = (await q(`SELECT status, end_reason FROM social_lives WHERE id=$1`, [muetB.id]))[0];
-  verifier("nettoyage déclenché par B : direct muet B clos à son tour", apresB.status === "ended" && apresB.end_reason === "hote_deconnecte");
-  if (MODE === "reel") await appel("POST", `/social/lives/${liveB.public_id}/terminer`, hoteB.token, null, hoteB.entetes);
+  verifier(B_ACTIF ? "nettoyage déclenché par B : direct muet B clos à son tour" : "espace B sans Social : rien n'y est déclenché, direct muet B intact",
+    B_ACTIF ? apresB.status === "ended" && apresB.end_reason === "hote_deconnecte" : apresB.status === "live");
+  if (MODE === "reel" && B_ACTIF) await appel("POST", `/social/lives/${liveB.public_id}/terminer`, hoteB.token, null, hoteB.entetes);
 }
 
 async function amis(a, b) {

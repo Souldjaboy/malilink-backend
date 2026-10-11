@@ -20,7 +20,8 @@ const LIVEKIT = Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY &
 
 async function personne(nom) {
   const u = (await q(
-    `INSERT INTO users (fullname, email, password, role, company_id) VALUES ($1,$2,'x','customer',NULL) RETURNING id, role, company_id`,
+    `INSERT INTO users (fullname, email, password, role, company_id, account_tenant_id, account_tenant_source)
+     VALUES ($1,$2,'x','customer',NULL,'malilink','inscription') RETURNING id, role, company_id`,
     [nom, `${nom.toLowerCase().replace(/\W/g, "")}-${crypto.randomBytes(3).toString("hex")}@essai.test`]))[0];
   const token = jeton(u);
   const r = await appel("POST", "/social/profile", token, { display_name: nom, birth_date: "1994-02-10", photo_url: "/uploads/photo-essai.jpg", city: "Bamako", is_public: true });
