@@ -7,7 +7,7 @@
 set -uo pipefail
 S="$1"
 export SITE=http://127.0.0.1:8080
-PAQ=/root/malilink-comptes-lives
+PAQ=/root/malilink-livraison-finale
 R=/var/www/releases/academy-essai
 LOG=/root/deploiement-$S.log
 DB=postgresql://malilink_app:motdepasse-app@127.0.0.1:5432/malilink_prod
@@ -38,11 +38,14 @@ pm2q() { pm2 jlist 2>/dev/null | node -e "$PHOTO_JS" "$@"; }
 FICHIERS_BACK="$( (grep ' backend/' "$PAQ/avant.sha256" | awk '{print $2}'; grep '^backend/' "$PAQ/nouveaux.txt") | sed 's#^backend/##' | sort)"
 empreintes_back() { for f in $FICHIERS_BACK; do printf '%s %s\n' "$(sha256sum "$R/backend/$f" 2>/dev/null | cut -c1-16 || true)" "$f"; done; }
 empreintes_payload() { for f in $FICHIERS_BACK; do printf '%s %s\n' "$(sha256sum "$PAQ/payload/backend/$f" | cut -c1-16)" "$f"; done; }
+mig091() { psql "$DB" -Atqc "SELECT count(*) FROM schema_migrations WHERE filename='091_espaces_comptes.sql'"; }
 migrations() { psql "$DB" -Atqc "SELECT count(*) FROM schema_migrations WHERE filename IN ('089_comptes_validation_courriels.sql','090_social_lives.sql')"; }
 repetitions() { runuser -u postgres -- psql -Atqc "SELECT string_agg(datname, ',') FROM pg_database WHERE datname LIKE 'malilink_repetition_%'"; }
 essai() { curl -s -m 5 "$SITE/__essai"; }
 dump_front() { node -e 'const d=JSON.parse(require("fs").readFileSync("/root/.pm2/dump.pm2","utf8")).find(x=>x.name==="malilink-frontend");console.log(d?d.pm_cwd:"absent")'; }
 
+# Fichiers téléversés par les utilisateurs : ne doivent jamais bouger.
+mkdir -p "$R/backend/uploads/essai" && for i in 1 2 3; do echo "photo $i" > "$R/backend/uploads/essai/photo-$i.jpg"; done
 AV_DEF_FRONT="$(pm2q def malilink-frontend)"; AV_DEF_FRONT_SC="$(pm2q def-sans-cwd malilink-frontend)"
 AV_DEF_BACK="$(pm2q def malilink-backend)"; AV_PID_FRONT="$(pm2q pid malilink-frontend)"
 AV_AUTRES="$(pm2q autres)"; AV_ESSAI="$(essai)"; AV_FICHIERS="$(empreintes_back)"; AV_DUMP="$(sha256sum /root/.pm2/dump.pm2)"
@@ -72,6 +75,7 @@ retour_verifie() {  # l'état d'avant est réellement rétabli
   verifier "Academy toujours protégée (401)" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$SITE/api/education/learning/programs")" = 401 ]'
   verifier "témoins Triangle/HAFIYA/Nginx jamais redémarrés" '[ "$(pm2q autres)" = "$AV_AUTRES" ]'
   verifier "aucune base de répétition restante" '[ -z "$(repetitions)" ]'
+  verifier "uploads intacts (3 fichiers)" '[ "$(ls $R/backend/uploads/essai | wc -l)" = 3 ]'
   verifier "sauvegarde PM2 (dump) : ancienne release" '[ "$(dump_front)" = "$R/frontend" ]'
 }
 
@@ -81,6 +85,9 @@ case "$S" in
     verifier "audit : code 0, « AUDIT TERMINÉ »" '[ "$CODE" = 0 ] && grep -q "AUDIT TERMINÉ" "$LOG"'
     verifier "moteur réel affiché : $(grep -o "moteur [0-9.]*[^·]*" "$LOG" | head -1)" 'grep -q "PostgreSQL joignable : moteur" "$LOG"'
     verifier "répétition possible via le compte postgres local (rôle applicatif sans CREATEDB)" 'grep -q "créée par le compte postgres local" "$LOG"'
+    verifier "ports réellement écoutés détectés (backend 5050, frontend 3020)" 'grep -q "(ports écoutés : 5050)" "$LOG" && grep -q "(ports écoutés : 3020)" "$LOG"'
+    verifier "école 8 identifiée en lecture seule, email masqué" 'grep -q "société 8 « MALILINK SCOOL » · espace malilink" "$LOG" && grep -q "d\*\*\*@e\*\*\*.test" "$LOG" && ! grep -q "directeur@ecole.test" "$LOG"'
+    verifier "SMTP absent : signalé sans rien envoyer" 'grep -q "SMTP_EN_ECHEC" "$LOG"'
     verifier "rien d'écrit : ni sauvegarde, ni fichier, ni processus touché" '[ -z "$(ls /root/backups)" ] && [ "$(empreintes_back)" = "$AV_FICHIERS" ] && [ "$(pm2q pid malilink-frontend)" = "$AV_PID_FRONT" ] && [ "$(pm2q autres)" = "$AV_AUTRES" ]'
     ;;
   succes)
@@ -90,10 +97,12 @@ case "$S" in
     verifier "migrations 089 et 090 en production, base de répétition supprimée" '[ "$(migrations)" = 2 ] && [ -z "$(repetitions)" ]'
     verifier "backend : fichiers du paquet, même définition PM2" '[ "$(empreintes_back)" = "$(empreintes_payload)" ] && [ "$(pm2q def malilink-backend)" = "$AV_DEF_BACK" ]'
     verifier "nouveau backend actif (nouveau message de renvoi d'OTP)" 'curl -s -X POST -H "Content-Type: application/json" -d "{}" "$SITE/api/verification/resend" | grep -q "Indiquez votre adresse email"'
-    verifier "frontend : nouvelle release $NOUVEAU" '[[ "$NOUVEAU" == /var/www/releases/malilink-comptes-lives-*/frontend ]] && essai | grep -q "\"release\":\"nouvelle\""'
+    verifier "frontend : nouvelle release $NOUVEAU" '[[ "$NOUVEAU" == /var/www/releases/malilink-livraison-finale-*/frontend ]] && essai | grep -q "\"release\":\"nouvelle\""'
     verifier "frontend : même script, arguments, interpréteur et environnement (PORT, MARQUEUR) qu'avant" '[ "$(pm2q def-sans-cwd malilink-frontend)" = "$AV_DEF_FRONT_SC" ] && essai | grep -q "lancement-origine-7f3a"'
-    verifier "témoins jamais redémarrés, dump PM2 sur la nouvelle release" '[ "$(pm2q autres)" = "$AV_AUTRES" ] && [ "$(dump_front)" = "$NOUVEAU" ] && [[ "$NOUVEAU" == */malilink-comptes-lives-*/frontend ]]'
-    SAVE="$(ls -d /root/backups/malilink-comptes-lives-*)"
+    verifier "témoins jamais redémarrés, dump PM2 sur la nouvelle release" '[ "$(pm2q autres)" = "$AV_AUTRES" ] && [ "$(dump_front)" = "$NOUVEAU" ] && [[ "$NOUVEAU" == */malilink-livraison-finale-*/frontend ]]'
+    verifier "mêmes ports qu'avant (3020) et uploads intacts, annoncés et réels" 'grep -q "mêmes ports : 3020" "$LOG" && grep -q "uploads intacts : 3 avant" "$LOG" && [ "$(ls $R/backend/uploads/essai | wc -l)" = 3 ]'
+    verifier "migration 091 en production (espaces des comptes)" '[ "$(mig091)" = 1 ]'
+    SAVE="$(ls -d /root/backups/malilink-livraison-finale-*)"
     echo "   → retour arrière manuel : bash $SAVE/rollback.sh"
     bash "$SAVE/rollback.sh" > "$LOG.retour" 2>&1; CODE=$?
     verifier "retour manuel : code 0, « RETOUR ARRIÈRE VÉRIFIÉ »" '[ "$CODE" = 0 ] && grep -q "RETOUR ARRIÈRE VÉRIFIÉ" "$LOG.retour"' "code $CODE"

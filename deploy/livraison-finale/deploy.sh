@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
-# MaliLink — comptes (validation administrative, emails/OTP, Super Admin ›
-# Modifier) + directs MaliLink Social isolés par tenant.
+# MaliLink — livraison finale : espaces vérifiés dans les jetons, comptes
+# (validation administrative, emails/OTP, sessions), Super Admin › Modifier,
+# directs MaliLink Social, procédure LiveKit.
 #
+#   bash precontrole.sh                           PRÉCONTRÔLE (= audit) : lecture seule
 #   bash deploy.sh                                AUDIT : vérifie tout, n'écrit rien
 #   bash deploy.sh --executer                     déploiement
 #   bash deploy.sh --retour-arriere <sauvegarde>  retour manuel à l'état d'avant
@@ -20,7 +22,12 @@
 #    définition PM2 complète (script, arguments, interpréteur, environnement) ;
 #  - le retour arrière n'est annoncé « vérifié » qu'après contrôle du service
 #    restauré : définition PM2 identique, processus en ligne et stable,
-#    réponses HTTP attendues. Sinon : « NON VÉRIFIÉ » et code de sortie 3.
+#    réponses HTTP attendues, mêmes ports. Sinon : « NON VÉRIFIÉ », code 3 ;
+#  - la base n'est JAMAIS restaurée automatiquement : les migrations sont
+#    additives et restent ; restaurer la sauvegarde effacerait les données
+#    saisies depuis (décision manuelle, en dernier recours) ;
+#  - uploads et fichiers locaux : seuls les fichiers listés (empreintes
+#    vérifiées) sont remplacés ; le dossier uploads n'est jamais touché.
 set -Eeuo pipefail
 umask 077
 
@@ -29,7 +36,8 @@ SITE="${SITE:-https://malilinkglobal.com}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 APP_BACK=malilink-backend
 APP_FRONT=malilink-frontend
-MIGRATIONS_ATTENDUES="089_comptes_validation_courriels.sql 090_social_lives.sql"
+NOM="malilink-livraison-finale"
+MIGRATIONS_ATTENDUES="089_comptes_validation_courriels.sql 090_social_lives.sql 091_espaces_comptes.sql"
 MODE="audit"
 case "${1:-}" in
   "") ;;
@@ -46,7 +54,7 @@ stop()   { printf '\n\033[31mARRÊT : %s\033[0m\n' "$1" >&2; exit 1; }
 # Échec d'un contrôle : code 1 → set -e → piège EXIT (retour arrière si besoin).
 echec()  { printf '   \033[31m✗\033[0m %s\n' "$1" >&2; return 1; }
 
-exec 9>/root/malilink-comptes-lives.lock
+exec 9>/tmp/malilink-livraison.lock
 flock -n 9 || stop "un déploiement est déjà en cours."
 for c in pm2 node psql pg_dump pg_restore curl sha256sum; do command -v "$c" >/dev/null || stop "$c est nécessaire."; done
 PM2="$(command -v pm2)"
@@ -121,6 +129,15 @@ JS
 pm2js() { pm2c jlist | node -e "$JS_PM2" "$@"; }
 
 cwd_de() { local pid; pid="$(pm2c pid "$1" 2>/dev/null || true)"; [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1; readlink -f "/proc/$pid/cwd"; }
+# Ports TCP réellement écoutés par le processus PM2 et ses enfants (npm → next).
+arbre_pids() { echo "$1"; local c; for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do arbre_pids "$c"; done; }
+ports_de() {
+  local pid motif; pid="$(pm2c pid "$1" 2>/dev/null || true)"; [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  motif="$(arbre_pids "$pid" | tr -d ' ' | paste -sd'|' -)"
+  ss -ltnpH 2>/dev/null | grep -E "pid=($motif)," | awk '{print $4}' | sed 's/.*://' | sort -un | paste -sd' ' - || true
+}
+nb_uploads() { [ -d "$1/uploads" ] && find "$1/uploads" -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0; }
+PORTS_BACK=""; PORTS_FRONT=""
 
 # En ligne, puis STABLE : même pid et aucun redémarrage pendant 8 s.
 attendre_stable() {
@@ -157,6 +174,7 @@ verifier_frontend() {
   [ "$(cwd_de "$APP_FRONT" || true)" = "$FRONT" ] || { info "frontend : répertoire $(cwd_de "$APP_FRONT" || echo '?') au lieu de $FRONT"; bon=1; }
   attendre_http "/" "200" 90 || { info "frontend : / répond $DERNIER_CODE"; bon=1; }
   attendre_http "/education/academy" "200|307|308" 30 || { info "frontend : /education/academy répond $DERNIER_CODE"; bon=1; }
+  [ -z "$PORTS_FRONT" ] || [ "$(ports_de "$APP_FRONT")" = "$PORTS_FRONT" ] || { info "frontend : ports $(ports_de "$APP_FRONT") au lieu de $PORTS_FRONT"; bon=1; }
   [ "$bon" = 0 ] && ok "frontend restauré et vérifié : $FRONT (définition PM2 identique, stable, HTTP 200)"
   return "$bon"
 }
@@ -178,6 +196,7 @@ verifier_backend() {
   pm2js comparer "$APP_BACK" "$SAVE/pm2-backend-avant.json" || bon=1
   [ "$(cwd_de "$APP_BACK" || true)" = "$BACK" ] || { info "backend : mauvais répertoire"; bon=1; }
   attendre_http "/api/education/learning/programs" "401|403" 60 || { info "backend : Academy répond $DERNIER_CODE"; bon=1; }
+  [ -z "$PORTS_BACK" ] || [ "$(ports_de "$APP_BACK")" = "$PORTS_BACK" ] || { info "backend : ports $(ports_de "$APP_BACK") au lieu de $PORTS_BACK"; bon=1; }
   [ "$bon" = 0 ] && ok "backend restauré et vérifié : fichiers d'origine (empreintes), processus stable, Academy protégée"
   return "$bon"
 }
@@ -217,6 +236,7 @@ fin() {
   printf '\n\033[31mÉCHEC (code %s%s%s) : retour arrière automatique.\033[0m\n' "$code" "${SIGNAL:+, signal $SIGNAL}" "${LIGNE:+, ligne $LIGNE : $CMD}" >&2
   if retour_arriere; then
     printf '\n\033[32mRETOUR ARRIÈRE VÉRIFIÉ\033[0m — production remise dans son état d'"'"'avant (migrations additives conservées).\n'
+    info "La base n'est pas restaurée : les données saisies pendant le déploiement sont conservées."
     exit "$code"
   fi
   printf '\n\033[31mRETOUR ARRIÈRE NON VÉRIFIÉ\033[0m — intervention manuelle nécessaire :\n'
@@ -258,8 +278,12 @@ for d in "$BACK" "$FRONT"; do
   printf '%s' "$r" | grep -qiE "triangle|hafiya" && stop "$d appartient à un autre produit ($r)."
 done
 [ -f "$FRONT/package.json" ] || stop "$FRONT/package.json absent."
-info "backend  : $BACK"
-info "frontend : $FRONT"
+PORTS_BACK="$(ports_de "$APP_BACK")"; PORTS_FRONT="$(ports_de "$APP_FRONT")"
+info "backend  : $BACK  (ports écoutés : ${PORTS_BACK:-non détectés})"
+info "frontend : $FRONT  (ports écoutés : ${PORTS_FRONT:-non détectés})"
+UPLOADS_AVANT="$(nb_uploads "$BACK")"
+info "uploads du backend : $UPLOADS_AVANT fichier(s) dans $BACK/uploads — jamais modifiés"
+[ -d "$FRONT/public/uploads" ] && alerte "$FRONT/public/uploads existe : la nouvelle release en sera une COPIE ; vérifiez qu'aucun fichier n'y est écrit pendant le déploiement."
 info "frontend lancé par : $(pm2js definition "$APP_FRONT" | node -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8")).apps[0];console.log(`${a.script} ${a.args.join(" ")} (${a.exec_mode}, ${Object.keys(a.env).length} variables d\x27environnement)`)')"
 
 # ───────────────────────────── 2. Paquet et empreintes ─────────────────────────
@@ -331,6 +355,41 @@ alerte "Sans serveur LiveKit joignable, l'application affiche « Directs indispo
 [ -d "$FRONT/node_modules/livekit-client" ] && ok "livekit-client présent dans le frontend" || alerte "livekit-client absent : il sera installé dans la copie (sans modifier package.json)."
 
 if [ "$MODE" = "audit" ]; then
+  titre "A. ESPACES (lecture seule)"
+  psql "$DATABASE_URL" -Atqc "SELECT '   espace '||COALESCE(NULLIF(tenant_id,''),'(vide)')||' : '||COUNT(*)||' société(s)' FROM companies GROUP BY tenant_id ORDER BY 1" || true
+  AUTRES="$(psql "$DATABASE_URL" -Atqc "SELECT '      société '||id||' « '||name||' » (espace '||COALESCE(NULLIF(tenant_id,''),'vide')||')' FROM companies WHERE COALESCE(tenant_id,'') <> 'malilink' ORDER BY id LIMIT 30" || true)"
+  if [ -n "$AUTRES" ]; then
+    alerte "sociétés hors de l'espace malilink : leurs comptes ne se connectent déjà pas sur MaliLink et ne figureront plus dans les listes du Super Admin :"
+    printf '%s\n' "$AUTRES"
+  else ok "toutes les sociétés sont dans l'espace malilink"; fi
+  if [ "$(psql "$DATABASE_URL" -Atqc "SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='account_tenant_id'")" = 1 ]; then
+    psql "$DATABASE_URL" -Atqc "SELECT '   comptes sans société : '||COUNT(*) FILTER (WHERE account_tenant_id IS NOT NULL)||' rattaché(s), '||COUNT(*) FILTER (WHERE account_tenant_id IS NULL)||' à rattacher' FROM users WHERE company_id IS NULL" || true
+  else
+    info "comptes sans société : $(psql "$DATABASE_URL" -Atqc "SELECT COUNT(*) FROM users WHERE company_id IS NULL") — chacun sera rattaché à son espace à sa prochaine connexion sur le site (journalisé)"
+  fi
+  info "Après le déploiement, un jeton sans espace (OAuth, connexion après code, inscription téléphone) demande une reconnexion."
+
+  titre "B. ÉCOLE « MALILINK SCOOL » (société ${SOCIETE_ECOLE:-8}) — identification, lecture seule"
+  ECOLE="$(psql "$DATABASE_URL" -Atqc "SELECT 'société '||id||' « '||name||' » · espace '||COALESCE(tenant_id,'?')||' · type '||COALESCE(business_type,'?')||' · statut '||COALESCE(status,'?')||' · compte '||COALESCE(account_status,'?')||' · email vérifié '||COALESCE(email_verified::text,'?') FROM companies WHERE id=${SOCIETE_ECOLE:-8}" || true)"
+  if [ -z "$ECOLE" ]; then alerte "aucune société ${SOCIETE_ECOLE:-8}"; else
+    info "$ECOLE"
+    psql "$DATABASE_URL" -Atqc "SELECT '   - utilisateur '||id||' · '||role||' · '||regexp_replace(COALESCE(email,''), '^(.)[^@]*@(.)[^.]*(\..*)?$', '\1***@\2***\3')||' · actif '||COALESCE(is_active::text,'?')||' · compte '||COALESCE(account_status,'?')||' · email vérifié '||COALESCE(email_verified::text,'?')||' · vérification requise '||COALESCE(verification_required::text,'?') FROM users WHERE company_id=${SOCIETE_ECOLE:-8} AND LOWER(COALESCE(role,'')) IN ('admin','administrateur','directeur','direction','director','owner','proprietaire') ORDER BY id" || true
+    info "Aucune modification. Après le déploiement : scripts/comptes/valider-compte-ecole.js --identifier, puis --valider (voir LISEZ-MOI)."
+  fi
+
+  titre "C. SMTP (connexion et authentification réelles, AUCUN envoi)"
+  DIAG="$(mktemp -d)"
+  mkdir -p "$DIAG/scripts/comptes" "$DIAG/services"
+  cp "$HERE/payload/backend/scripts/comptes/diagnostic-email.js" "$DIAG/scripts/comptes/"
+  cp "$HERE/payload/backend/services/courriel.js" "$DIAG/services/"
+  ln -s "$BACK/node_modules" "$DIAG/node_modules"
+  pm2c jlist | node -e '
+    const p = JSON.parse(require("fs").readFileSync(0, "utf8")).find((x) => x.name === "malilink-backend");
+    const env = (p && p.pm2_env && p.pm2_env.env) || {};
+    for (const k of Object.keys(env)) if (/^(SMTP_|PUBLIC_BASE_URL$|DATABASE_URL$)/.test(k)) console.log(`export ${k}=\x27${String(env[k]).replace(/\x27/g, "\x27\\\x27\x27")}\x27`);' > "$DIAG/env" || true
+  ( set -a; . "$DIAG/env"; set +a; cd "$BACK" && node "$DIAG/scripts/comptes/diagnostic-email.js" ) || alerte "SMTP en échec : sans correction, aucun code ne pourra partir (voir LISEZ-MOI)."
+  rm -rf "$DIAG"
+
   titre "AUDIT TERMINÉ — rien n'a été modifié"
   info "Pour déployer (de préférence dans tmux) : bash $HERE/deploy.sh --executer"
   exit 0
@@ -339,15 +398,15 @@ fi
 
 # ───────────────────────────── 5. Sauvegardes ──────────────────────────────────
 titre "5. SAUVEGARDES (code, configuration protégée, définitions PM2, base)"
-SAVE="/root/backups/malilink-comptes-lives-$STAMP"
-NEW_FRONT="/var/www/releases/malilink-comptes-lives-$STAMP/frontend"
+SAVE="/root/backups/$NOM-$STAMP"
+NEW_FRONT="/var/www/releases/$NOM-$STAMP/frontend"
 install -d -m 700 "$SAVE" "$SAVE/backend"
 # Journal complet ; tee ignore INT/TERM/HUP pour que le retour arrière reste tracé.
 exec > >(trap '' INT TERM HUP; exec tee -a "$SAVE/deploiement.log") 2>&1
 armer_pieges
 cp "$HERE/avant.sha256" "$HERE/nouveaux.txt" "$SAVE/"
 cp "$HERE/deploy.sh" "$SAVE/deploy.sh"
-{ printf 'BACK=%q\n' "$BACK"; printf 'FRONT=%q\n' "$FRONT"; printf 'NEW_FRONT=%q\n' "$NEW_FRONT"; printf 'SITE_DEPLOIEMENT=%q\n' "$SITE"; } > "$SAVE/etat.env"
+{ printf 'BACK=%q\n' "$BACK"; printf 'FRONT=%q\n' "$FRONT"; printf 'NEW_FRONT=%q\n' "$NEW_FRONT"; printf 'SITE_DEPLOIEMENT=%q\n' "$SITE"; printf 'PORTS_BACK=%q\n' "$PORTS_BACK"; printf 'PORTS_FRONT=%q\n' "$PORTS_FRONT"; } > "$SAVE/etat.env"
 pm2c jlist > "$SAVE/pm2-private.json"
 pm2js definition "$APP_FRONT" > "$SAVE/pm2-frontend-avant.json"
 pm2js definition "$APP_FRONT" "$NEW_FRONT" > "$SAVE/pm2-frontend-nouveau.json"
@@ -391,7 +450,9 @@ cp "$BACK/scripts/migrate.js" "$RUN/scripts/"; cp "$BACK"/sql/*.sql "$HERE"/payl
 (cd "$RUN" && DATABASE_URL="$URL_REPET" node scripts/migrate.js) > "$SAVE/repetition-migrations.log" 2>&1 \
   || { tail -15 "$SAVE/repetition-migrations.log"; echec "migrations en échec sur la copie : production intacte"; }
 VERIF="$(psql "$URL_REPET" -Atqc "SELECT
-   (SELECT count(*) FROM schema_migrations WHERE filename IN ('089_comptes_validation_courriels.sql','090_social_lives.sql')) = 2
+   (SELECT count(*) FROM schema_migrations WHERE filename IN ('089_comptes_validation_courriels.sql','090_social_lives.sql','091_espaces_comptes.sql')) = 3
+   AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='account_tenant_id')
+   AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname='users_account_tenant_valide')
    AND to_regclass('public.account_admin_validations') IS NOT NULL AND to_regclass('public.account_email_changes') IS NOT NULL
    AND to_regclass('public.email_delivery_log') IS NOT NULL AND to_regclass('public.social_lives') IS NOT NULL
    AND to_regclass('public.social_live_viewers') IS NOT NULL AND to_regclass('public.social_live_comments') IS NOT NULL
@@ -401,7 +462,7 @@ VERIF="$(psql "$URL_REPET" -Atqc "SELECT
 [ "$VERIF" = t ] || echec "schéma attendu absent après migration de la copie"
 (cd "$RUN" && DATABASE_URL="$URL_REPET" node scripts/migrate.js --status) | grep -qE "En attente +: 0" || echec "migrations non idempotentes sur la copie"
 [ "$(psql "$URL_REPET" -Atqc "SELECT count(*) FROM users")" = "$(psql "$DATABASE_URL" -Atqc "SELECT count(*) FROM users")" ] || echec "données modifiées par la migration"
-ok "migrations 089 et 090 appliquées sur la copie (moteur $MOTEUR, données réelles), schéma conforme, rejouables sans effet"
+ok "migrations 089, 090 et 091 appliquées sur la copie (moteur $MOTEUR, données réelles), schéma conforme, rejouables sans effet"
 supprimer_repetition
 
 # ───────────────────────────── 7. Frontend construit à part ────────────────────
@@ -428,6 +489,8 @@ pm2c restart "$APP_BACK" >/dev/null
 attendre_stable "$APP_BACK" || echec "le nouveau backend ne reste pas en ligne"
 [ "$(cwd_de "$APP_BACK")" = "$BACK" ] || echec "backend : mauvais répertoire"
 pm2js comparer "$APP_BACK" "$SAVE/pm2-backend-avant.json" || echec "définition PM2 du backend modifiée"
+attendre_http "/api/education/learning/programs" "401|403" 60 || true
+[ -z "$PORTS_BACK" ] || [ "$(ports_de "$APP_BACK")" = "$PORTS_BACK" ] || echec "backend : ports $(ports_de "$APP_BACK") au lieu de $PORTS_BACK"
 c1="$(curl -s -m 15 -o "$SAVE/controle-resend.json" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "$SITE/api/verification/resend" || true)"
 grep -q "Indiquez votre adresse email" "$SAVE/controle-resend.json" 2>/dev/null || echec "renvoi d'OTP : réponse inattendue ($c1)"
 attendre_http "/api/social/lives/config" "401" 30 || echec "directs : $DERNIER_CODE au lieu de 401"
@@ -442,10 +505,12 @@ pm2c delete "$APP_FRONT" >/dev/null
 pm2_propre start "$SAVE/pm2-frontend-nouveau.json" >/dev/null
 attendre_stable "$APP_FRONT" || echec "le nouveau frontend ne reste pas en ligne"
 pm2js comparer "$APP_FRONT" "$SAVE/pm2-frontend-nouveau.json" || echec "définition PM2 du nouveau frontend inattendue"
-for controle in "/:200" "/confirmer-email:200" "/social/lives:200|307|308" "/education/academy:200|307|308"; do
+for controle in "/:200" "/login:200" "/confirmer-email:200" "/social/lives:200|307|308" "/education/academy:200|307|308" "/super-admin:200|307|308"; do
   attendre_http "${controle%%:*}" "${controle#*:}" 90 || echec "frontend : ${controle%%:*} répond $DERNIER_CODE"
 done
-info "accueil 200 · confirmer-email 200 · lives et academy accessibles"
+info "accueil, connexion et confirmer-email 200 · directs, Academy et Super Admin accessibles"
+[ -z "$PORTS_FRONT" ] || [ "$(ports_de "$APP_FRONT")" = "$PORTS_FRONT" ] || echec "frontend : ports $(ports_de "$APP_FRONT") au lieu de $PORTS_FRONT"
+[ -z "$PORTS_FRONT" ] || ok "nouveau frontend sur les mêmes ports : $PORTS_FRONT"
 pm2c save --force >/dev/null
 BACK_TOUCHE=0; FRONT_TOUCHE=0
 trap - ERR INT TERM HUP EXIT
@@ -463,8 +528,12 @@ pm2c jlist | node -e '
 ( set -a; . "$ENVTMP"; set +a; cd "$BACK" && node scripts/comptes/diagnostic-email.js ) || alerte "SMTP en échec : voir ci-dessus (les codes ne peuvent pas partir tant que ce n'est pas corrigé)."
 rm -f "$ENVTMP"
 
+UPLOADS_APRES="$(nb_uploads "$BACK")"
+[ "$UPLOADS_APRES" -ge "$UPLOADS_AVANT" ] && ok "uploads intacts : $UPLOADS_AVANT avant, $UPLOADS_APRES après" || alerte "uploads : $UPLOADS_AVANT avant, $UPLOADS_APRES après (à examiner)"
+
 titre "DÉPLOIEMENT TERMINÉ"
 info "Journal : $SAVE/deploiement.log"
-info "Retour arrière manuel : bash $SAVE/rollback.sh"
+info "Retour arrière manuel : bash $SAVE/rollback.sh (code et définition PM2 ; la base n'est jamais restaurée)"
+info "Sessions : un jeton émis sans espace (OAuth, après code, inscription téléphone) demande une reconnexion."
 info "Étape suivante — identifier le compte école (lecture seule) :"
 info "  cd $BACK && node scripts/comptes/valider-compte-ecole.js --identifier --societe 8"

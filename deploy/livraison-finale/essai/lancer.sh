@@ -7,7 +7,7 @@ mkdir -p "$V/resultats"
 for s in "$@"; do
   c="vps-$s-$$"
   docker run -d --name "$c" -e POSTGRES_PASSWORD=essai -v "$V:/essai:ro" "$IMG" >/dev/null
-  docker cp "$P" "$c:/root/malilink-comptes-lives" >/dev/null
+  docker cp "$P" "$c:/root/malilink-livraison-finale" >/dev/null
   docker exec "$c" bash /essai/scenario.sh "$s" 2>&1 | tee "$V/resultats/${IMG#*:}-$s.txt"
   docker exec "$c" bash -c "cat /root/deploiement-$s.log" > "$V/resultats/${IMG#*:}-$s.deploy.log" 2>/dev/null
   docker exec "$c" bash -c "cat /root/deploiement-$s.log.retour" > "$V/resultats/${IMG#*:}-$s.retour.log" 2>/dev/null || true
