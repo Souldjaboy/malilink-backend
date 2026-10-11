@@ -4,9 +4,15 @@
  * MaliLink — Socket.io temps réel (messagerie sociale, présence, frappe).
  *
  * Sécurité :
- * - authentification JWT obligatoire au handshake (handshake.auth.token) ;
- * - chaque socket rejoint uniquement SA room "user:<id>" — les événements
- *   de conversation sont émis serveur-side aux membres vérifiés en base ;
+ * - authentification JWT obligatoire au handshake (handshake.auth.token),
+ *   avec les MÊMES contrôles que l'API (verifierSession) : jeton portant un
+ *   espace, session non révoquée, compte actif, appartenance prouvée à
+ *   l'espace, espace de la connexion (domaine) identique à celui du jeton ;
+ * - une session révoquée (mot de passe, changement d'email…) ou un compte
+ *   désactivé referme ses connexions : immédiatement via
+ *   reverifierUtilisateur(), et au plus tard à la revérification périodique ;
+ * - chaque socket rejoint SA room "user:<id>" et la room de SON espace :
+ *   la présence n'est diffusée qu'à l'espace autorisé ;
  * - limitation de fréquence basique par socket (anti-spam) ;
  * - aucun secret dans les logs.
  *
@@ -17,7 +23,12 @@
 
 const { Server } = require("socket.io");
 
-function createRealtime({ httpServer, jwt, jwtSecret, pool }) {
+const REVERIFICATION_MS = 60000;
+
+function createRealtime({ httpServer, jwt, jwtSecret, pool, verifierSession, espaceDeRequete }) {
+  if (typeof verifierSession !== "function" || typeof espaceDeRequete !== "function") {
+    throw new Error("createRealtime : verifierSession et espaceDeRequete sont obligatoires");
+  }
   const io = new Server(httpServer, {
     path: "/socket.io",
     cors: { origin: true, credentials: true },
@@ -26,29 +37,48 @@ function createRealtime({ httpServer, jwt, jwtSecret, pool }) {
   });
 
   const onlineUsers = new Map(); // userId -> nombre de sockets actives
+  const salleEspace = (tenant) => `espace:${tenant}`;
 
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
+    let payload;
     try {
       const token = socket.handshake?.auth?.token || "";
       if (!token) return next(new Error("Authentification requise"));
-      const payload = jwt.verify(token, jwtSecret);
-      // Comme l'API : un jeton sans espace (ancien format) est à renouveler.
-      if (!payload.tenant_id) return next(new Error("Session à renouveler"));
-      socket.data.userId = Number(payload.id);
-      socket.data.tenantId = String(payload.tenant_id);
-      if (!socket.data.userId) return next(new Error("Token invalide"));
-      next();
+      payload = jwt.verify(token, jwtSecret);
     } catch {
-      next(new Error("Token invalide"));
+      return next(new Error("Token invalide"));
     }
+    const espace = espaceDeRequete(socket.request);
+    const session = await verifierSession(payload, espace).catch(() => ({ ok: false, code: "VERIFICATION_INDISPONIBLE" }));
+    if (!session.ok) return next(new Error(session.code === "SESSION_SANS_ESPACE" ? "Session à renouveler" : session.code));
+    socket.data.userId = Number(payload.id);
+    socket.data.tenantId = session.tenant;
+    socket.data.payload = payload;
+    socket.data.espace = espace;
+    next();
   });
+
+  /* Revérifie une socket ; la ferme si la session n'est plus valable. */
+  async function reverifier(socket) {
+    const session = await verifierSession(socket.data.payload, socket.data.espace)
+      .catch(() => ({ ok: true })); // base momentanément indisponible : on ne ferme pas sur une panne
+    if (session.ok) return;
+    socket.emit("session:fermee", { code: session.code, message: session.error || "Session fermée." });
+    socket.disconnect(true);
+  }
+  const minuterie = setInterval(() => {
+    for (const socket of io.of("/").sockets.values()) reverifier(socket).catch(() => {});
+  }, REVERIFICATION_MS);
+  minuterie.unref();
 
   io.on("connection", (socket) => {
     const userId = socket.data.userId;
+    const espace = salleEspace(socket.data.tenantId);
     socket.join(`user:${userId}`);
+    socket.join(espace);
 
     onlineUsers.set(userId, (onlineUsers.get(userId) || 0) + 1);
-    io.emit("presence:online", { user_id: userId, online: true });
+    io.to(espace).emit("presence:online", { user_id: userId, online: true });
 
     // Anti-spam : max 30 événements client / 10 s / socket.
     let eventCount = 0;
@@ -92,7 +122,7 @@ function createRealtime({ httpServer, jwt, jwtSecret, pool }) {
       const remaining = (onlineUsers.get(userId) || 1) - 1;
       if (remaining <= 0) {
         onlineUsers.delete(userId);
-        io.emit("presence:online", { user_id: userId, online: false });
+        io.to(espace).emit("presence:online", { user_id: userId, online: false });
         pool
           .query(
             `INSERT INTO social_user_presence (user_id, last_seen_at)
@@ -114,6 +144,14 @@ function createRealtime({ httpServer, jwt, jwtSecret, pool }) {
     emitToUsers(userIds, event, payload) {
       for (const id of userIds) {
         io.to(`user:${id}`).emit(event, payload);
+      }
+    },
+    /* Session révoquée ou compte modifié : revérifie tout de suite ses connexions. */
+    async reverifierUtilisateur(userId) {
+      const sockets = await io.in(`user:${Number(userId)}`).fetchSockets().catch(() => []);
+      for (const s of sockets) {
+        const socket = io.of("/").sockets.get(s.id);
+        if (socket) await reverifier(socket).catch(() => {});
       }
     }
   };

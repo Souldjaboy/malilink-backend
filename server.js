@@ -92,6 +92,25 @@ app.use(sensitiveRoutesRateLimit);
 
 app.use(requireTenant);
 
+// Super Admin agissant sur un utilisateur précis par les routes génériques
+// (/users/:id…) : seulement un compte dont l'appartenance à l'espace de la
+// requête est prouvée (les routes /super-admin ont leur propre garde).
+app.use(async (req, res, next) => {
+  const cible = /^\/users\/(\d+)(?:\/|$)/.exec(req.path);
+  if (!cible) return next();
+  const demandeur = resolveRequestUser(req);
+  if (!demandeur || !isSuperAdminUser(demandeur)) return next();
+  try {
+    if ((await espaces.utilisateurDansEspace(pool, Number(cible[1]), req.tenant_id)) !== "oui") {
+      return res.status(404).json({ error: "Utilisateur introuvable dans votre espace.", code: "UTILISATEUR_HORS_ESPACE" });
+    }
+    return next();
+  } catch (error) {
+    console.error("garde utilisateur :", error.message);
+    return res.status(503).json({ error: "Contrôle d'accès momentanément indisponible. Réessayez.", code: "ACCESS_CHECK_FAILED" });
+  }
+});
+
 if (!fs.existsSync("uploads")) {
   fs.mkdirSync("uploads");
 }
@@ -756,7 +775,6 @@ async function buildLoginResponseForUser(userId, req, demande) {
 
   const espace = await espaces.etablirEspaceConnexion(pool, req, user, demande);
   if (espace.error) return { refus: espace };
-  if (espace.rattache) await journaliserRattachementEspace(req, user, espace.tenant);
 
   const normalizedEmail = String(user.email || "").trim().toLowerCase();
   const isSuperAdmin =
@@ -955,29 +973,63 @@ function getUserCompanyId(req) {
   return req.user?.company_id || null;
 }
 
-/* Révocation des sessions : un jeton émis avant users.tokens_valid_after
-   est refusé. Lecture mise en cache 30 s par utilisateur. */
-const cacheRevocation = new Map();
-async function sessionRevoquee(user) {
-  if (!user?.id || !user.iat) return false;
+/* État d'un compte, vérifié à CHAQUE requête (API) et pour chaque connexion
+   temps réel : révocation des sessions (tokens_valid_after), compte actif,
+   société inchangée, appartenance PROUVÉE à l'espace du jeton (société, ou
+   espace attribué au compte). Lecture mise en cache 30 s par utilisateur ;
+   revoquerSessions() l'invalide aussitôt et referme ses connexions temps réel. */
+const cacheEtatCompte = new Map();
+let notifierRevocationTempsReel = () => {};
+async function etatCompte(userId) {
   const now = Date.now();
-  let entree = cacheRevocation.get(user.id);
-  if (!entree || now - entree.at > 30000) {
-    try {
-      const { rows } = await pool.query("SELECT tokens_valid_after FROM users WHERE id=$1", [user.id]);
-      entree = { at: now, apres: rows[0]?.tokens_valid_after ? new Date(rows[0].tokens_valid_after).getTime() : 0 };
-    } catch {
-      entree = { at: now, apres: 0 };
-    }
-    cacheRevocation.set(user.id, entree);
-    if (cacheRevocation.size > 5000) cacheRevocation.delete(cacheRevocation.keys().next().value);
+  let e = cacheEtatCompte.get(userId);
+  // Seuls les états favorables sont gardés 30 s : un compte sans espace établi
+  // ou désactivé est relu à chaque fois (attribution ou réactivation immédiates).
+  if (!e || now - e.at > 30000 || !e.existe || !e.actif || !e.espace) {
+    const { rows } = await pool.query(
+      `SELECT u.tokens_valid_after, u.is_active, u.company_id, u.account_tenant_id, c.tenant_id AS company_tenant
+         FROM users u LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = $1`, [userId]);
+    const r = rows[0];
+    e = r
+      ? { at: now, existe: true, apres: r.tokens_valid_after ? new Date(r.tokens_valid_after).getTime() : 0, actif: r.is_active !== false,
+          societe: r.company_id ? Number(r.company_id) : null,
+          espace: r.company_id ? normalizeTenantId(r.company_tenant) : normalizeTenantId(r.account_tenant_id) }
+      : { at: now, existe: false };
+    cacheEtatCompte.set(userId, e);
+    if (cacheEtatCompte.size > 5000) cacheEtatCompte.delete(cacheEtatCompte.keys().next().value);
   }
+  return e;
+}
+/* Session (jeton déjà décodé) valable pour l'espace de la requête ?
+   → { ok: true, tenant } ou { ok: false, status, code, error }. */
+async function verifierSession(user, espaceRequete) {
+  const refus = (status, code, error) => ({ ok: false, status, code, error });
+  const tokenTenant = normalizeTenantId(user?.tenant_id);
+  // Jeton sans espace (ancien format) : aucun espace attribué par défaut.
+  if (!tokenTenant) return refus(401, "SESSION_SANS_ESPACE", "Session à renouveler : reconnectez-vous.");
+  let e;
+  try { e = await etatCompte(Number(user.id)); }
+  catch { return refus(503, "VERIFICATION_INDISPONIBLE", "Vérification de session momentanément indisponible. Réessayez."); }
+  if (!e.existe) return refus(401, "COMPTE_INTROUVABLE", "Session expirée : reconnectez-vous.");
   // iat est à la seconde : un jeton de la même seconde que la révocation est
   // révoqué aussi (au pire, une connexion faite dans cette seconde est à refaire).
-  return entree.apres > 0 && user.iat <= Math.floor(entree.apres / 1000);
+  if (e.apres > 0 && !(user.iat > Math.floor(e.apres / 1000))) return refus(401, "session_revoquee", "Session expirée : reconnectez-vous.");
+  if (!e.actif) return refus(401, "COMPTE_DESACTIVE", "Compte désactivé.");
+  if ((e.societe || null) !== (Number(user.company_id || 0) || null)) return refus(401, "SESSION_PERIMEE", "Session à renouveler : reconnectez-vous.");
+  if (!e.espace) {
+    return e.societe
+      ? refus(403, "ESPACE_SOCIETE_INDEFINI", "L'espace de votre société n'est pas défini : contactez l'administration.")
+      : refus(403, "ESPACE_NON_ETABLI", espaces.MESSAGE_NON_ETABLI);
+  }
+  // Ni le domaine ni un en-tête ne changent l'espace porté par le jeton.
+  if (e.espace !== tokenTenant || espaceRequete !== tokenTenant) {
+    return refus(403, "AUTRE_ESPACE", "Accès refusé : ce compte n’appartient pas à cette version.");
+  }
+  return { ok: true, tenant: tokenTenant };
 }
 function revoquerSessions(userId) {
-  cacheRevocation.delete(Number(userId));
+  cacheEtatCompte.delete(Number(userId));
+  notifierRevocationTempsReel(Number(userId));
 }
 
 async function authenticateToken(req, res, next) {
@@ -988,56 +1040,41 @@ async function authenticateToken(req, res, next) {
     });
   }
 
+  let user;
   try {
-    const user = jwt.verify(token, JWT_SECRET);
+    user = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return res.status(403).json({
+      error: "Token invalide"
+    });
+  }
+
+  try {
     const requestTenant = getTenantFromRequest(req);
-    const tokenTenant = normalizeTenantId(user.tenant_id);
-
-    // Jeton sans espace (émis avant la vérification des espaces) : aucun
-    // espace attribué par défaut, la session est à renouveler.
-    if (!tokenTenant) {
-      return res.status(401).json({ error: "Session à renouveler : reconnectez-vous.", code: "SESSION_SANS_ESPACE" });
-    }
-
-    // Sessions révoquées (réinitialisation du mot de passe, changement d'email).
-    if (await sessionRevoquee(user)) {
-      return res.status(401).json({ error: "Session expirée : reconnectez-vous.", code: "session_revoquee" });
-    }
-
-    // Ni le domaine ni un en-tête ne changent l'espace porté par le jeton.
-    if (tokenTenant !== requestTenant) {
-      return res.status(403).json({
-        error: "Accès refusé : ce compte n’appartient pas à cette version.",
-        code: "AUTRE_ESPACE"
-      });
-    }
-
-    if (!(await companyBelongsToTenant(user.company_id, requestTenant))) {
-      return res.status(403).json({
-        error: "Accès refusé : entreprise non autorisée pour ce tenant."
-      });
+    const session = await verifierSession(user, requestTenant);
+    if (!session.ok) {
+      return res.status(session.status).json({ error: session.error, code: session.code });
     }
 
     // Super Admin : l'école choisie (x-active-company-id…) doit être une
     // société existante de son propre espace.
     if (isSuperAdminUser(user)) {
       const active = getRequestedActiveCompanyId(req);
-      if (active && active !== Number(user.company_id || 0) && !(await espaces.societeDansEspace(pool, active, tokenTenant))) {
+      if (active && active !== Number(user.company_id || 0) && !(await espaces.societeDansEspace(pool, active, session.tenant))) {
         return res.status(403).json({ error: "Société hors de votre espace ou introuvable.", code: "SOCIETE_HORS_ESPACE" });
       }
     }
 
     req.user = {
       ...user,
-      tenant_id: tokenTenant
+      tenant_id: session.tenant
     };
     req.tenant_id = requestTenant;
 
     next();
   } catch (err) {
-    return res.status(403).json({
-      error: "Token invalide"
-    });
+    console.error("ERREUR AUTHENTIFICATION :", err.message);
+    return res.status(503).json({ error: "Vérification de session momentanément indisponible. Réessayez.", code: "VERIFICATION_INDISPONIBLE" });
   }
 }
 
@@ -1107,8 +1144,8 @@ async function logAudit(req, action, entityType = "", entityId = null, details =
    companyId (facultatif) limite la cible à une entreprise. */
 async function reinitialiserMotDePasseTemporaire(req, { userId, companyId = null, envoyerEmail = false }) {
   const tenant = getTenantFromRequest(req);
-  // Jamais un compte d'un autre espace (Super Admin compris).
-  if ((await espaces.utilisateurDansEspace(pool, Number(userId), req.user?.tenant_id || tenant)) === "non") return null;
+  // Uniquement un compte dont l'appartenance à l'espace est prouvée (Super Admin compris).
+  if ((await espaces.utilisateurDansEspace(pool, Number(userId), req.user?.tenant_id || tenant)) !== "oui") return null;
   const prefixe = tenant === "malilink" ? "MaliLink" : tenant === "hafiya" ? "Hafiya" : "Triangle";
   const temporaire = `${prefixe}-${crypto.randomBytes(3).toString("hex")}-${crypto.randomBytes(3).toString("hex").toUpperCase()}9`;
   const result = await pool.query(
@@ -2647,7 +2684,7 @@ app.post("/password-reset/request", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, email, phone, role, company_id, is_active
+      `SELECT id, email, phone, role, company_id, is_active, account_tenant_id
        FROM users
        WHERE ${looksLikeEmail ? "LOWER(email)=LOWER($1)" : "regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g')=$1"}
        ORDER BY id DESC
@@ -2670,6 +2707,12 @@ app.post("/password-reset/request", async (req, res) => {
     }
     if (user.is_active === false) {
       return res.status(403).json({ error: "Compte désactivé. Contactez un administrateur." });
+    }
+    // Appartenance non établie à l'espace de ce site (compte sans espace, ou
+    // d'un autre espace) : aucun code, même réponse neutre (pas d'énumération).
+    const espaceCompte = await espaces.espaceDuCompte(pool, user);
+    if (!espaceCompte.tenant || espaceCompte.tenant !== getTenantFromRequest(req)) {
+      return res.json({ success: true, message: genericMessage });
     }
 
     const code = generateOtpCode();
@@ -2772,7 +2815,7 @@ app.post("/password-reset/confirm", async (req, res) => {
     }
 
     const result = await client.query(
-      `SELECT pr.*, u.email, u.role
+      `SELECT pr.*, u.email, u.role, u.company_id AS user_company_id, u.account_tenant_id
        FROM password_reset_codes pr
        JOIN users u ON u.id=pr.user_id
        WHERE ${filter}
@@ -2783,6 +2826,15 @@ app.post("/password-reset/confirm", async (req, res) => {
     const reset = result.rows[0];
 
     if (!reset) {
+      return res.status(400).json({ error: "Code expiré ou introuvable." });
+    }
+    // Sans appartenance établie à l'espace de ce site : pas de changement de
+    // mot de passe (opération sensible), procédure expliquée.
+    const espaceReset = await espaces.espaceDuCompte(pool, { id: reset.user_id, company_id: reset.user_company_id, account_tenant_id: reset.account_tenant_id });
+    if (!espaceReset.tenant) {
+      return res.status(403).json({ error: espaces.MESSAGE_NON_ETABLI, code: "ESPACE_NON_ETABLI" });
+    }
+    if (espaceReset.tenant !== getTenantFromRequest(req)) {
       return res.status(400).json({ error: "Code expiré ou introuvable." });
     }
 
@@ -2964,14 +3016,6 @@ const SELECT_UTILISATEUR_CONNEXION = `SELECT
  * actif, vérification, entreprise suspendue, abonnement, jeton, cookies,
  * journal. Une passkey ne contourne donc aucun contrôle.
  */
-/* Ancien compte sans société rattaché à son espace au premier login : journalisé. */
-async function journaliserRattachementEspace(req, user, tenantId) {
-  await logAudit(
-    { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: null } },
-    "compte_rattache_espace", "user", user.id, { tenant_id: tenantId, source: "premiere_connexion" }
-  ).catch(() => {});
-}
-
 async function finaliserConnexion(req, res, user, methode) {
   if (user.is_active === false) {
     return res.status(403).json({ error: "Compte désactivé" });
@@ -2983,7 +3027,6 @@ async function finaliserConnexion(req, res, user, methode) {
     return res.status(espace.status).json({ error: espace.error, code: espace.code });
   }
   const tenantId = espace.tenant;
-  if (espace.rattache) await journaliserRattachementEspace(req, user, tenantId);
 
   const isSuperAdmin =
     user.is_super_admin === true ||
@@ -3118,6 +3161,13 @@ async function finaliserConnexionParId(req, res, userId, methode) {
   if (!rows[0]) return res.status(401).json({ error: "Compte introuvable.", code: "COMPTE_INTROUVABLE" });
   return finaliserConnexion(req, res, rows[0], methode);
 }
+
+/* Espace de la requête tel que le serveur l'établit (domaine reconnu, sinon
+   déploiement) : diagnostic public, sans donnée privée. */
+app.get("/espace", (req, res) => {
+  const e = espaces.espaceDeRequete(req);
+  res.json({ tenant_id: e.tenant, source: e.source });
+});
 
 app.get("/support/config", async (req, res) => {
   res.json({
@@ -9194,8 +9244,10 @@ app.use("/super-admin", authenticateToken, async (req, res, next) => {
     if (societe && !(await espaces.societeDansEspace(pool, Number(societe[1]), req.user.tenant_id))) {
       return res.status(404).json({ error: "Société introuvable dans votre espace.", code: "SOCIETE_HORS_ESPACE" });
     }
+    // Utilisateur : appartenance PROUVÉE à l'espace (un compte sans espace
+    // établi n'appartient à aucun espace : personne n'agit dessus ici).
     const utilisateur = /^\/users\/(\d+)(?:\/|$)/.exec(req.path);
-    if (utilisateur && (await espaces.utilisateurDansEspace(pool, Number(utilisateur[1]), req.user.tenant_id)) === "non") {
+    if (utilisateur && (await espaces.utilisateurDansEspace(pool, Number(utilisateur[1]), req.user.tenant_id)) !== "oui") {
       return res.status(404).json({ error: "Utilisateur introuvable dans votre espace.", code: "UTILISATEUR_HORS_ESPACE" });
     }
     next();
@@ -12622,7 +12674,7 @@ app.get("/super-admin/marketplace", authenticateToken, async (req, res) => {
       pool.query("SELECT COUNT(*)::int AS total, COALESCE(SUM(total_amount),0)::numeric AS amount FROM marketplace_orders WHERE vendor_company_id IN (SELECT id FROM companies WHERE tenant_id=$1)", [req.user.tenant_id]),
       pool.query("SELECT COUNT(DISTINCT company_id)::int AS total FROM marketplace_products WHERE company_id IN (SELECT id FROM companies WHERE tenant_id=$1)", [req.user.tenant_id]),
       pool.query(`SELECT COUNT(*)::int AS total FROM marketplace_profiles mp JOIN users u ON u.id=mp.user_id LEFT JOIN companies c ON c.id=u.company_id
-                   WHERE mp.profile_type='customer' AND (c.tenant_id=$1 OR (u.company_id IS NULL AND (u.account_tenant_id=$1 OR u.account_tenant_id IS NULL)))`, [req.user.tenant_id])
+                   WHERE mp.profile_type='customer' AND (c.tenant_id=$1 OR (u.company_id IS NULL AND u.account_tenant_id=$1))`, [req.user.tenant_id])
     ]);
     res.json({
       products: products.rows[0],
@@ -12671,7 +12723,7 @@ app.get("/super-admin/marketplace/customers", authenticateToken, async (req, res
     if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
     const result = await pool.query(
       `SELECT mp.* FROM marketplace_profiles mp JOIN users u ON u.id=mp.user_id LEFT JOIN companies c ON c.id=u.company_id
-        WHERE mp.profile_type='customer' AND (c.tenant_id=$1 OR (u.company_id IS NULL AND (u.account_tenant_id=$1 OR u.account_tenant_id IS NULL)))
+        WHERE mp.profile_type='customer' AND (c.tenant_id=$1 OR (u.company_id IS NULL AND u.account_tenant_id=$1))
         ORDER BY mp.id DESC LIMIT 200`, [req.user.tenant_id]);
     res.json(result.rows);
   } catch (error) {
@@ -17469,10 +17521,11 @@ app.get("/super-admin/users", authenticateToken, authorizeRoles("super_admin"), 
         u.created_at
       FROM users u
       LEFT JOIN companies c ON u.company_id = c.id
-      -- Comptes de l'espace : par leur société, ou (sans société) par leur
-      -- espace enregistré ; les anciens comptes non rattachés restent visibles.
+      -- Comptes dont l'appartenance à l'espace est PROUVÉE : par leur
+      -- société, ou (sans société) par l'espace attribué au compte. Un ancien
+      -- compte sans espace établi n'apparaît dans aucun espace.
       WHERE (u.company_id IS NOT NULL AND c.tenant_id = $1)
-         OR (u.company_id IS NULL AND (u.account_tenant_id = $1 OR u.account_tenant_id IS NULL))
+         OR (u.company_id IS NULL AND u.account_tenant_id = $1)
       ORDER BY u.id DESC
     `, [req.user.tenant_id]);
 
@@ -17508,6 +17561,8 @@ app.put("/super-admin/users/:id", authenticateToken, authorizeRoles("super_admin
         req.params.id
       ]
     );
+    // Désactivation ou changement de rôle : sessions et connexions temps réel revérifiées tout de suite.
+    if (result.rows[0]) revoquerSessions(result.rows[0].id);
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -19322,7 +19377,12 @@ app.use("/ai", createAiRouter({ pool, authenticateToken }));
 const http = require("http");
 const httpServer = http.createServer(app);
 const { createRealtime } = require("./socket");
-const realtime = createRealtime({ httpServer, jwt, jwtSecret: JWT_SECRET, pool });
+const realtime = createRealtime({
+  httpServer, jwt, jwtSecret: JWT_SECRET, pool,
+  // Mêmes contrôles que l'API : espace, compte actif, révocation des sessions.
+  verifierSession, espaceDeRequete: (req) => espaces.espaceDeRequete(req).tenant,
+});
+notifierRevocationTempsReel = (userId) => realtime.reverifierUtilisateur(userId);
 app.set("realtime", realtime);
 
 const createSocialRouter = require("./routes/social");
