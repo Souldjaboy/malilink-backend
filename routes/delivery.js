@@ -121,10 +121,11 @@ module.exports = function createDeliveryRouter({
         const userResult = await client.query(
           `INSERT INTO users
              (fullname, email, phone, password, role, is_active, account_status,
-              verification_required, phone_verified, created_at)
-           VALUES ($1,$2,$3,$4,'livreur',true,'active',false,true,NOW())
+              verification_required, phone_verified, created_at,
+              account_tenant_id, account_tenant_source, account_tenant_set_at)
+           VALUES ($1,$2,$3,$4,'livreur',true,'active',false,true,NOW(),$5,'inscription',NOW())
            RETURNING id, fullname, email, phone, role`,
-          [cleanFullname, storedEmail, cleanPhone, passwordHash]
+          [cleanFullname, storedEmail, cleanPhone, passwordHash, req.tenant_id]
         );
         const user = userResult.rows[0];
 
@@ -154,7 +155,8 @@ module.exports = function createDeliveryRouter({
             role: "livreur",
             company_id: null,
             is_super_admin: false,
-            tenant_id: req.tenant_id || "malilink"
+            // Espace de l'inscription (requireTenant, global), aussi enregistré sur le compte.
+            tenant_id: req.tenant_id
           },
           jwtSecret,
           { expiresIn: "1d" }

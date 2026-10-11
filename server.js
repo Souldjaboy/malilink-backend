@@ -87,6 +87,7 @@ app.use((req, res, next) => {
 
 const { sensitiveRoutesRateLimit } = require("./middleware/rateLimit");
 const courriel = require("./services/courriel");
+const espaces = require("./services/espaces");
 app.use(sensitiveRoutesRateLimit);
 
 app.use(requireTenant);
@@ -286,34 +287,11 @@ function normalizeTenantId(value) {
   return VALID_TENANTS.has(normalized) ? normalized : "";
 }
 
+// Espace de la requête (en-tête explicite, sinon domaine, sinon configuration
+// du déploiement) : voir services/espaces.js. Pour un utilisateur connecté,
+// authenticateToken exige en plus que ce soit l'espace porté par son jeton.
 function getTenantFromRequest(req) {
-  const rawHeaderTenant =
-    req?.headers?.["x-tenant-id"] ||
-    req?.headers?.["x-app-product"] ||
-    req?.headers?.["x-product-id"] ||
-    req?.query?.tenant_id;
-  const headerTenant = normalizeTenantId(rawHeaderTenant);
-
-  if (headerTenant) return headerTenant;
-  if (rawHeaderTenant) return "__invalid__";
-
-  const host = String(
-    req?.headers?.host ||
-      req?.headers?.["x-forwarded-host"] ||
-      req?.hostname ||
-      ""
-  )
-    .split(",")[0]
-    .split(":")[0]
-    .toLowerCase();
-
-  if (host.includes("malilinkglobal.com") || host.includes("malilink.trianglewmspro.com")) {
-    return "malilink";
-  }
-  if (host.includes("hafiyalab.com") || host.includes("afia.trianglewmspro.com")) {
-    return "hafiya";
-  }
-  return normalizeTenantId(process.env.DEFAULT_TENANT_ID) || "triangle";
+  return espaces.espaceDeRequete(req).tenant;
 }
 
 function requireTenant(req, res, next) {
@@ -749,7 +727,11 @@ function normalizeSocialProfile(provider, rawProfile) {
   };
 }
 
-async function buildLoginResponseForUser(userId) {
+/* Réponse de connexion (OAuth, connexion après code) : même établissement de
+   l'espace que finaliserConnexion. demande : espace établi par le serveur en
+   amont (état OAuth signé) ; sinon l'espace de la requête.
+   → { token, user } ; { refus: { status, error, code } } ; null si compte introuvable. */
+async function buildLoginResponseForUser(userId, req, demande) {
   const result = await pool.query(
     `SELECT u.*,
             c.name AS company_name,
@@ -772,6 +754,10 @@ async function buildLoginResponseForUser(userId) {
   const user = result.rows[0];
   if (!user) return null;
 
+  const espace = await espaces.etablirEspaceConnexion(pool, req, user, demande);
+  if (espace.error) return { refus: espace };
+  if (espace.rattache) await journaliserRattachementEspace(req, user, espace.tenant);
+
   const normalizedEmail = String(user.email || "").trim().toLowerCase();
   const isSuperAdmin =
     user.is_super_admin === true ||
@@ -787,6 +773,7 @@ async function buildLoginResponseForUser(userId) {
       email: user.email,
       role: isSuperAdmin ? "super_admin" : user.role,
       company_id: user.company_id,
+      tenant_id: espace.tenant,
       is_super_admin: isSuperAdmin,
       subscription_status: subscriptionStatus
     },
@@ -806,6 +793,7 @@ async function buildLoginResponseForUser(userId) {
       email: user.email,
       role: isSuperAdmin ? "super_admin" : user.role,
       company_id: user.company_id,
+      tenant_id: espace.tenant,
       company_name: user.company_name || "",
       company_status: user.company_status || "",
       is_super_admin: isSuperAdmin,
@@ -1005,14 +993,22 @@ async function authenticateToken(req, res, next) {
     const requestTenant = getTenantFromRequest(req);
     const tokenTenant = normalizeTenantId(user.tenant_id);
 
+    // Jeton sans espace (émis avant la vérification des espaces) : aucun
+    // espace attribué par défaut, la session est à renouveler.
+    if (!tokenTenant) {
+      return res.status(401).json({ error: "Session à renouveler : reconnectez-vous.", code: "SESSION_SANS_ESPACE" });
+    }
+
     // Sessions révoquées (réinitialisation du mot de passe, changement d'email).
     if (await sessionRevoquee(user)) {
       return res.status(401).json({ error: "Session expirée : reconnectez-vous.", code: "session_revoquee" });
     }
 
-    if (tokenTenant && tokenTenant !== requestTenant) {
+    // Ni le domaine ni un en-tête ne changent l'espace porté par le jeton.
+    if (tokenTenant !== requestTenant) {
       return res.status(403).json({
-        error: "Accès refusé : ce compte n’appartient pas à cette version."
+        error: "Accès refusé : ce compte n’appartient pas à cette version.",
+        code: "AUTRE_ESPACE"
       });
     }
 
@@ -1022,9 +1018,18 @@ async function authenticateToken(req, res, next) {
       });
     }
 
+    // Super Admin : l'école choisie (x-active-company-id…) doit être une
+    // société existante de son propre espace.
+    if (isSuperAdminUser(user)) {
+      const active = getRequestedActiveCompanyId(req);
+      if (active && active !== Number(user.company_id || 0) && !(await espaces.societeDansEspace(pool, active, tokenTenant))) {
+        return res.status(403).json({ error: "Société hors de votre espace ou introuvable.", code: "SOCIETE_HORS_ESPACE" });
+      }
+    }
+
     req.user = {
       ...user,
-      tenant_id: tokenTenant || requestTenant
+      tenant_id: tokenTenant
     };
     req.tenant_id = requestTenant;
 
@@ -1102,6 +1107,8 @@ async function logAudit(req, action, entityType = "", entityId = null, details =
    companyId (facultatif) limite la cible à une entreprise. */
 async function reinitialiserMotDePasseTemporaire(req, { userId, companyId = null, envoyerEmail = false }) {
   const tenant = getTenantFromRequest(req);
+  // Jamais un compte d'un autre espace (Super Admin compris).
+  if ((await espaces.utilisateurDansEspace(pool, Number(userId), req.user?.tenant_id || tenant)) === "non") return null;
   const prefixe = tenant === "malilink" ? "MaliLink" : tenant === "hafiya" ? "Hafiya" : "Triangle";
   const temporaire = `${prefixe}-${crypto.randomBytes(3).toString("hex")}-${crypto.randomBytes(3).toString("hex").toUpperCase()}9`;
   const result = await pool.query(
@@ -2792,7 +2799,8 @@ app.post("/password-reset/confirm", async (req, res) => {
     }
 
     await client.query("BEGIN");
-    await client.query("UPDATE users SET password=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2", [
+    // Nouveau mot de passe : toutes les sessions ouvertes sont fermées.
+    await client.query("UPDATE users SET password=$1, tokens_valid_after=NOW(), updated_at=CURRENT_TIMESTAMP WHERE id=$2", [
       await hashPassword(new_password),
       reset.user_id
     ]);
@@ -2802,6 +2810,7 @@ app.post("/password-reset/confirm", async (req, res) => {
       [reset.user_id, reset.id]
     );
     await client.query("COMMIT");
+    revoquerSessions(reset.user_id);
 
     await logAudit(
       { ...req, user: { id: reset.user_id, company_id: reset.company_id, role: reset.role, email: reset.email } },
@@ -2813,7 +2822,7 @@ app.post("/password-reset/confirm", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Mot de passe réinitialisé. Vous pouvez vous connecter."
+      message: "Mot de passe réinitialisé. Les sessions ouvertes ont été fermées : vous pouvez vous connecter."
     });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
@@ -2955,16 +2964,26 @@ const SELECT_UTILISATEUR_CONNEXION = `SELECT
  * actif, vérification, entreprise suspendue, abonnement, jeton, cookies,
  * journal. Une passkey ne contourne donc aucun contrôle.
  */
+/* Ancien compte sans société rattaché à son espace au premier login : journalisé. */
+async function journaliserRattachementEspace(req, user, tenantId) {
+  await logAudit(
+    { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: null } },
+    "compte_rattache_espace", "user", user.id, { tenant_id: tenantId, source: "premiere_connexion" }
+  ).catch(() => {});
+}
+
 async function finaliserConnexion(req, res, user, methode) {
-  const tenantId = getTenantFromRequest(req);
-  if (!(await companyBelongsToTenant(user.company_id, tenantId))) {
-    return res.status(403).json({
-      error: "Accès refusé : ce compte n’appartient pas à cette version."
-    });
-  }
   if (user.is_active === false) {
     return res.status(403).json({ error: "Compte désactivé" });
   }
+  // Espace du compte établi côté serveur (société, ou espace du compte) ;
+  // il doit être celui de la requête. Voir services/espaces.js.
+  const espace = await espaces.etablirEspaceConnexion(pool, req, user);
+  if (espace.error) {
+    return res.status(espace.status).json({ error: espace.error, code: espace.code });
+  }
+  const tenantId = espace.tenant;
+  if (espace.rattache) await journaliserRattachementEspace(req, user, tenantId);
 
   const isSuperAdmin =
     user.is_super_admin === true ||
@@ -3143,10 +3162,17 @@ app.get("/auth/social/:provider/start", async (req, res) => {
       return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Provider OAuth non configuré")}`);
     }
 
+    // Espace établi au départ (domaine du site utilisé), signé dans l'état.
+    const espaceDepart = espaces.espaceDeRequete(req);
+    if (!espaces.normaliser(espaceDepart.tenant)) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Espace de connexion invalide")}`);
+    }
     const state = jwt.sign(
       {
         provider,
         mode: mode === "register" ? "register" : "login",
+        tenant: espaceDepart.tenant,
+        source: espaceDepart.source,
         nonce: crypto.randomBytes(12).toString("hex")
       },
       JWT_SECRET,
@@ -3191,6 +3217,9 @@ app.get("/auth/social/:provider/callback", async (req, res) => {
     if (statePayload.provider !== provider) {
       return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Provider OAuth invalide")}`);
     }
+    const demandeOAuth = espaces.normaliser(statePayload.tenant)
+      ? { tenant: statePayload.tenant, source: statePayload.source }
+      : espaces.espaceDeRequete(req);
 
     const tokenResponse = await fetch(config.tokenUrl, {
       method: "POST",
@@ -3261,9 +3290,9 @@ app.get("/auth/social/:provider/callback", async (req, res) => {
         `INSERT INTO companies
          (name, responsible_name, email, phone, plan_id, subscription_status,
           trial_ends_at, email_verified, phone_verified, account_status,
-          trial_start_date, trial_end_date, subscription_plan, subscription_expires_at)
+          trial_start_date, trial_end_date, subscription_plan, subscription_expires_at, tenant_id)
          VALUES ($1,$2,$3,'',$4,'trial',NOW() + INTERVAL '15 days',$5,false,'active',
-                 NOW(),NOW() + INTERVAL '15 days',$6,NOW() + INTERVAL '15 days')
+                 NOW(),NOW() + INTERVAL '15 days',$6,NOW() + INTERVAL '15 days',$7)
          RETURNING *`,
         [
           `Entreprise de ${displayName}`,
@@ -3271,7 +3300,8 @@ app.get("/auth/social/:provider/callback", async (req, res) => {
           profile.email || "",
           plan.id || null,
           profile.email_verified === true,
-          plan.name || "Trial"
+          plan.name || "Trial",
+          demandeOAuth.tenant
         ]
       );
       const company = companyResult.rows[0];
@@ -3350,9 +3380,12 @@ app.get("/auth/social/:provider/callback", async (req, res) => {
       { provider, scopes: config.scope }
     );
 
-    const loginPayload = await buildLoginResponseForUser(userId);
+    const loginPayload = await buildLoginResponseForUser(userId, req, demandeOAuth);
     if (!loginPayload) {
-      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Compte Triangle introuvable")}`);
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Compte introuvable")}`);
+    }
+    if (loginPayload.refus) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent(loginPayload.refus.error)}`);
     }
 
     const encoded = Buffer.from(JSON.stringify(loginPayload)).toString("base64url");
@@ -3489,14 +3522,17 @@ app.post("/verification/verify", async (req, res) => {
       { target_type: verification.target_type }
     );
 
-    const loginPayload = verification.user_id
-      ? await buildLoginResponseForUser(verification.user_id)
+    let loginPayload = verification.user_id
+      ? await buildLoginResponseForUser(verification.user_id, req)
       : null;
+    // Vérification faite, mais connexion refusée (autre espace) : pas de jeton.
+    const refusEspace = loginPayload?.refus || null;
+    if (refusEspace) loginPayload = null;
     const verifiedRole = normalizeRole(loginPayload?.user?.role);
 
     res.json({
       success: true,
-      message: "Vérification réussie. Vous pouvez vous connecter.",
+      message: refusEspace ? `Vérification réussie. ${refusEspace.error}` : "Vérification réussie. Vous pouvez vous connecter.",
       redirect: loginPayload?.token
         ? (verifiedRole === "customer" ? "/client/dashboard" : "/dashboard")
         : "/login",
@@ -3646,18 +3682,31 @@ app.put("/me/password", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "Mot de passe actuel incorrect" });
     }
 
-    await pool.query(
+    // Les autres sessions sont fermées ; celle-ci reçoit un nouveau jeton,
+    // émis après la révocation (iat postérieur à tokens_valid_after).
+    const { rows: [apres] } = await pool.query(
       `UPDATE users
        SET password=$1,
            force_password_change=false,
+           tokens_valid_after=NOW(),
            updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
+       WHERE id=$2
+       RETURNING tokens_valid_after`,
       [await hashPassword(new_password), req.user.id]
     );
+    revoquerSessions(req.user.id);
+    const { id, email, role, company_id, tenant_id, is_super_admin, subscription_status } = req.user;
+    const token = jwt.sign(
+      { id, email, role, company_id, tenant_id, is_super_admin, subscription_status,
+        iat: Math.floor(new Date(apres.tokens_valid_after).getTime() / 1000) + 1 },
+      JWT_SECRET,
+      { expiresIn: "1d" }
+    );
 
-    await logAudit(req, "change_password", "user", req.user.id, {});
+    await logAudit(req, "change_password", "user", req.user.id, { autres_sessions_fermees: true });
 
-    res.json({ message: "Mot de passe modifié" });
+    setSecureAuthCookies(req, res, token, tenant_id);
+    res.json({ message: "Mot de passe modifié. Vos autres sessions ont été fermées.", token });
   } catch (error) {
     console.error("ERREUR ME PASSWORD :", error);
     res.status(500).json({ error: "Erreur changement mot de passe" });
@@ -9134,11 +9183,25 @@ app.get("/accounting/statements", authenticateToken, async (req, res) => {
   }
 });
 
-app.use("/super-admin", authenticateToken, (req, res, next) => {
+app.use("/super-admin", authenticateToken, async (req, res, next) => {
   if (req.user?.is_super_admin !== true && normalizeRole(req.user?.role) !== "super_admin") {
     return res.status(403).json({ error: "Accès super admin requis." });
   }
-  next();
+  // Espace : la société ou l'utilisateur visé par l'adresse doit appartenir à
+  // l'espace du Super Admin ; sinon « introuvable », sans rien révéler.
+  try {
+    const societe = /^\/(?:companies|entreprises|subscriptions|modules\/company)\/(\d+)(?:\/|$)/.exec(req.path);
+    if (societe && !(await espaces.societeDansEspace(pool, Number(societe[1]), req.user.tenant_id))) {
+      return res.status(404).json({ error: "Société introuvable dans votre espace.", code: "SOCIETE_HORS_ESPACE" });
+    }
+    const utilisateur = /^\/users\/(\d+)(?:\/|$)/.exec(req.path);
+    if (utilisateur && (await espaces.utilisateurDansEspace(pool, Number(utilisateur[1]), req.user.tenant_id)) === "non") {
+      return res.status(404).json({ error: "Utilisateur introuvable dans votre espace.", code: "UTILISATEUR_HORS_ESPACE" });
+    }
+    next();
+  } catch (error) {
+    return echecControle(res, "espace super admin", error);
+  }
 });
 
 app.get("/super-admin/modules", authenticateToken, async (req, res) => {
@@ -9153,10 +9216,12 @@ app.get("/super-admin/modules", authenticateToken, async (req, res) => {
     const moduleKeys = access.MODULE_CATALOG.filter((m) => !m.core).map((m) => m.key);
 
     const companiesResult = await pool.query(
-      "SELECT id, name FROM companies ORDER BY id ASC"
+      "SELECT id, name FROM companies WHERE tenant_id=$1 ORDER BY id ASC", [req.user.tenant_id]
     );
     const modulesResult = await pool.query(
-      "SELECT * FROM company_modules ORDER BY company_id ASC, module_key ASC"
+      `SELECT * FROM company_modules
+        WHERE company_id IN (SELECT id FROM companies WHERE tenant_id=$1)
+        ORDER BY company_id ASC, module_key ASC`, [req.user.tenant_id]
     );
 
     res.json({
@@ -10529,12 +10594,19 @@ app.post("/marketplace/customers/register", async (req, res) => {
        Avec email : le flux de vérification existant est conservé. */
     const phoneOnly = !cleanEmail;
 
+    // Compte sans société : son espace est celui où il s'inscrit, enregistré dès la création.
+    const espaceInscription = espaces.espaceDeRequete(req);
+    if (!espaces.normaliser(espaceInscription.tenant)) {
+      return res.status(400).json({ error: "Espace d'inscription invalide." });
+    }
+
     const passwordHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
     const userResult = await pool.query(
       `INSERT INTO users
        (fullname, email, phone, password, role, is_active, account_status,
-        verification_required, phone_verified, created_at)
-       VALUES ($1,$2,$3,$4,'customer',true,$5,$6,$7,NOW())
+        verification_required, phone_verified, created_at,
+        account_tenant_id, account_tenant_source, account_tenant_set_at)
+       VALUES ($1,$2,$3,$4,'customer',true,$5,$6,$7,NOW(),$8,'inscription',NOW())
        RETURNING id, fullname, email, phone, role`,
       [
         fullname,
@@ -10543,7 +10615,8 @@ app.post("/marketplace/customers/register", async (req, res) => {
         passwordHash,
         phoneOnly ? "active" : "pending_verification",
         !phoneOnly,
-        phoneOnly
+        phoneOnly,
+        espaceInscription.tenant
       ]
     );
     const user = userResult.rows[0];
@@ -10562,6 +10635,7 @@ app.post("/marketplace/customers/register", async (req, res) => {
           email: user.email,
           role: "customer",
           company_id: null,
+          tenant_id: espaceInscription.tenant,
           is_super_admin: false
         },
         JWT_SECRET,
@@ -12544,10 +12618,11 @@ app.get("/super-admin/marketplace", authenticateToken, async (req, res) => {
   try {
     if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
     const [products, orders, vendors, customers] = await Promise.all([
-      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_products"),
-      pool.query("SELECT COUNT(*)::int AS total, COALESCE(SUM(total_amount),0)::numeric AS amount FROM marketplace_orders"),
-      pool.query("SELECT COUNT(DISTINCT company_id)::int AS total FROM marketplace_products"),
-      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_profiles WHERE profile_type='customer'")
+      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_products WHERE company_id IN (SELECT id FROM companies WHERE tenant_id=$1)", [req.user.tenant_id]),
+      pool.query("SELECT COUNT(*)::int AS total, COALESCE(SUM(total_amount),0)::numeric AS amount FROM marketplace_orders WHERE vendor_company_id IN (SELECT id FROM companies WHERE tenant_id=$1)", [req.user.tenant_id]),
+      pool.query("SELECT COUNT(DISTINCT company_id)::int AS total FROM marketplace_products WHERE company_id IN (SELECT id FROM companies WHERE tenant_id=$1)", [req.user.tenant_id]),
+      pool.query(`SELECT COUNT(*)::int AS total FROM marketplace_profiles mp JOIN users u ON u.id=mp.user_id LEFT JOIN companies c ON c.id=u.company_id
+                   WHERE mp.profile_type='customer' AND (c.tenant_id=$1 OR (u.company_id IS NULL AND (u.account_tenant_id=$1 OR u.account_tenant_id IS NULL)))`, [req.user.tenant_id])
     ]);
     res.json({
       products: products.rows[0],
@@ -12564,7 +12639,9 @@ app.get("/super-admin/marketplace", authenticateToken, async (req, res) => {
 app.get("/super-admin/marketplace/orders", authenticateToken, async (req, res) => {
   try {
     if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
-    const result = await pool.query("SELECT * FROM marketplace_orders ORDER BY id DESC LIMIT 200");
+    const result = await pool.query(
+      "SELECT * FROM marketplace_orders WHERE vendor_company_id IN (SELECT id FROM companies WHERE tenant_id=$1) ORDER BY id DESC LIMIT 200",
+      [req.user.tenant_id]);
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: "Erreur commandes marketplace super admin" });
@@ -12578,8 +12655,10 @@ app.get("/super-admin/marketplace/vendors", authenticateToken, async (req, res) 
       `SELECT c.id, c.name, COUNT(mp.id)::int AS products_count
        FROM companies c
        LEFT JOIN marketplace_products mp ON mp.company_id=c.id
+       WHERE c.tenant_id=$1
        GROUP BY c.id, c.name
-       ORDER BY c.name ASC`
+       ORDER BY c.name ASC`,
+      [req.user.tenant_id]
     );
     res.json(result.rows);
   } catch (error) {
@@ -12590,7 +12669,10 @@ app.get("/super-admin/marketplace/vendors", authenticateToken, async (req, res) 
 app.get("/super-admin/marketplace/customers", authenticateToken, async (req, res) => {
   try {
     if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
-    const result = await pool.query("SELECT * FROM marketplace_profiles WHERE profile_type='customer' ORDER BY id DESC LIMIT 200");
+    const result = await pool.query(
+      `SELECT mp.* FROM marketplace_profiles mp JOIN users u ON u.id=mp.user_id LEFT JOIN companies c ON c.id=u.company_id
+        WHERE mp.profile_type='customer' AND (c.tenant_id=$1 OR (u.company_id IS NULL AND (u.account_tenant_id=$1 OR u.account_tenant_id IS NULL)))
+        ORDER BY mp.id DESC LIMIT 200`, [req.user.tenant_id]);
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: "Erreur clients marketplace super admin" });
@@ -16615,24 +16697,27 @@ app.use("/super-admin", authenticateToken, authorizeRoles("super_admin"));
 /* SUPER ADMIN SAAS */
 app.get("/super-admin/overview", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
-    const totalCompanies = await pool.query("SELECT COUNT(*) FROM companies");
+    // Chiffres de l'espace du Super Admin uniquement.
+    const espace = [req.user.tenant_id];
+    const dansEspace = "company_id IN (SELECT id FROM companies WHERE tenant_id=$1)";
+    const totalCompanies = await pool.query("SELECT COUNT(*) FROM companies WHERE tenant_id=$1", espace);
     const activeCompanies = await pool.query(
-      "SELECT COUNT(*) FROM companies WHERE status='active'"
+      "SELECT COUNT(*) FROM companies WHERE status='active' AND tenant_id=$1", espace
     );
     const suspendedCompanies = await pool.query(
-      "SELECT COUNT(*) FROM companies WHERE status='suspended'"
+      "SELECT COUNT(*) FROM companies WHERE status='suspended' AND tenant_id=$1", espace
     );
     const totalPlans = await pool.query(
       "SELECT COUNT(*) FROM subscription_plans"
     );
     const activeSubscriptions = await pool.query(
-      "SELECT COUNT(*) FROM subscriptions WHERE status='active'"
+      `SELECT COUNT(*) FROM subscriptions WHERE status='active' AND ${dansEspace}`, espace
     );
     const trialSubscriptions = await pool.query(
-      "SELECT COUNT(*) FROM subscriptions WHERE status='trial'"
+      `SELECT COUNT(*) FROM subscriptions WHERE status='trial' AND ${dansEspace}`, espace
     );
     const totalPayments = await pool.query(
-      "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status='paid'"
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status='paid' AND ${dansEspace}`, espace
     );
 
     res.json({
@@ -16662,7 +16747,9 @@ app.get("/super-admin/companies", authenticateToken, authorizeRoles("super_admin
        FROM companies c
        LEFT JOIN subscriptions s ON c.id = s.company_id
        LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
-       ORDER BY c.id DESC`
+       WHERE c.tenant_id = $1
+       ORDER BY c.id DESC`,
+      [req.user.tenant_id]
     );
 
     res.json(result.rows);
@@ -17378,11 +17465,16 @@ app.get("/super-admin/users", authenticateToken, authorizeRoles("super_admin"), 
         u.is_super_admin,
         u.company_id,
         c.name AS company_name,
+        COALESCE(c.tenant_id, u.account_tenant_id) AS espace,
         u.created_at
       FROM users u
       LEFT JOIN companies c ON u.company_id = c.id
+      -- Comptes de l'espace : par leur société, ou (sans société) par leur
+      -- espace enregistré ; les anciens comptes non rattachés restent visibles.
+      WHERE (u.company_id IS NOT NULL AND c.tenant_id = $1)
+         OR (u.company_id IS NULL AND (u.account_tenant_id = $1 OR u.account_tenant_id IS NULL))
       ORDER BY u.id DESC
-    `);
+    `, [req.user.tenant_id]);
 
     res.json(result.rows);
   } catch (error) {
@@ -17433,17 +17525,24 @@ app.put("/super-admin/users/:id/password", authenticateToken, authorizeRoles("su
       return res.status(400).json({ error: passwordError });
     }
 
+    // Mot de passe choisi par le Super Admin : à changer à la prochaine
+    // connexion, sessions ouvertes fermées, action journalisée.
     const result = await pool.query(
       `UPDATE users
-       SET password=$1
+       SET password=$1, force_password_change=true, tokens_valid_after=NOW(), updated_at=CURRENT_TIMESTAMP
        WHERE id=$2
-       RETURNING id, fullname, email`,
+       RETURNING id, fullname, email, company_id`,
       [await hashPassword(password), req.params.id]
     );
+    if (!result.rows[0]) return res.status(404).json({ error: "Utilisateur introuvable." });
+    revoquerSessions(result.rows[0].id);
+    await logAudit({ ...req, user: { ...req.user, company_id: result.rows[0].company_id } },
+      "super_admin_password_set", "user", result.rows[0].id, { force_password_change: true, sessions_fermees: true });
 
+    const { company_id: _societe, ...utilisateur } = result.rows[0];
     res.json({
-      message: "Mot de passe modifié",
-      user: result.rows[0]
+      message: "Mot de passe modifié : changement imposé à la prochaine connexion, sessions fermées.",
+      user: utilisateur
     });
   } catch (error) {
     console.error(error);

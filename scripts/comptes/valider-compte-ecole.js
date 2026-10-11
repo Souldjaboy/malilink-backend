@@ -37,6 +37,9 @@ function afficher(fiche, attendu) {
   console.log(`\nSociété ${e.id} — « ${e.name} »${attendu ? "  ← correspond au nom attendu" : ""}`);
   console.log(`  tenant ${e.tenant_id || "?"} · statut ${e.status || "?"} · compte ${e.account_status || "?"} · email ${e.email_masque || "—"} vérifié=${e.email_verified}`);
   console.log(`  abonnement ${e.subscription_status || "?"} · validation admin ${e.admin_validated_at ? new Date(e.admin_validated_at).toISOString() : "non"}`);
+  if (e.tenant_id !== "malilink") {
+    console.log(`  ⚠ espace « ${e.tenant_id || "non défini"} » : ce compte ne pourra pas se connecter sur MaliLink tant que l'espace de la société n'est pas « malilink » (aucune modification faite ici).`);
+  }
   if (!fiche.administrateurs.length) console.log("  (aucun administrateur)");
   for (const u of fiche.administrateurs) {
     console.log(`  - utilisateur ${u.id} · ${u.role} · ${u.email_masque} · actif=${u.is_active} · compte=${u.account_status || "?"} · email vérifié=${u.email_verified} · vérification requise=${u.verification_required} · validation admin=${u.admin_validated_at ? "oui" : "non"}`);

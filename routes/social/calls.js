@@ -44,7 +44,7 @@ function jetonLiveKit(config, { salle, identite, nom, video }) {
 }
 
 module.exports = function registerCallRoutes(router, { pool, helpers, realtime }) {
-  const { getFeatureFlags, isBlockedEitherWay, areFriends, getProfile, getPrivacy } = helpers;
+  const { getFeatureFlags, isBlockedEitherWay, areFriends, getProfile, getPrivacy, memeEspace } = helpers;
 
   // Poussée immédiate aux deux participants (le sondage de l'interface reste le filet de sécurité).
   async function pousser(publicId, evenement) {
@@ -68,14 +68,15 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
   }
 
   // Sonnerie sans réponse → manqué ; appel resté ouvert trop longtemps → terminé.
-  async function expirer() {
+  // Expiration des appels de l'espace de la requête uniquement.
+  async function expirer(tenant) {
     await pool.query(
       `UPDATE social_calls SET status='missed', ended_at=NOW(), end_reason='sans_reponse'
-        WHERE status='ringing' AND created_at < NOW() - make_interval(secs => $1)`, [SONNERIE_SECONDES]);
+        WHERE status='ringing' AND tenant_id=$2 AND created_at < NOW() - make_interval(secs => $1)`, [SONNERIE_SECONDES, tenant]);
     await pool.query(
       `UPDATE social_calls SET status='ended', ended_at=NOW(), end_reason='duree_max',
               duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM NOW() - COALESCE(answered_at, created_at))::int)
-        WHERE status='accepted' AND COALESCE(answered_at, created_at) < NOW() - make_interval(hours => $1)`, [DUREE_MAX_HEURES]);
+        WHERE status='accepted' AND tenant_id=$2 AND COALESCE(answered_at, created_at) < NOW() - make_interval(hours => $1)`, [DUREE_MAX_HEURES, tenant]);
   }
 
   const vue = (c, moi) => ({
@@ -90,7 +91,9 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
               p.display_name AS other_name, p.photo_url AS other_avatar
          FROM social_calls c
          LEFT JOIN social_profiles p ON p.user_id = CASE WHEN c.caller_id=$2 THEN c.callee_id ELSE c.caller_id END
-        WHERE c.public_id=$1 AND (c.caller_id=$2 OR c.callee_id=$2)`, [String(publicId || "").slice(0, 40), moi]);
+        WHERE c.public_id=$1 AND (c.caller_id=$2 OR c.callee_id=$2)
+          AND c.tenant_id = (SELECT COALESCE(co.tenant_id, u.account_tenant_id) FROM users u LEFT JOIN companies co ON co.id=u.company_id WHERE u.id=$2)`,
+      [String(publicId || "").slice(0, 40), moi]);
     return rows[0] || null;
   }
 
@@ -116,13 +119,15 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
       const kind = req.body?.kind === "video" ? "video" : "audio";
       if (kind === "video" && !e.video) return res.status(503).json({ error: "Les appels vidéo ne sont pas encore disponibles.", code: "VIDEO_INDISPONIBLE" });
       if (!autre || autre === moi) return res.status(400).json({ error: "Destinataire invalide." });
+      // Jamais d'appel vers un compte d'un autre espace (ni d'un ancien compte pas encore rattaché).
+      if (!memeEspace || !(await memeEspace(autre, req.tenant_id))) return res.status(404).json({ error: "Profil introuvable." });
       if (await isBlockedEitherWay(moi, autre)) return res.status(403).json({ error: "Appel impossible avec ce profil." });
       const profil = await getProfile(autre);
       if (!profil || profil.is_active === false) return res.status(404).json({ error: "Profil introuvable." });
       const regle = (await getPrivacy(autre))?.who_can_call || "friends";
       if (regle === "nobody") return res.status(403).json({ error: "Cette personne n'accepte pas les appels." });
       if (regle === "friends" && !(await areFriends(moi, autre))) return res.status(403).json({ error: "Seuls ses amis peuvent appeler cette personne." });
-      await expirer();
+      await expirer(req.tenant_id);
       const occupe = await pool.query(
         `SELECT caller_id, callee_id FROM social_calls
           WHERE status IN ('ringing','accepted') AND (caller_id = ANY($1::int[]) OR callee_id = ANY($1::int[])) LIMIT 1`, [[moi, autre]]);
@@ -134,7 +139,7 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
       const salle = `ml-${crypto.randomBytes(12).toString("hex")}`;
       await pool.query(
         `INSERT INTO social_calls (public_id, tenant_id, caller_id, callee_id, kind, room_name) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [publicId, req.tenant_id || "malilink", moi, autre, kind, salle]);
+        [publicId, req.tenant_id, moi, autre, kind, salle]);
       const appel = await appelDe(publicId, moi);
       pousser(publicId, "call:incoming");
       res.status(201).json({
@@ -152,7 +157,7 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
     try {
       const e = await etat();
       if (!e.audio) return res.json({ entrant: null, en_cours: null });
-      await expirer();
+      await expirer(req.tenant_id);
       const moi = req.user.id;
       const { rows } = await pool.query(
         `SELECT c.*, CASE WHEN c.caller_id=$1 THEN c.callee_id ELSE c.caller_id END AS other_id,
@@ -173,7 +178,7 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
   router.get("/calls/history", async (req, res) => {
     try {
       const moi = req.user.id;
-      await expirer();
+      await expirer(req.tenant_id);
       const { rows } = await pool.query(
         `SELECT c.*, CASE WHEN c.caller_id=$1 THEN c.callee_id ELSE c.caller_id END AS other_id,
                 p.display_name AS other_name, p.photo_url AS other_avatar
@@ -193,7 +198,7 @@ module.exports = function registerCallRoutes(router, { pool, helpers, realtime }
     try {
       const e = await etat();
       if (!e.audio) return indisponible(res);
-      await expirer();
+      await expirer(req.tenant_id);
       const moi = req.user.id;
       const { rows } = await pool.query(
         `UPDATE social_calls SET status='accepted', answered_at=NOW()

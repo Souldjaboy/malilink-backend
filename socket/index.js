@@ -32,7 +32,10 @@ function createRealtime({ httpServer, jwt, jwtSecret, pool }) {
       const token = socket.handshake?.auth?.token || "";
       if (!token) return next(new Error("Authentification requise"));
       const payload = jwt.verify(token, jwtSecret);
+      // Comme l'API : un jeton sans espace (ancien format) est à renouveler.
+      if (!payload.tenant_id) return next(new Error("Session à renouveler"));
       socket.data.userId = Number(payload.id);
+      socket.data.tenantId = String(payload.tenant_id);
       if (!socket.data.userId) return next(new Error("Token invalide"));
       next();
     } catch {

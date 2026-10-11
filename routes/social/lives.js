@@ -55,8 +55,9 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
     return Boolean(u && u.is_active !== false && (u.is_super_admin === true || String(u.role).toLowerCase() === "super_admin"));
   }
 
-  // Tenant validé par authenticateToken (jeton et requête concordent).
-  const tenantDe = (req) => req.tenant_id || "malilink";
+  // Espace validé par authenticateToken (jeton et requête concordent) :
+  // toujours présent, jamais d'espace par défaut.
+  const tenantDe = (req) => req.tenant_id;
 
   // Fin automatique des directs du tenant dont l'hôte ne donne plus signe de vie.
   async function nettoyer(req) {
@@ -188,12 +189,14 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
         throw e;
       }
       const live = await liveDe(req, publicId);
-      // Prévenir amis et abonnés (200 au plus), sans bloquer le démarrage.
+      // Prévenir amis et abonnés (200 au plus) DU MÊME ESPACE, sans bloquer le démarrage.
       // Amis toujours ; abonnés aussi sauf pour un direct réservé aux amis.
       pool.query(
-        `SELECT DISTINCT u FROM (
+        `SELECT DISTINCT x.u FROM (
            SELECT CASE WHEN user_a=$1 THEN user_b ELSE user_a END AS u FROM social_friendships WHERE user_a=$1 OR user_b=$1
-           UNION SELECT follower_user_id FROM social_follows WHERE followed_user_id=$1 AND status='active' AND $2 <> 'friends') x LIMIT 200`, [moi, audience])
+           UNION SELECT follower_user_id FROM social_follows WHERE followed_user_id=$1 AND status='active' AND $2 <> 'friends') x
+           JOIN users us ON us.id = x.u LEFT JOIN companies co ON co.id = us.company_id
+          WHERE COALESCE(co.tenant_id, us.account_tenant_id) = $3 LIMIT 200`, [moi, audience, tenantDe(req)])
         .then(({ rows }) => Promise.all(rows.map((r) => createNotification({
           user_id: r.u, title: "Direct en cours", message: `${live.host_name || "Un membre"} est en direct : ${titre}`, type: "social_live",
           company_id: null, related_entity_type: "social_live",

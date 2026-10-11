@@ -25,15 +25,26 @@ const registerNetworkRoutes = require("./network");
 const registerCallRoutes = require("./calls");
 const registerLiveRoutes = require("./lives");
 const { createSocialMedia } = require("./media");
+const espaces = require("../../services/espaces");
 
 module.exports = function createSocialRouter({ pool, authenticateToken, createNotification, realtime, media }) {
   const router = express.Router();
   const helpers = createHelpers({ pool });
+  helpers.memeEspace = async (userId, tenant) => (await espaces.utilisateurDansEspace(pool, userId, tenant)) === "oui";
   // Médias des publications : instance partagée avec la route de lecture
   // signée montée hors authentification dans server.js (/social-media).
   const socialMedia = media || createSocialMedia({ pool });
 
   router.use(authenticateToken);
+
+  // Réseau social propre à MaliLink : réservé aux espaces de SOCIAL_ESPACES
+  // (« malilink » par défaut). Un compte d'un autre espace n'atteint aucune
+  // donnée Social, même avec un identifiant ; les directs et les appels
+  // filtrent en plus par espace.
+  const espacesSocial = new Set(String(process.env.SOCIAL_ESPACES || "malilink").split(",").map((t) => t.trim().toLowerCase()).filter(Boolean));
+  router.use((req, res, next) => (espacesSocial.has(req.tenant_id)
+    ? next()
+    : res.status(404).json({ error: "Réseau social indisponible dans cet espace.", code: "SOCIAL_HORS_ESPACE" })));
 
   // Coupe tout le module si social_enabled=false.
   router.use(helpers.requireFlag("social_enabled"));
