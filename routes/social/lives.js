@@ -19,7 +19,10 @@
  *   POST /lives/:id/terminer           terminer (hôte, Super Admin)
  *
  * Droits contrôlés côté serveur à chaque jeton : audience (public, amis,
- * abonnés), blocages, exclusion, direct encore en cours. Jetons limités à
+ * abonnés), blocages, exclusion, direct encore en cours. Chaque direct
+ * appartient au tenant de la requête qui l'a créé : toute recherche (et le
+ * nettoyage automatique) est limitée au tenant de la requête ; un direct
+ * d'un autre tenant répond « introuvable », même avec son identifiant. Jetons limités à
  * la salle, 10 minutes. Aucun enregistrement. Sans serveur média
  * fonctionnel, tout répond « indisponible » : aucun direct simulé.
  */
@@ -52,20 +55,27 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
     return Boolean(u && u.is_active !== false && (u.is_super_admin === true || String(u.role).toLowerCase() === "super_admin"));
   }
 
-  // Fin automatique des directs dont l'hôte ne donne plus signe de vie.
-  async function nettoyer() {
+  // Tenant validé par authenticateToken (jeton et requête concordent).
+  const tenantDe = (req) => req.tenant_id || "malilink";
+
+  // Fin automatique des directs du tenant dont l'hôte ne donne plus signe de vie.
+  async function nettoyer(req) {
     const { rows } = await pool.query(
       `UPDATE social_lives SET status='ended', ended_at=NOW(), end_reason='hote_deconnecte'
-        WHERE status='live' AND host_seen_at < NOW() - make_interval(secs => $1) RETURNING room_name`, [HOTE_ABSENT_S]);
+        WHERE status='live' AND tenant_id=$2 AND host_seen_at < NOW() - make_interval(secs => $1)
+        RETURNING id, public_id, host_id, room_name`, [HOTE_ABSENT_S, tenantDe(req)]);
     const config = livekit.configuration();
-    for (const r of rows) if (config) livekit.api(config, "DeleteRoom", r.room_name, {}).catch(() => {});
+    for (const r of rows) {
+      if (config) livekit.api(config, "DeleteRoom", r.room_name, {}).catch(() => {});
+      pousser(r, "live:termine", { raison: "hote_deconnecte" });
+    }
   }
 
-  async function liveDe(publicId) {
+  async function liveDe(req, publicId = req.params.id) {
     const { rows } = await pool.query(
       `SELECT l.*, p.display_name AS host_name, p.photo_url AS host_photo
          FROM social_lives l LEFT JOIN social_profiles p ON p.user_id=l.host_id
-        WHERE l.public_id=$1`, [String(publicId || "").slice(0, 40)]);
+        WHERE l.public_id=$1 AND l.tenant_id=$2`, [String(publicId || "").slice(0, 40), tenantDe(req)]);
     return rows[0] || null;
   }
 
@@ -133,7 +143,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
     try {
       const d = await disponibilite();
       if (!d.enabled) return res.json({ enabled: false, raison: d.raison, lives: [] });
-      await nettoyer();
+      await nettoyer(req);
       const moi = req.user.id;
       const { rows } = await pool.query(
         `SELECT l.*, p.display_name AS host_name, p.photo_url AS host_photo
@@ -144,7 +154,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
                  OR (l.audience='followers' AND EXISTS (SELECT 1 FROM social_follows fo WHERE fo.follower_user_id=$1 AND fo.followed_user_id=l.host_id AND fo.status='active')))
             AND NOT EXISTS (SELECT 1 FROM social_blocks b WHERE (b.blocker_user_id=$1 AND b.blocked_user_id=l.host_id) OR (b.blocker_user_id=l.host_id AND b.blocked_user_id=$1))
             AND NOT EXISTS (SELECT 1 FROM social_live_viewers v WHERE v.live_id=l.id AND v.user_id=$1 AND v.banned_at IS NOT NULL)
-          ORDER BY l.started_at DESC LIMIT 50`, [moi, req.tenant_id || "malilink"]);
+          ORDER BY l.started_at DESC LIMIT 50`, [moi, tenantDe(req)]);
       const lives = [];
       for (const l of rows) lives.push(vue(l, { compteur: await compteur(l) }));
       res.json({ enabled: true, lives });
@@ -164,7 +174,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
       if (titre.length < 3) return res.status(400).json({ error: "Donnez un titre à votre direct (3 caractères au moins)." });
       const profil = await getProfile(moi);
       if (!profil || profil.is_active === false) return res.status(403).json({ error: "Activez votre profil MaliLink Social pour lancer un direct." });
-      await nettoyer();
+      await nettoyer(req);
       const recents = (await pool.query(`SELECT COUNT(*)::int AS n FROM social_lives WHERE host_id=$1 AND started_at > NOW() - INTERVAL '24 hours'`, [moi])).rows[0].n;
       if (recents >= 10) return res.status(429).json({ error: "Limite de 10 directs par 24 heures atteinte." });
       const publicId = crypto.randomBytes(12).toString("base64url");
@@ -172,12 +182,12 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
       try {
         await pool.query(
           `INSERT INTO social_lives (public_id, tenant_id, host_id, title, audience, room_name) VALUES ($1,$2,$3,$4,$5,$6)`,
-          [publicId, req.tenant_id || "malilink", moi, titre, audience, salle]);
+          [publicId, tenantDe(req), moi, titre, audience, salle]);
       } catch (e) {
         if (e.code === "23505") return res.status(409).json({ error: "Vous avez déjà un direct en cours.", code: "DIRECT_EN_COURS" });
         throw e;
       }
-      const live = await liveDe(publicId);
+      const live = await liveDe(req, publicId);
       // Prévenir amis et abonnés (200 au plus), sans bloquer le démarrage.
       // Amis toujours ; abonnés aussi sauf pour un direct réservé aux amis.
       pool.query(
@@ -201,8 +211,8 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.get("/lives/:id", async (req, res) => {
     try {
-      await nettoyer();
-      const live = await liveDe(req.params.id);
+      await nettoyer(req);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const droit = await peutRegarder(live, req.user.id);
       if (!droit.ok && !(await estSuperAdmin(req.user.id))) return res.status(droit.status).json({ error: droit.message, code: droit.code });
@@ -216,8 +226,8 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
   async function delivrerJeton(req, res, rejoindre) {
     const d = await disponibilite();
     if (!d.enabled) return indisponible(res, d);
-    await nettoyer();
-    const live = await liveDe(req.params.id);
+    await nettoyer(req);
+    const live = await liveDe(req);
     if (!live) return res.status(404).json({ error: "Direct introuvable." });
     if (live.status !== "live") return res.status(410).json({ error: "Ce direct est terminé.", code: "DIRECT_TERMINE" });
     const moi = req.user.id;
@@ -243,7 +253,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.post("/lives/:id/presence", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const moi = req.user.id;
       if (live.host_id === moi) {
@@ -264,7 +274,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.get("/lives/:id/commentaires", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const droit = await peutRegarder(live, req.user.id);
       if (!droit.ok && !(await estSuperAdmin(req.user.id))) return res.status(droit.status).json({ error: droit.message });
@@ -282,7 +292,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.post("/lives/:id/commentaires", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       if (live.status !== "live") return res.status(410).json({ error: "Ce direct est terminé." });
       if (!live.comments_enabled) return res.status(403).json({ error: "Les commentaires sont fermés." });
@@ -312,7 +322,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.delete("/lives/:id/commentaires/:cid", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const moi = req.user.id;
       const moderateur = live.host_id === moi || (await estSuperAdmin(moi));
@@ -331,7 +341,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.get("/lives/:id/spectateurs", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       if (live.host_id !== req.user.id && !(await estSuperAdmin(req.user.id))) return res.status(403).json({ error: "Réservé à l'hôte." });
       const { rows } = await pool.query(
@@ -348,7 +358,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.post("/lives/:id/exclure/:userId", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const moi = req.user.id;
       if (live.host_id !== moi && !(await estSuperAdmin(moi))) return res.status(403).json({ error: "Réservé à l'hôte." });
@@ -374,7 +384,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.post("/lives/:id/signaler", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const moi = req.user.id;
       if (live.host_id === moi) return res.status(400).json({ error: "Vous ne pouvez pas signaler votre propre direct." });
@@ -395,7 +405,7 @@ module.exports = function registerLiveRoutes(router, { pool, helpers, createNoti
 
   router.post("/lives/:id/terminer", async (req, res) => {
     try {
-      const live = await liveDe(req.params.id);
+      const live = await liveDe(req);
       if (!live) return res.status(404).json({ error: "Direct introuvable." });
       const moi = req.user.id;
       const superAdmin = live.host_id !== moi && (await estSuperAdmin(moi));
