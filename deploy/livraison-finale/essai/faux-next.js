@@ -16,7 +16,7 @@ const nouvelle = fs.existsSync("app/confirmer-email/page.tsx");
 const mode = lire(nouvelle ? "/etc/essai/nouveau" : "/etc/essai/ancien");
 console.log(`démarrage ${nouvelle ? "NOUVELLE" : "ANCIENNE"} release, mode « ${mode || "normal"} », PORT=${process.env.PORT}`);
 if (mode === "plante") { console.error("plantage volontaire"); process.exit(1); }
-const pages = { "/": true, "/confirmer-email": nouvelle, "/social/lives": fs.existsSync("app/social/lives/page.tsx"), "/education/academy": fs.existsSync("app/education/academy/page.tsx") };
+const pages = { "/": true, "/login": true, "/super-admin": true, "/confirmer-email": nouvelle, "/social/lives": fs.existsSync("app/social/lives/page.tsx"), "/education/academy": fs.existsSync("app/education/academy/page.tsx") };
 const serveur = http.createServer((req, res) => {
   const chemin = req.url.split("?")[0];
   if (chemin === "/__essai") return res.end(JSON.stringify({ release: nouvelle ? "nouvelle" : "ancienne", cwd: process.cwd(), PORT: process.env.PORT, MARQUEUR_ESSAI: process.env.MARQUEUR_ESSAI }));
