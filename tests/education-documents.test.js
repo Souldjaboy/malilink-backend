@@ -154,7 +154,8 @@ async function main() {
     const v = await fetch(`${BASE}/verification/${jetons[0].token}`).then((r) => r.json());
     const brutV = JSON.stringify(v);
     verifier("QR du bulletin : authentique, type, période, classe", v.authentique === true && v.type_libelle === "Bulletin de notes" && v.periode === "Trimestre 1" && v.classe === "CM2 A");
-    verifier("…sans note, moyenne, rang ni appréciation", !/15|12|13,|Très bon|Félicitations|rang|moyenne/i.test(brutV.replace(/Trimestre 1|2026-2027|EFD-B\d{4}-\d+/g, "")), brutV);
+    // Adresse signée du logo retirée : sa signature aléatoire peut contenir « 15 » ou « 12 ».
+    verifier("…sans note, moyenne, rang ni appréciation", !/15|12|13,|Très bon|Félicitations|rang|moyenne/i.test(brutV.replace(/"\/education-fichiers\/[^"]*"/g, '""').replace(/Trimestre 1|2026-2027|EFD-B\d{4}-\d+/g, "")), brutV);
 
     const parent = (await q(`SELECT parent_user_id FROM edu_student_parents WHERE student_id=$1`, [e1]))[0];
     const tp = jeton({ id: parent.parent_user_id, role: "parent", company_id: a.id });

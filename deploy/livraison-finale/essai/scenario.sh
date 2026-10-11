@@ -16,6 +16,8 @@ verifier() { if eval "$2"; then echo "  ✓ $1"; NB_OK=$((NB_OK + 1)); else echo
 
 # Démarrage comme après un redémarrage du VPS : base, puis processus PM2 enregistrés.
 until pg_isready -q -h 127.0.0.1; do sleep 1; done
+# Faux Next à jour dans la release d'origine (l'image en garde la copie de sa préparation).
+cp /essai/faux-next.js "$R/frontend/faux-next.js"
 pm2 resurrect >/dev/null 2>&1
 for _ in $(seq 1 60); do
   curl -sf -o /dev/null "$SITE/" && [ "$(curl -s -o /dev/null -w '%{http_code}' "$SITE/api/education/learning/programs")" = 401 ] && break; sleep 1
@@ -93,7 +95,7 @@ case "$S" in
   succes)
     lancer; NOUVEAU="$(pm2q cwd malilink-frontend)"
     verifier "déploiement : code 0, « DÉPLOIEMENT TERMINÉ »" '[ "$CODE" = 0 ] && grep -q "DÉPLOIEMENT TERMINÉ" "$LOG"' "code $CODE"
-    verifier "répétition sur copie : 089 et 090 appliquées sur le moteur réel" 'grep -q "migrations 089 et 090 appliquées sur la copie" "$LOG" && grep -q "copie conforme" "$LOG"'
+    verifier "répétition sur copie : 089, 090 et 091 appliquées sur le moteur réel" 'grep -q "migrations 089, 090 et 091 appliquées sur la copie" "$LOG" && grep -q "copie conforme" "$LOG"'
     verifier "migrations 089 et 090 en production, base de répétition supprimée" '[ "$(migrations)" = 2 ] && [ -z "$(repetitions)" ]'
     verifier "backend : fichiers du paquet, même définition PM2" '[ "$(empreintes_back)" = "$(empreintes_payload)" ] && [ "$(pm2q def malilink-backend)" = "$AV_DEF_BACK" ]'
     verifier "nouveau backend actif (nouveau message de renvoi d'OTP)" 'curl -s -X POST -H "Content-Type: application/json" -d "{}" "$SITE/api/verification/resend" | grep -q "Indiquez votre adresse email"'
