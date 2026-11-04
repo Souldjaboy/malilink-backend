@@ -390,6 +390,97 @@ module.exports = function createEducationRouter({ pool, authenticateToken, autho
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur matière" }); }
   });
 
+
+  // Modification réservée à l'administration de l'établissement.
+  router.patch("/classes/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+      const level = typeof req.body?.level === "string" ? req.body.level.trim() : "";
+      if (!Number.isInteger(id) || id <= 0 || !name || name.length > 160 || level.length > 100)
+        return res.status(400).json({ error: "Nom de classe ou niveau invalide." });
+      const { rows } = await pool.query(
+        "UPDATE edu_classes SET name=$1, level=$2 WHERE id=$3 AND company_id=$4 RETURNING *",
+        [name, level || null, id, schoolId(req)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Classe introuvable." });
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur de modification de la classe." }); }
+  });
+
+  router.patch("/subjects/:id", requireRoles(STAFF_ROLES), async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+      const coefficient = Number(req.body?.coefficient);
+      if (!Number.isInteger(id) || id <= 0 || !name || name.length > 160 ||
+          !Number.isFinite(coefficient) || coefficient < 0.5 || coefficient > 20)
+        return res.status(400).json({ error: "Nom de matière ou coefficient invalide (0,5 à 20)." });
+      const { rows } = await pool.query(
+        "UPDATE edu_subjects SET name=$1, coefficient=$2 WHERE id=$3 AND company_id=$4 RETURNING *",
+        [name, coefficient, id, schoolId(req)]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Matière introuvable." });
+      res.json(rows[0]);
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur de modification de la matière." }); }
+  });
+
+  // Les FK de l'éducation utilisent parfois ON DELETE CASCADE.
+  // Refuser la suppression si la classe ou matière est référencée.
+  // Le verrou FOR UPDATE protège contre une insertion concurrente.
+  async function supprimerSansDependances(req, res, table, libelle) {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Identifiant invalide." });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query(
+        `SELECT id FROM ${table} WHERE id=$1 AND company_id=$2 FOR UPDATE`,
+        [id, schoolId(req)]
+      );
+      if (!existing.rows[0]) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: `${libelle} introuvable.` });
+      }
+      const refs = await client.query(
+        `SELECT n.nspname AS schema_name, t.relname AS table_name, a.attname AS column_name
+           FROM pg_constraint c
+           JOIN pg_class t ON t.oid=c.conrelid
+           JOIN pg_namespace n ON n.oid=t.relnamespace
+           JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1]
+          WHERE c.contype='f' AND c.confrelid=$1::regclass
+            AND array_length(c.conkey,1)=1 AND array_length(c.confkey,1)=1`,
+        [table]
+      );
+      const quoteId = (v) => '"' + String(v).replace(/"/g, '""') + '"';
+      for (const ref of refs.rows) {
+        const target = `${quoteId(ref.schema_name)}.${quoteId(ref.table_name)}`;
+        const column = quoteId(ref.column_name);
+        const used = await client.query(`SELECT 1 FROM ${target} WHERE ${column}=$1 LIMIT 1`, [id]);
+        if (used.rowCount) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: `Suppression impossible : ${libelle.toLowerCase()} déjà utilisé(e) dans des dossiers. Modifiez son nom plutôt.`,
+          });
+        }
+      }
+      await client.query(`DELETE FROM ${table} WHERE id=$1 AND company_id=$2`, [id, schoolId(req)]);
+      await client.query("COMMIT");
+      return res.json({ success: true });
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (e.code === "23503")
+        return res.status(409).json({ error: "Suppression impossible : cet élément est déjà utilisé." });
+      console.error(e);
+      return res.status(500).json({ error: "Erreur lors de la suppression." });
+    } finally { client.release(); }
+  }
+
+  router.delete("/classes/:id", requireRoles(STAFF_ROLES), (req, res) =>
+    supprimerSansDependances(req, res, "edu_classes", "Classe"));
+  router.delete("/subjects/:id", requireRoles(STAFF_ROLES), (req, res) =>
+    supprimerSansDependances(req, res, "edu_subjects", "Matière"));
+
   // Liste des affectations (professeur ↔ matière ↔ classe) — §6.
   router.get("/teacher-assignments", async (req, res) => {
     try {
